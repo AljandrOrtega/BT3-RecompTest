@@ -165,7 +165,37 @@ static inline __m128 ps2VuSat(__m128 v)
 #define PS2_VMUL(a, b) ps2VuSat(_mm_mul_ps((__m128)(a), (__m128)(b)))
 #define PS2_VDIV(a, b) ps2VuSat(_mm_div_ps((__m128)(a), (__m128)(b)))
 #define PS2_VMULQ(a, q) ps2VuSat(_mm_mul_ps((__m128)(a), _mm_set1_ps(q)))
-#define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
+// [vu0flags] VU0 macro-mode FP ops must update the STATUS flag register. BT3 tests billboard
+// vertices for being off-screen with a flag-only idiom in func_121140:
+//     ctc2 $zero,$vi16 ; vsub.xyw vf0,vf5,vf11 ; vsub.xy vf0,vf12,vf5 ; cfc2 $v0,$vi16 ; andi 0xC0
+// Both subtractions write vf0 -- the results are DISCARDED; they exist purely for their sign/zero
+// flags (x<0, y<0, w<0, or x/y > 4096). Nothing in this runtime ever wrote vu0_vpu_stat4, so cfc2
+// read back the 0 that ctc2 had just written, `andi 0xC0` was always 0, and the branch that stops
+// emitting out-of-bounds vertices COULD NEVER BE TAKEN.
+// Consequence (Destroyed Namek lava geysers): corners that project off-screen are emitted anyway,
+// exceed the 4095.9 px ceiling of the GS 12.4 field, WRAP, and stretch a lava-textured triangle
+// across the whole view. Measured against PCSX2: >5% of our lava vertices sat at w~0.2 (on the
+// camera) where the console never goes below w=474, and 18/144 quads had a corner-depth ratio
+// over 2x where the console never exceeds 1.46.
+// Status layout: bit0 Z, bit1 S, bits 6/7 = sticky ZS/SS (the pair the game tests with 0xC0).
+// `ctx` is in scope at every one of the 99 generated call sites. PS2X_VU0FLAGS=0 disables.
+static const bool g_ps2Vu0FlagsOn = [](){ const char *e = ::getenv("PS2X_VU0FLAGS"); return !(e && e[0] == '0'); }();
+static inline __m128 ps2Vu0Blend(R5900Context *ctx, __m128 old, __m128 res, __m128 mask)
+{
+    if (g_ps2Vu0FlagsOn)
+    {
+        const int sel = _mm_movemask_ps(mask);                                   // written fields
+        const int neg = _mm_movemask_ps(res);                                    // sign bits
+        const int zer = _mm_movemask_ps(_mm_cmpeq_ps(res, _mm_setzero_ps()));    // zero lanes
+        const uint32_t cur = (uint32_t)((zer & sel) ? 1u : 0u) | (uint32_t)((neg & sel) ? 2u : 0u);
+        ctx->vu0_vpu_stat4 = (ctx->vu0_vpu_stat4 & 0x0FC0u)   // keep the sticky bits
+                           | cur                              // Z / S for this op
+                           | ((cur & 0x01u) << 6)             // -> sticky ZS
+                           | ((cur & 0x02u) << 6);            // -> sticky SS
+    }
+    return PS2_BLENDV_PS(old, res, mask);
+}
+#define PS2_VBLEND(a, b, mask) ps2Vu0Blend(ctx, (__m128)(a), (__m128)(b), (__m128)(mask))
 
 // Memory access helpers - Hybrid Fast/Slow Path
 // Fast path: Direct RDRAM access (masked).
