@@ -6,11 +6,15 @@
 #include "iso9660.h"
 #include "settings_dialog.h"
 #include "settings_manager.h"
+#include "tex_install_dialog.h"
 
 #include <QApplication>
+#include <QColor>
 #include <QDir>
+#include <QEasingCurve>
 #include <QFile>
 #include <QFileInfo>
+#include <QGraphicsDropShadowEffect>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -18,6 +22,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QProcess>
+#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
 #include <QShowEvent>
@@ -135,6 +140,13 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     // Seed settings manager from the shared savedata dir.
     SettingsManager::instance().setConfigDir(m_savedataDir);
     SettingsManager::instance().load();
+
+    // [firstboot] No settings.toml yet -> pulse SETTINGS so a first-time user
+    // is drawn to Settings > Misc (game data + texture pack), without a dialog
+    // interrupting them.
+    const bool firstBoot = !QFile::exists(SettingsManager::instance().configpath());
+    if (firstBoot)
+        startSettingsGlow();
 }
 
 // Release deploy: no SELFX next to us, but a plain ps2EntryRunner from the
@@ -222,7 +234,7 @@ void LauncherWindow::onPlayClicked()
         const QString dataDir = m_dataDir;
         proc->setArguments({QDir(dataDir).filePath(QStringLiteral("SLUS_216.78"))});
         auto env = QProcessEnvironment::systemEnvironment();
-        // [deploy] Anchor the runner's savedata/assets/fonts (and bt3_settings.ini)
+        // [deploy] Anchor the runner's savedata/assets/fonts (and settings.toml)
         // at the deploy root -- where the launcher wrote them -- not data/.
         env.insert(QStringLiteral("PS2X_EXEDIR"), apppaths::userRoot());
         env.insert(QStringLiteral("PS2X_ASSETDIR"), apppaths::assets());
@@ -256,7 +268,11 @@ void LauncherWindow::checkGameData()
     m_gameDataValid = (DiscVerify::verifyInstalledData(m_dataDir) == DiscVerify::State::Valid);
 
     if (m_play)
-        m_play->setEnabled((!m_gameElf.isEmpty() || m_plainRunner) && m_gameDataValid);
+    {
+        const bool enabled = (!m_gameElf.isEmpty() || m_plainRunner) && m_gameDataValid;
+        m_play->setEnabled(enabled);
+        setButtonGlow(m_play, m_playGlow, m_playGlowAnim, enabled);   // [glow] PLAY pulses while enabled
+    }
 
     updateHint();
 }
@@ -294,6 +310,12 @@ bool LauncherWindow::openInstallWizard()
     InstallWizardDialog dlg(this);
     const bool installed = dlg.exec() == QDialog::Accepted;
     checkGameData();
+    if (installed && dlg.wantTexturePack())
+    {
+        // The wizard's final page recommended the pack and the user chose Next.
+        TexInstallDialog tex(this);
+        tex.exec();
+    }
     return installed && m_gameDataValid;
 }
 
@@ -315,8 +337,61 @@ void LauncherWindow::showEvent(QShowEvent *e)
 
 void LauncherWindow::onSettingsClicked()
 {
+    stopSettingsGlow();
     SettingsDialog dlg(this);
     dlg.exec();
+}
+
+void LauncherWindow::startSettingsGlow()
+{
+    setButtonGlow(m_settings, m_settingsGlow, m_settingsGlowAnim, true);
+}
+
+void LauncherWindow::stopSettingsGlow()
+{
+    setButtonGlow(m_settings, m_settingsGlow, m_settingsGlowAnim, false);
+}
+
+void LauncherWindow::setButtonGlow(QPushButton *btn, QGraphicsDropShadowEffect *&fx,
+                                   QPropertyAnimation *&anim, bool on)
+{
+    if (!btn)
+        return;
+
+    if (on)
+    {
+        if (fx)
+            return;   // already glowing
+        fx = new QGraphicsDropShadowEffect(btn);
+        fx->setOffset(0, 0);
+        fx->setBlurRadius(6.0);
+        fx->setColor(QColor(255, 158, 26, 210));   // dbz::kAccent halo
+        btn->setGraphicsEffect(fx);
+
+        anim = new QPropertyAnimation(fx, "blurRadius", this);
+        anim->setDuration(1200);
+        anim->setLoopCount(-1);
+        anim->setEasingCurve(QEasingCurve::InOutSine);
+        anim->setKeyValueAt(0.0, 6.0);
+        anim->setKeyValueAt(0.5, 30.0);
+        anim->setKeyValueAt(1.0, 6.0);
+        anim->start();
+    }
+    else
+    {
+        if (anim)
+        {
+            anim->stop();
+            delete anim;
+            anim = nullptr;
+        }
+        if (fx)
+        {
+            // setGraphicsEffect(nullptr) makes QWidget delete the previous effect.
+            btn->setGraphicsEffect(nullptr);
+            fx = nullptr;
+        }
+    }
 }
 
 void LauncherWindow::loadBackground() { /* bg applied in paintEvent */ }

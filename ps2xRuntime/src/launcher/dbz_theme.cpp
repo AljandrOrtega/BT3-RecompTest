@@ -26,7 +26,7 @@ namespace dbz
     QString stylesheet()
     {
         return QString(R"QSS(
-        QWidget { background-color: %1; color: %2; }
+        QWidget { background-color: %1; color: %4; }
         QMainWindow { background-color: %1; }
 
         QDialog {

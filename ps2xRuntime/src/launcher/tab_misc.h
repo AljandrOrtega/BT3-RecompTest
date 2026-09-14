@@ -6,8 +6,8 @@ class QCheckBox;
 class QLabel;
 class QPushButton;
 
-// "Misc" settings tab: shows the installed game data status (size + validity
-// dot) and a Reinstall Mode toggle that exposes the Install Wizard.
+// "Misc" settings tab: game data status (size + validity dot), the Install
+// Wizard, and the texture-pack section (enable toggle, status dot, install).
 class MiscTab : public QWidget
 {
     Q_OBJECT
@@ -19,6 +19,9 @@ private slots:
     void onReinstallMode(bool on);
     void onInstallWizard();
     void onOpenFolder();
+    void onTexPackToggled(bool on);
+    void onInstallPack();
+    void onTexPackFolder();
 
 private:
     QLabel *m_size = nullptr;
@@ -27,4 +30,11 @@ private:
     QCheckBox *m_reinstall = nullptr;
     QPushButton *m_wizardBtn = nullptr;
     QPushButton *m_browse = nullptr;
+
+    // [texreplace]
+    QCheckBox *m_texCheck = nullptr;
+    QLabel *m_texDot = nullptr;
+    QLabel *m_texDotText = nullptr;
+    QPushButton *m_texInstall = nullptr;
+    QPushButton *m_texFolder = nullptr;
 };

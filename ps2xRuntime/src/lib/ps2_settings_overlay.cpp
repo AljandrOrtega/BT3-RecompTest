@@ -3,6 +3,7 @@
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
+#include "runtime/ps2_render_scale.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/pad_config.h"
 #if defined(__linux__)
@@ -13,16 +14,52 @@
 #include "rlImGui.h"
 #include "raylib.h"
 
+#include "runtime/ps2_toml.h"
+
 #include <fstream>
 #include <sstream>
 #include <filesystem>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 
-static const char *kConfigFileName = "bt3_settings.ini";
+static const char *kConfigFileName = "settings.toml";        // launcher + overlay + FMV share this
+static const char *kLegacyConfigFileName = "bt3_settings.ini"; // 0.x format, migrated on first load
 static const char *kDumpFileName = "bt3_settings_dump.log";
+
+static const char *kConfigHeader =
+    "# Dragon Ball Z: Budokai Tenkaichi 3 - Recompiled\n"
+    "# User settings - written by the launcher and the in-game overlay.\n"
+    "# Delete this file to reset everything to defaults.\n\n";
+
+namespace
+{
+    // --- settings.toml helpers -----------------------------------------------
+    const char *rendererName(int r)
+    {
+        switch (r) { case 0: return "opengl"; case 1: return "software"; case 2: return "parallel-gs"; default: return "parallel-gs"; }
+    }
+    int nameToRenderer(const std::string &s, int def)
+    {
+        if (s == "opengl" || s == "gl") return 0;
+        if (s == "software" || s == "sw") return 1;
+        if (s == "parallel-gs" || s == "parallel_gs" || s == "pgs") return 2;
+        return def;
+    }
+    std::string colorToHex(unsigned c)
+    {
+        char b[8]; std::snprintf(b, sizeof b, "#%06x", c & 0xFFFFFFu); return b;
+    }
+    unsigned hexToColor(const std::string &s, unsigned def)
+    {
+        if (s.empty()) return def;
+        try { return static_cast<unsigned>(std::stoul(s[0] == '#' ? s.substr(1) : s, nullptr, 16)) & 0xFFFFFFu; }
+        catch (...) { return def; }
+    }
+} // namespace
 
 // Deploy/retract animation timing for the overlay window (see PS2SettingsOverlay::draw).
 static constexpr float kOverlayAnimDuration = 0.16f; // seconds, open or close
@@ -298,15 +335,6 @@ void PS2SettingsOverlay::setConfigDirectory(const std::string &dir)
     }
 }
 
-static std::string trim(const std::string &s)
-{
-    auto start = s.find_first_not_of(" \t\r\n");
-    auto end = s.find_last_not_of(" \t\r\n");
-    if (start == std::string::npos)
-        return {};
-    return s.substr(start, end - start + 1);
-}
-
 // Declared here rather than including GLFW/glfw3.h, which clashes with raylib.h.
 extern "C" int glfwJoystickIsGamepad(int jid);
 extern "C" const char *glfwGetJoystickName(int jid);
@@ -367,7 +395,7 @@ void PS2SettingsOverlay::initialize()
     // overlay is opened for the first time (m_deviceList is otherwise only populated
     // when the overlay opens via resetCaptureState/buildDeviceList).
     buildDeviceList();
-    // Apply all loaded settings (glow, postfx, volume, etc.) at startup.
+    // Apply all loaded settings (glow, volume, etc.) at startup.
     applySettings();
     // Snapshot the persisted settings so shutdown() only rewrites the ini when the
     // session actually changed something (keeps launcher-authored values intact).
@@ -395,7 +423,6 @@ bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
            gpuRenderer == o.gpuRenderer &&
            renderer == o.renderer &&
            glow == o.glow &&
-           postfx == o.postfx &&
            glowFix == o.glowFix &&
            bilinear == o.bilinear &&
            halfTexel == o.halfTexel &&
@@ -470,161 +497,72 @@ void PS2SettingsOverlay::loadSettings()
     if (!file.is_open())
         return;
 
-    std::string section;
-    std::string line;
-    while (std::getline(file, line))
+    ps2x_toml::Document doc;
+    doc.parse(file);
+
+    m_settings.masterVolume = std::clamp((float)doc.getD("audio.master_volume", m_settings.masterVolume), 0.0f, 1.0f);
+    m_settings.musicVolume = std::clamp((float)doc.getD("audio.music_volume", m_settings.musicVolume), 0.0f, 1.0f);
+    m_settings.sfxVolume = std::clamp((float)doc.getD("audio.sfx_volume", m_settings.sfxVolume), 0.0f, 1.0f);
+
     {
-        line = trim(line);
-        if (line.empty() || line[0] == '#' || line[0] == ';')
-            continue;
-
-        if (line[0] == '[')
-        {
-            auto end = line.find(']');
-            if (end != std::string::npos)
-                section = trim(line.substr(1, end - 1));
-            continue;
-        }
-
-        auto eq = line.find('=');
-        if (eq == std::string::npos)
-            continue;
-
-        std::string key = trim(line.substr(0, eq));
-        std::string val = trim(line.substr(eq + 1));
-
-        try
-        {
-            if (section == "audio")
-            {
-                if (key == "master_volume")
-                    m_settings.masterVolume = std::clamp(std::stof(val), 0.0f, 1.0f);
-                else if (key == "music_volume")
-                    m_settings.musicVolume = std::clamp(std::stof(val), 0.0f, 1.0f);
-                else if (key == "sfx_volume")
-                    m_settings.sfxVolume = std::clamp(std::stof(val), 0.0f, 1.0f);
-            }
-            else if (section == "video")
-            {
-                if (key == "gpu_renderer")
-                    { if (!envUserSet("PS2X_GPU")) m_settings.gpuRenderer = (val == "1" || val == "true"); }
-                else if (key == "renderer")
-                {   // [renderer] 0 OpenGL / 1 software / 2 paraLLEl-GS
-                    int r = std::atoi(val.c_str());
+        int r = nameToRenderer(doc.getS("video.renderer", rendererName(m_settings.renderer)), m_settings.renderer);
 #if !defined(PS2X_HAVE_PGS)
-                    if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
+        if (r == Settings::kRendererParallelGS) r = Settings::kRendererOpenGL;
 #endif
-                    if (r >= 0 && r <= 2) { m_settings.renderer = r; m_sawRendererKey = true; }
-                }
-                else if (key == "glow")
-                    { if (!envUserSet("PS2X_GLOW")) m_settings.glow = (val == "1" || val == "true"); }
-                else if (key == "glowfix")
-                    { if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = (val == "1" || val == "true"); }
-                else if (key == "ink_strength")
-                    { if (!envUserSet("PS2X_INKSTRENGTH") && !envUserSet("PS2X_ADGS"))
-                          m_settings.inkStrength = std::clamp(std::atoi(val.c_str()), 100, 400); }
-                else if (key == "ink_width")
-                    m_settings.inkWidth = std::clamp(std::atoi(val.c_str()), 25, 100);
-                else if (key == "ink_color")
-                    m_settings.inkColor = static_cast<unsigned>(std::strtoul(val.c_str(), nullptr, 16)) & 0xFFFFFFu;
-                else if (key == "postfx")
-                    { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
-                else if (key == "bilinear")
-                    { if (!envUserSet("PS2X_BILINEAR")) m_settings.bilinear = (val == "1" || val == "true"); }
-                else if (key == "halftexel")
-                    { if (!envUserSet("PS2X_HALFTEXEL")) m_settings.halfTexel = (val == "1" || val == "true"); }
-                else if (key == "skippost")
-                    { if (!envUserSet("PS2X_SKIPPOST")) m_settings.skipPost = (val == "1" || val == "true"); }
-                else if (key == "skip_stale_vram")
-                    { if (!envUserSet("PS2X_SKIP_STALE_VRAM")) m_settings.skipStaleVram = (val == "1" || val == "true"); }
-                else if (key == "render_scale")
-                {
-                    int s = std::atoi(val.c_str());
-                    if (!envUserSet("PS2X_RENDER_SCALE")) m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
-                }
-                else if (key == "outline")
-                { if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = (val == "1" || val == "true"); }
-                else if (key == "texture_pack")
-                { if (!envUserSet("PS2X_TEXPACK")) m_settings.texPack = (val == "1" || val == "true"); }
-                else if (key == "shadows")
-                { if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = (val == "1" || val == "true"); }
-                else if (key == "dof_blur")
-                { if (!envUserSet("PS2X_DOFMASK")) m_settings.dofBlur = (val == "1" || val == "true"); }
-                else if (key == "dof_zfar")
-                { if (!envUserSet("PS2X_DOFZFAR")) m_settings.dofZFar = std::clamp(std::atoi(val.c_str()), 20000, 800000); }
-                else if (key == "fullscreen")
-                    m_settings.fullscreen = (val == "1" || val == "true");
-                else if (key == "widescreen")
-                    m_settings.widescreen = (val == "1" || val == "true");
-                else if (key == "fps60")
-                    m_settings.fps60 = (val == "1" || val == "true");
-                else if (key == "window_w")
-                    m_settings.windowW = std::atoi(val.c_str());
-                else if (key == "window_h")
-                    m_settings.windowH = std::atoi(val.c_str());
-                else if (key == "force_bilinear")
-                    m_settings.forceBilinear = (val == "1" || val == "true");
-                else if (key == "hud_layout")
-                    m_settings.hudLayout = std::atoi(val.c_str());
-                else if (key == "hud_off_l")
-                    m_settings.hudOffL = std::atoi(val.c_str());
-                else if (key == "hud_off_c")
-                    m_settings.hudOffC = std::atoi(val.c_str());
-                else if (key == "hud_off_r")
-                    m_settings.hudOffR = std::atoi(val.c_str());
-            }
-            else if (section == "controllers")
-            {
-                if (key == "deadzone")
-                    m_settings.deadzone = std::clamp(std::stof(val), 0.0f, 0.5f);
-                else if (key == "overlay_enabled")
-                    m_settings.overlayEnabled = (val == "1" || val == "true");
-                else if (key == "device")
-                    m_selectedDevice = std::clamp(std::stoi(val), 0, 100);
-                else if (key == "overlay_pad_btns")
-                {
-                    m_settings.overlayPadBtns.clear();
-                    std::stringstream ss(val);
-                    std::string tok;
-                    while (std::getline(ss, tok, ','))
-                        m_settings.overlayPadBtns.push_back(std::clamp(std::stoi(tok), 0, 31));
-                }
-                else if (key == "overlay_keys")
-                {
-                    m_settings.overlayKeys.clear();
-                    std::stringstream ss(val);
-                    std::string tok;
-                    while (std::getline(ss, tok, ','))
-                        m_settings.overlayKeys.push_back(std::clamp(std::stoi(tok), 32, 348));
-                }
-            }
-            else if (section == "logging")
-            {
-                if (key == "dump_audio")
-                    m_dumpAudio = (val == "1" || val == "true");
-                else if (key == "dump_video")
-                    m_dumpVideo = (val == "1" || val == "true");
-                else if (key == "dump_controllers")
-                    m_dumpControllers = (val == "1" || val == "true");
-                else if (key == "dump_runtime")
-                    m_dumpRuntime = (val == "1" || val == "true");
-                else if (key == "dump_gamepad")
-                    m_dumpGamepad = (val == "1" || val == "true");
-                else if (key == "log_level")
-                {   // [loglevel] clamp to 0..3 so a bad INI value never disables logging silently
-                    m_settings.logLevel = std::clamp(std::atoi(val.c_str()), 0, 3);
-                    s_logLevel = m_settings.logLevel;
-                }
-            }
-        }
-        catch (const std::exception &)
-        {
-        }
+        if (r >= 0 && r <= 2) { m_settings.renderer = r; m_sawRendererKey = true; }
     }
-    // [renderer] legacy ini (no `renderer` key): gpu_renderer=0 meant the software rasterizer; otherwise the default
-    // backend, which is paraLLEl-GS when built in. Either way keep gpuRenderer coherent for the older readers.
-    if (!m_sawRendererKey)
-        m_settings.renderer = m_settings.gpuRenderer ? Settings::kRendererDefault : Settings::kRendererSoftware;
+    if (!envUserSet("PS2X_GLOW")) m_settings.glow = doc.getB("video.glow", m_settings.glow);
+    if (!envUserSet("PS2X_GLOWFIX")) m_settings.glowFix = doc.getB("video.glowfix", m_settings.glowFix);
+    if (!envUserSet("PS2X_INKSTRENGTH") && !envUserSet("PS2X_ADGS"))
+        m_settings.inkStrength = std::clamp(doc.getI("video.ink_strength", m_settings.inkStrength), 100, 400);
+    m_settings.inkWidth = std::clamp(doc.getI("video.ink_width", m_settings.inkWidth), 25, 100);
+    m_settings.inkColor = hexToColor(doc.getS("video.ink_color", colorToHex(m_settings.inkColor)), m_settings.inkColor);
+    if (!envUserSet("PS2X_BILINEAR")) m_settings.bilinear = doc.getB("video.bilinear", m_settings.bilinear);
+    if (!envUserSet("PS2X_HALFTEXEL")) m_settings.halfTexel = doc.getB("video.halftexel", m_settings.halfTexel);
+    if (!envUserSet("PS2X_SKIPPOST")) m_settings.skipPost = doc.getB("video.skippost", m_settings.skipPost);
+    if (!envUserSet("PS2X_SKIP_STALE_VRAM")) m_settings.skipStaleVram = doc.getB("video.skip_stale_vram", m_settings.skipStaleVram);
+    if (!envUserSet("PS2X_RENDER_SCALE"))
+    {
+        const int s = doc.getI("video.render_scale", m_settings.renderScale);
+        m_settings.renderScale = (s >= 1 && s <= 4) ? s : 1;
+    }
+    if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = doc.getB("video.outline", m_settings.outline);
+    if (!envUserSet("PS2X_TEXPACK")) m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
+    if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = doc.getB("video.shadows", m_settings.shadows);
+    if (!envUserSet("PS2X_DOFMASK")) m_settings.dofBlur = doc.getB("video.dof_blur", m_settings.dofBlur);
+    if (!envUserSet("PS2X_DOFZFAR")) m_settings.dofZFar = std::clamp(doc.getI("video.dof_zfar", m_settings.dofZFar), 20000, 800000);
+    m_settings.fullscreen = doc.getB("video.fullscreen", m_settings.fullscreen);
+    m_settings.widescreen = doc.getB("video.widescreen", m_settings.widescreen);
+    m_settings.fps60 = doc.getB("video.fps60", m_settings.fps60);
+    m_settings.windowW = doc.getI("video.window_w", m_settings.windowW);
+    m_settings.windowH = doc.getI("video.window_h", m_settings.windowH);
+    m_settings.forceBilinear = doc.getB("video.force_bilinear", m_settings.forceBilinear);
+    m_settings.hudLayout = doc.getI("video.hud.layout", m_settings.hudLayout);
+    m_settings.hudOffL = doc.getI("video.hud.offset_left", m_settings.hudOffL);
+    m_settings.hudOffC = doc.getI("video.hud.offset_center", m_settings.hudOffC);
+    m_settings.hudOffR = doc.getI("video.hud.offset_right", m_settings.hudOffR);
+
+    m_settings.deadzone = std::clamp((float)doc.getD("controllers.deadzone", m_settings.deadzone), 0.0f, 0.5f);
+    m_settings.overlayEnabled = doc.getB("controllers.overlay_enabled", m_settings.overlayEnabled);
+    m_selectedDevice = std::clamp(doc.getI("controllers.device", m_selectedDevice), 0, 100);
+    {
+        std::vector<int> pb = doc.getIA("controllers.hotkey.pad_btns", m_settings.overlayPadBtns);
+        for (int &b : pb) b = std::clamp(b, 0, 31);
+        if (!pb.empty()) m_settings.overlayPadBtns = pb;
+        std::vector<int> keys = doc.getIA("controllers.hotkey.keys", m_settings.overlayKeys);
+        for (int &k : keys) k = std::clamp(k, 32, 348);
+        if (!keys.empty()) m_settings.overlayKeys = keys;
+    }
+
+    m_dumpAudio = doc.getB("logging.dump_audio", m_dumpAudio);
+    m_dumpVideo = doc.getB("logging.dump_video", m_dumpVideo);
+    m_dumpControllers = doc.getB("logging.dump_controllers", m_dumpControllers);
+    m_dumpRuntime = doc.getB("logging.dump_runtime", m_dumpRuntime);
+    m_dumpGamepad = doc.getB("logging.dump_gamepad", m_dumpGamepad);
+    m_settings.logLevel = std::clamp(doc.getI("logging.log_level", m_settings.logLevel), 0, 3);
+    s_logLevel = m_settings.logLevel;
+
+    // [renderer] keep gpuRenderer coherent for the older readers.
     m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);
 }
 
@@ -646,7 +584,7 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     if (renderer == 2)
     {
         setEnvDefault("PS2X_PGS", "1");
-        // [pgslive] pack mode only when a pack is actually INDEXED (PS2X_TEXREPLACE or ./textures): the Texture
+        // [pgslive] pack mode only when a pack is actually INDEXED (PS2X_TEXREPLACE or data/Textures): the Texture
         // Replacement switch is greyed out without one, and pack mode costs a second packet walk per frame (a laptop
         // 4060 log showed 17-26 ms/swap of backend CPU at 4x with the switch on and NO pack). With a pack the switch
         // still flips live in either direction. PS2X_PGS_PACK=0 in the env forces the exclusive path.
@@ -663,139 +601,120 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
 
 void PS2SettingsOverlay::preloadSettings()
 {
-    const std::string iniPath = s_configDir.empty()
+    const std::string configPath = s_configDir.empty()
         ? (std::filesystem::current_path() / kConfigFileName).string()
         : (std::filesystem::path(s_configDir) / kConfigFileName).string();
-    std::ifstream file(iniPath);
-    int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no ini exists yet
-    bool texPackPre = true;
+    int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no toml exists yet
+    bool texPackPre = false;
     bool forceBilinearPre = true;
+
+    std::ifstream file(configPath);
     if (!file.is_open())
     {
+        // 0.x legacy INI: the launcher imports it and writes the TOML (dropping the old
+        // file). Running the runner directly, just clear a stray leftover.
+        const std::string legacy = s_configDir.empty()
+            ? (std::filesystem::current_path() / kLegacyConfigFileName).string()
+            : (std::filesystem::path(s_configDir) / kLegacyConfigFileName).string();
+        std::error_code ec;
+        std::filesystem::remove(legacy, ec);
         exportRendererEnv(rendererPre, texPackPre, forceBilinearPre);
         return;
     }
 
-    std::string section;
-    std::string line;
-    while (std::getline(file, line))
+    ps2x_toml::Document doc;
+    doc.parse(file);
+
+    s_widescreen = doc.getB("video.widescreen", s_widescreen);
+    rendererPre = nameToRenderer(doc.getS("video.renderer", rendererName(rendererPre)), rendererPre);
+    texPackPre = doc.getB("video.texture_pack", texPackPre);
+    forceBilinearPre = doc.getB("video.force_bilinear", forceBilinearPre);
+    {   // [rscale] authoritative startup application -- runs before anything reads the
+        // live scale, so the TOML value wins the lazy-init race.
+        const int rs = doc.getI("video.render_scale", 0);
+        if (rs >= 1 && rs <= 4 && !envUserSet("PS2X_RENDER_SCALE") && !envUserSet("PS2X_RENDERSCALE"))
+        {
+            GsGpuRenderer::setRenderScale(rs);
+            if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(rs);   // [pgslive] backend starts at the file scale
+        }
+    }
     {
-        line = trim(line);
-        if (line.empty() || line[0] == '#' || line[0] == ';')
-            continue;
-
-        if (line[0] == '[')
-        {
-            auto end = line.find(']');
-            if (end != std::string::npos)
-                section = trim(line.substr(1, end - 1));
-            continue;
-        }
-
-        auto eq = line.find('=');
-        if (eq == std::string::npos)
-            continue;
-
-        std::string key = trim(line.substr(0, eq));
-        std::string val = trim(line.substr(eq + 1));
-
-        if (section == "video" && key == "widescreen")
-            s_widescreen = (val == "1" || val == "true");
-        else if (section == "video" && key == "renderer")
-        {
-            const int r = std::atoi(val.c_str());
-            if (r >= 0 && r <= 2) rendererPre = r;
-        }
-        else if (section == "video" && key == "gpu_renderer")
-        {   // legacy: 0 = software (only honoured when no `renderer` key follows)
-            if (!(val == "1" || val == "true") && rendererPre == Settings::kRendererDefault) rendererPre = Settings::kRendererSoftware;
-        }
-        else if (section == "video" && key == "texture_pack")
-            texPackPre = (val == "1" || val == "true");
-        else if (section == "video" && key == "force_bilinear")
-            forceBilinearPre = (val == "1" || val == "true");
-        else if (section == "video" && key == "render_scale")
-        {   // [rscale] authoritative startup application -- runs before anything reads the
-            // live scale, so the INI value wins the lazy-init race.
-            if (!envUserSet("PS2X_RENDER_SCALE") && !envUserSet("PS2X_RENDERSCALE"))
-            {
-                int rs = std::atoi(val.c_str());
-                if (rs >= 1 && rs <= 4) GsGpuRenderer::setRenderScale(rs);
-                if (rs >= 1 && rs <= 4 && !envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(rs);   // [pgslive] backend starts at the INI scale
-            }
-        }
-        else if (section == "logging" && key == "log_level")
-        {   // [loglevel] capture for main(): must be visible before runtime init so the
-            // PS2X_* diagnostic env vars (and the stderr redirect to logs/bt3.log) apply.
-            const int lvl = std::clamp(std::atoi(val.c_str()), 0, 3);
-            s_logLevel = lvl;
-            s_startupLogLevel = lvl;
-        }
+        // [loglevel] capture for main(): must be visible before runtime init so the
+        // PS2X_* diagnostic env vars (and the stderr redirect to logs/bt3.log) apply.
+        const int lvl = std::clamp(doc.getI("logging.log_level", s_startupLogLevel), 0, 3);
+        s_logLevel = lvl;
+        s_startupLogLevel = lvl;
     }
     exportRendererEnv(rendererPre, texPackPre, forceBilinearPre);
 }
 
 void PS2SettingsOverlay::saveSettings() const
 {
+    using ps2x_toml::fmtBool;
+    using ps2x_toml::fmtDbl;
+    using ps2x_toml::fmtInt;
+    using ps2x_toml::fmtIntArray;
+    using ps2x_toml::fmtStr;
+
+    std::ostringstream os;
+    os << kConfigHeader << "\n";
+
+    os << "[audio]\n";
+    os << "master_volume = " << fmtDbl(m_settings.masterVolume) << "\n";
+    os << "music_volume = " << fmtDbl(m_settings.musicVolume) << "\n";
+    os << "sfx_volume = " << fmtDbl(m_settings.sfxVolume) << "\n\n";
+
+    os << "[video]\n";
+    os << "renderer = " << fmtStr(rendererName(m_settings.renderer)) << "\n";
+    os << "glow = " << fmtBool(m_settings.glow) << "\n";
+    os << "glowfix = " << fmtBool(m_settings.glowFix) << "\n";
+    os << "ink_strength = " << fmtInt(m_settings.inkStrength) << "\n";
+    os << "ink_width = " << fmtInt(m_settings.inkWidth) << "\n";
+    os << "ink_color = " << fmtStr(colorToHex(m_settings.inkColor)) << "\n";
+    os << "bilinear = " << fmtBool(m_settings.bilinear) << "\n";
+    os << "halftexel = " << fmtBool(m_settings.halfTexel) << "\n";
+    os << "skippost = " << fmtBool(m_settings.skipPost) << "\n";
+    os << "skip_stale_vram = " << fmtBool(m_settings.skipStaleVram) << "\n";
+    os << "render_scale = " << fmtInt(m_settings.renderScale) << "\n";
+    os << "outline = " << fmtBool(m_settings.outline) << "\n";
+    os << "texture_pack = " << fmtBool(m_settings.texPack) << "\n";
+    os << "shadows = " << fmtBool(m_settings.shadows) << "\n";
+    os << "dof_blur = " << fmtBool(m_settings.dofBlur) << "\n";
+    os << "dof_zfar = " << fmtInt(m_settings.dofZFar) << "\n";
+    os << "fullscreen = " << fmtBool(m_settings.fullscreen) << "\n";
+    os << "widescreen = " << fmtBool(m_settings.widescreen) << "\n";
+    os << "window_w = " << fmtInt(m_settings.windowW) << "\n";
+    os << "window_h = " << fmtInt(m_settings.windowH) << "\n";
+    os << "force_bilinear = " << fmtBool(m_settings.forceBilinear) << "\n";
+    os << "fps60 = " << fmtBool(m_settings.fps60) << "\n\n";
+
+    os << "[video.hud]\n";
+    os << "layout = " << fmtInt(m_settings.hudLayout) << "\n";
+    os << "offset_left = " << fmtInt(m_settings.hudOffL) << "\n";
+    os << "offset_center = " << fmtInt(m_settings.hudOffC) << "\n";
+    os << "offset_right = " << fmtInt(m_settings.hudOffR) << "\n\n";
+
+    os << "[controllers]\n";
+    os << "device = " << fmtInt(m_selectedDevice) << "\n";
+    os << "deadzone = " << fmtDbl(m_settings.deadzone) << "\n";
+    os << "overlay_enabled = " << fmtBool(m_settings.overlayEnabled) << "\n\n";
+
+    os << "[controllers.hotkey]\n";
+    os << "pad_btns = " << fmtIntArray(m_settings.overlayPadBtns) << "\n";
+    os << "keys = " << fmtIntArray(m_settings.overlayKeys) << "\n\n";
+
+    os << "[logging]\n";
+    os << "log_level = " << fmtInt(m_settings.logLevel) << "\n";
+    os << "dump_audio = " << fmtBool(m_dumpAudio) << "\n";
+    os << "dump_video = " << fmtBool(m_dumpVideo) << "\n";
+    os << "dump_controllers = " << fmtBool(m_dumpControllers) << "\n";
+    os << "dump_runtime = " << fmtBool(m_dumpRuntime) << "\n";
+    os << "dump_gamepad = " << fmtBool(m_dumpGamepad) << "\n";
+
     std::ofstream file(m_configPath, std::ios::trunc);
     if (!file.is_open())
         return;
-
-    file << "[audio]\n";
-    file << "master_volume=" << m_settings.masterVolume << "\n";
-    file << "music_volume=" << m_settings.musicVolume << "\n";
-    file << "sfx_volume=" << m_settings.sfxVolume << "\n\n";
-
-    file << "[video]\n";
-    file << "gpu_renderer=" << (m_settings.gpuRenderer ? "1" : "0") << "\n";
-    file << "renderer=" << m_settings.renderer << "\n";
-    file << "glow=" << (m_settings.glow ? "1" : "0") << "\n";
-    file << "glowfix=" << (m_settings.glowFix ? "1" : "0") << "\n";
-    file << "ink_strength=" << m_settings.inkStrength << "\n";
-    file << "ink_width=" << m_settings.inkWidth << "\n";
-    { char hex[16]; std::snprintf(hex, sizeof hex, "%06x", m_settings.inkColor); file << "ink_color=" << hex << "\n"; }
-    file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
-    file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
-    file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
-    file << "skippost=" << (m_settings.skipPost ? "1" : "0") << "\n";
-    file << "skip_stale_vram=" << (m_settings.skipStaleVram ? "1" : "0") << "\n";
-    file << "render_scale=" << m_settings.renderScale << "\n";
-    file << "outline=" << (m_settings.outline ? "1" : "0") << "\n";
-    file << "texture_pack=" << (m_settings.texPack ? "1" : "0") << "\n";
-    file << "shadows=" << (m_settings.shadows ? "1" : "0") << "\n";
-    file << "dof_blur=" << (m_settings.dofBlur ? "1" : "0") << "\n";
-    file << "dof_zfar=" << m_settings.dofZFar << "\n";
-    file << "fullscreen=" << (m_settings.fullscreen ? "1" : "0") << "\n";
-    file << "window_w=" << m_settings.windowW << "\n";
-    file << "window_h=" << m_settings.windowH << "\n";
-    file << "force_bilinear=" << (m_settings.forceBilinear ? "1" : "0") << "\n";
-    file << "hud_layout=" << m_settings.hudLayout << "\n";
-    file << "hud_off_l=" << m_settings.hudOffL << "\n";
-    file << "hud_off_c=" << m_settings.hudOffC << "\n";
-    file << "hud_off_r=" << m_settings.hudOffR << "\n";
-    file << "fps60=" << (m_settings.fps60 ? "1" : "0") << "\n";
-    file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
-
-    file << "[controllers]\n";
-    file << "deadzone=" << m_settings.deadzone << "\n";
-    file << "device=" << m_selectedDevice << "\n";
-    file << "overlay_enabled=" << (m_settings.overlayEnabled ? "1" : "0") << "\n";
-    file << "overlay_pad_btns=";
-    for (size_t i = 0; i < m_settings.overlayPadBtns.size(); ++i)
-        file << (i ? "," : "") << m_settings.overlayPadBtns[i];
-    file << "\n";
-    file << "overlay_keys=";
-    for (size_t i = 0; i < m_settings.overlayKeys.size(); ++i)
-        file << (i ? "," : "") << m_settings.overlayKeys[i];
-    file << "\n\n";
-
-    file << "[logging]\n";
-    file << "dump_audio=" << (m_dumpAudio ? "1" : "0") << "\n";
-    file << "dump_video=" << (m_dumpVideo ? "1" : "0") << "\n";
-    file << "dump_controllers=" << (m_dumpControllers ? "1" : "0") << "\n";
-    file << "dump_runtime=" << (m_dumpRuntime ? "1" : "0") << "\n";
-    file << "dump_gamepad=" << (m_dumpGamepad ? "1" : "0") << "\n";
-    file << "log_level=" << m_settings.logLevel << "\n";
+    file << os.str();
 }
 
 void PS2SettingsOverlay::applyDeadzone()
@@ -830,7 +749,6 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.glow = GsGpuRenderer::glowEnabled();
     m_settings.glowFix = GsGpuRenderer::glowFixEnabled();
     m_settings.inkStrength = GsGpuRenderer::inkStrengthPct();
-    m_settings.postfx = GsGpuRenderer::postfxEnabled();
     m_settings.bilinear = GsGpuRenderer::bilinearEnabled();
     m_settings.halfTexel = GsGpuRenderer::halfTexelEnabled();
     m_settings.skipPost = GsGpuRenderer::skipPostEnabled();
@@ -853,7 +771,6 @@ void PS2SettingsOverlay::applySettings()
     m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
     GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
     GsGpuRenderer::setGlow(m_settings.glow);
-    GsGpuRenderer::setPostfx(m_settings.postfx);
     // [glowfix] applied at STARTUP only: two of its four parts (the fbp224/fbp336 size caps)
     // are decided when the FBO is allocated, so flipping it mid-run would leave a half-applied
     // state -- and a partial glow fix is a REGRESSION (it washes the frame out).
@@ -1108,9 +1025,8 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
         PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
         m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
-    GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
+        GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
         GsGpuRenderer::setGlow(m_settings.glow);
-        GsGpuRenderer::setPostfx(m_settings.postfx);
         m_dirty = false;
     }
 
@@ -1231,6 +1147,12 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                 {
                     m_activeTab = 3;
                     drawLoggingTab();
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("  About"))
+                {
+                    m_activeTab = 4;
+                    drawAboutTab();
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -1435,8 +1357,6 @@ void PS2SettingsOverlay::drawVideoTab()
     // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
     //  measured them at 0.000 frame diff in fights -- their draw classes are
     //  superseded by the current serving pipeline. Env vars still work for devs.)
-    if (toggleSwitch("Post-FX", &m_settings.postfx))
-        m_dirty = true;
     {   // [glowfix] BT3's bloom/glow chain -- the Kaioken aura and every attack glow.
         const bool was = m_settings.glowFix;
         if (toggleSwitch("Glow (Kaioken aura)", &m_settings.glowFix))
@@ -1446,27 +1366,6 @@ void PS2SettingsOverlay::drawVideoTab()
         else if (was) ImGui::TextDisabled("Character/attack bloom. Off = the pre-fix look.");
     }
 
-    // (Render Scale UI removed in this integration: the scaling machinery's per-draw
-    // cost regressed the fight loop; the setting is still persisted for a future port.)
-    // Filtering
-    sectionHeader("QUALITY");
-    {   // internal render scale: scene buffers render at N x native (1x = PS2-native)
-        static const char *kScales[] = {"Native (1x)", "2x", "3x", "4x"};
-        int rsIdx = m_settings.renderScale - 1;
-        if (rsIdx < 0) rsIdx = 0; if (rsIdx > 3) rsIdx = 3;
-        ImGui::TextUnformatted("Internal Resolution");
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-        if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
-        {
-            m_settings.renderScale = rsIdx + 1;   // persisted to INI; OpenGL applies on next launch, paraLLEl-GS live
-            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
-            m_dirty = true;
-        }
-        if (m_settings.renderer == 2)
-            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
-        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
-            ImGui::TextDisabled("(applies on restart)");
-    }
     sectionHeader("FILTERING");
     if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
         m_dirty = true;
@@ -1485,6 +1384,11 @@ void PS2SettingsOverlay::drawVideoTab()
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
+        // [builtin-res] the internal render scale follows the resolution: 720p=1x,
+        // 1080p=2x, 1440p+=3x. Derive it from the current screen in fullscreen.
+        const int h = GetScreenHeight();
+        m_settings.renderScale = ps2xRenderScaleForHeight(h);
+        if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
@@ -1522,11 +1426,12 @@ void PS2SettingsOverlay::drawVideoTab()
     {
         static const int kRes[][2] = {{1024, 768}, {1280, 720}, {1360, 768},
                                       {1366, 768}, {1440, 900}, {1600, 900},
-                                      {1920, 1080}, {2560, 1440}, {3440, 1440}};
+                                      {1920, 1080}, {2560, 1440}, {3440, 1440}, {3840, 2160}};
         static const char *kResNames[] = {"1024 x 768 (4:3)", "1280 x 720", "1360 x 768",
                                           "1366 x 768", "1440 x 900", "1600 x 900",
-                                          "1920 x 1080", "2560 x 1440", "3440 x 1440 (ultrawide)"};
-        constexpr int kResCount = 9;
+                                          "1920 x 1080", "2560 x 1440", "3440 x 1440 (ultrawide)",
+                                          "3840 x 2160 (4K)"};
+        constexpr int kResCount = 10;
         int cur = -1;
         const int w = GetScreenWidth(), h = GetScreenHeight();
         for (int i = 0; i < kResCount; ++i)
@@ -1544,6 +1449,10 @@ void PS2SettingsOverlay::drawVideoTab()
                     SetWindowSize(kRes[i][0], kRes[i][1]);
                     m_settings.windowW = kRes[i][0];
                     m_settings.windowH = kRes[i][1];
+                    // [builtin-res] the internal render scale is built into the resolution:
+                    // 720p=1x, 1080p=2x, 1440p+=3x. paraLLEl-GS replays live at the new SSAA.
+                    m_settings.renderScale = ps2xRenderScaleForHeight(kRes[i][1]);
+                    if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
                     m_dirty = true;
                 }
             }
@@ -2061,6 +1970,43 @@ void PS2SettingsOverlay::drawLoggingTab()
     ImGui::TextDisabled("The dump file is appended with a timestamp on every write.");
 }
 
+void PS2SettingsOverlay::drawAboutTab()
+{
+    ImGui::Spacing();
+
+    sectionHeader("ABOUT");
+    ImGui::TextWrapped("Dragon Ball Z: Budokai Tenkaichi 3 - Recompiled");
+    ImGui::TextWrapped(
+        "A statically recompiled, native PC port built on PS2Recomp. The game's MIPS code "
+        "is translated to C++ at build time from your own disc image; no game content is "
+        "distributed with this project.");
+    ImGui::Spacing();
+
+    sectionHeader("CREDITS");
+    ImGui::TextWrapped("z3xox - owner / lead developer");
+    ImGui::TextDisabled("  recompiler, runtime (EE/GS/VU1/scheduler), renderer, game overrides, generators");
+    ImGui::TextWrapped("RexxColder - supporter / colaborador");
+    ImGui::TextDisabled("  optimizacion (perf/async), launcher + install wizard, input & gamepads, "
+                        "build/release, deploy, game-data (AFS/AFL), docs");
+    ImGui::TextWrapped("valenvivaldi - colaborador");
+    ImGui::TextDisabled("  port macOS arm64, packaging, audio");
+    ImGui::Spacing();
+
+    sectionHeader("THIRD-PARTY");
+    if (ImGui::BeginChild("##about_third", ImVec2(-1, 0), ImGuiChildFlags_Borders))
+    {
+        ImGui::TextWrapped("ran-j/PS2Recomp - static recompiler (upstream, GPL-3.0)");
+        ImGui::TextWrapped("ViveTheModder - NTSC-U AFS file lists (Apache-2.0)");
+        ImGui::TextWrapped("Arntzen Software - paraLLEl-GS (LGPL-3.0-or-later)");
+        ImGui::Spacing();
+    }
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("GPL-3.0. Not affiliated with Spike or Bandai Namco.");
+    ImGui::TextDisabled("github.com/z3xox/BT3-Recomp");
+}
+
 void PS2SettingsOverlay::dumpSettingsToFile()
 {
     const std::string dumpPath = s_configDir.empty()
@@ -2091,7 +2037,6 @@ void PS2SettingsOverlay::dumpSettingsToFile()
         file << "[Video]\n";
         file << "  gpu_renderer = " << (m_settings.gpuRenderer ? "1" : "0") << "\n";
         file << "  glow         = " << (m_settings.glow ? "1" : "0") << "\n";
-        file << "  postfx       = " << (m_settings.postfx ? "1" : "0") << "\n";
         file << "  bilinear     = " << (m_settings.bilinear ? "1" : "0") << "\n";
         file << "  halftexel    = " << (m_settings.halfTexel ? "1" : "0") << "\n";
         file << "  skip_post    = " << (m_settings.skipPost ? "1" : "0") << "\n";
@@ -2141,7 +2086,6 @@ void PS2SettingsOverlay::dumpSettingsToFile()
         file << "[Runtime]\n";
         file << "  gpu_renderer_enabled = " << (GsGpuRenderer::enabled() ? "1" : "0") << "\n";
         file << "  glow_enabled         = " << (GsGpuRenderer::glowEnabled() ? "1" : "0") << "\n";
-        file << "  postfx_enabled       = " << (GsGpuRenderer::postfxEnabled() ? "1" : "0") << "\n";
         file << "  bilinear_enabled     = " << (GsGpuRenderer::bilinearEnabled() ? "1" : "0") << "\n";
         file << "  halftexel_enabled    = " << (GsGpuRenderer::halfTexelEnabled() ? "1" : "0") << "\n";
         file << "  skip_post_enabled    = " << (GsGpuRenderer::skipPostEnabled() ? "1" : "0") << "\n";

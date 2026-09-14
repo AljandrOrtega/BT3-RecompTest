@@ -82,9 +82,9 @@ namespace
 
     // [deploy] Resolve the directory of the running executable (via /proc/self/exe so
     // argv[0] and CWD cannot steer it). The settings overlay anchors its savedata/,
-    // assets/, fonts and bt3_settings.ini off this directory, so a launcher can be
+    // assets/, fonts and settings.toml off this directory, so a launcher can be
     // double-clicked from any CWD and still find its portable files (same convention as
-    // the previous single-binary deploy: <exeDir>/savedata/bt3_settings.ini).
+    // the previous single-binary deploy: <exeDir>/savedata/settings.toml).
     std::filesystem::path getExecutableDirectory()
     {
         // [deploy] A self-extracting launcher stashes this runner in cache but its

@@ -118,6 +118,7 @@ InstallWizardDialog::InstallWizardDialog(QWidget *parent, bool reinstall)
     resize(520, 330);
     setModal(true);
     buildUi();
+    m_reinstall = reinstall;
     if (reinstall)
         setIndex(1); // straight to the disc dump selection
 }
@@ -280,6 +281,51 @@ void InstallWizardDialog::buildUi()
         l->addLayout(rowC);
     }
     m_stack->addWidget(pageC);
+
+    // --- Page D: post-install texture-pack recommendation (first install) ----
+    auto *pageD = new QWidget;
+    {
+        auto *l = new QVBoxLayout(pageD);
+        l->setContentsMargins(28, 24, 28, 24);
+        auto *head = new QLabel(QStringLiteral("Recommended: 4K Texture Pack"), pageD);
+        head->setStyleSheet(QStringLiteral("font-size: 17px; font-weight: 600; color: #ffd9a0;"));
+        l->addWidget(head);
+        l->addSpacing(12);
+
+        auto *body = new QLabel(
+            QStringLiteral("We strongly recommend installing the 4K texture pack. It replaces the "
+                           "game's textures with high-resolution ones and greatly improves the visuals.\n\n"
+                           "You can do it now, or later from Settings -> Misc -> Install texture pack."),
+            pageD);
+        body->setWordWrap(true);
+        body->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
+        l->addWidget(body);
+        l->addStretch(1);
+
+        auto *rowD = new QHBoxLayout;
+        rowD->addStretch(1);
+        auto *recClose = new QPushButton(QStringLiteral("Close"), pageD);
+        recClose->setObjectName(QStringLiteral("wizardButton"));
+        recClose->setCursor(Qt::PointingHandCursor);
+        connect(recClose, &QPushButton::clicked, this, [this] {
+            if (m_installed)
+                accept();
+            else
+                reject();
+        });
+        rowD->addWidget(recClose);
+        rowD->addSpacing(8);
+        m_recNext = new QPushButton(QStringLiteral("Next"), pageD);
+        m_recNext->setObjectName(QStringLiteral("wizardButton"));
+        m_recNext->setCursor(Qt::PointingHandCursor);
+        connect(m_recNext, &QPushButton::clicked, this, [this] {
+            m_wantTexPack = true;
+            accept();
+        });
+        rowD->addWidget(m_recNext);
+        l->addLayout(rowD);
+    }
+    m_stack->addWidget(pageD);
 }
 
 void InstallWizardDialog::setIndex(int index)
@@ -528,6 +574,10 @@ void InstallWizardDialog::applyInstallResult(bool ok, const QString &msg)
         m_doneLabel->setText(msg);
         m_doneLabel->setStyleSheet(QStringLiteral("font-size: 13px; color: #22c55e;"));
         m_bar->setValue(m_bar->maximum());
+        m_close->setEnabled(true);
+        if (!m_reinstall)
+            setIndex(3); // offer the texture pack on the first install
+        return;
     }
     else
     {

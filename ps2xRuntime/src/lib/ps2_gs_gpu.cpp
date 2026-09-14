@@ -1533,6 +1533,12 @@ std::atomic<bool> g_ps2xMapDrawSeen{false};
 
 // [fmvphase] Set by sceMpegGetPicture; lets the VRAM probes filter to the actual movie.
 std::atomic<uint32_t> g_ps2FmvActive{0u};
+// [movsync] True while a movie session is actually serving frames. Set by sceMpegGetPicture
+// (VIDEO INIT), cleared on Reset/Delete/finish/IsEnd (VIDEO END). Unlike g_ps2FmvActive, which
+// is a one-way "FMV phase reached" latch, this tracks the LIVE session (gates the FMV override).
+std::atomic<uint32_t> g_ps2MovieActive{0u};
+std::atomic<uint64_t> g_ps2MovieSession{0u};   // [movsync] increments on each VIDEO INIT
+std::atomic<uint32_t> g_ps2ForceSkipFrames{0u}; // [skipforce] >0: force skip on the next pad reads
 std::atomic<uint64_t> g_fmvLastEmitNs{0u};   // [fmvwindow] set by ps2GsEmitFmvFrame, read by the sceGsSwapDBuff stub
 // [fmvblit] framebuffer currently being filled by movie macroblocks, and its FBW.
 std::atomic<uint32_t> g_fmvPendingFbp{0xFFFFFFFFu};

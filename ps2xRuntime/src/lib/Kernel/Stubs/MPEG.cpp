@@ -18,6 +18,19 @@ extern "C"
 
 extern std::atomic<uint32_t> g_ps2FmvActive; // [fmvphase] defined in ps2_gs_gpu.cpp
 void ps2GsEmitFmvFrame();                   // [fmvblit] defined in ps2_gs_gpu.cpp
+extern std::atomic<uint32_t> g_ps2MovieActive;  // [movsync] defined in ps2_gs_gpu.cpp
+extern std::atomic<uint64_t> g_ps2MovieSession; // [movsync] defined in ps2_gs_gpu.cpp
+
+// [movsync] FMV session tracker: INIT on the first served picture, END on Reset/Delete/finish/IsEnd.
+// Always maintained (the override reads g_ps2MovieActive); the log is gated by PS2X_MOVIEPROBE.
+static void movprobeVideoEnd(const char *why)
+{
+    if (g_ps2MovieActive.exchange(0u, std::memory_order_relaxed) != 0u)
+    {
+        if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+            std::fprintf(stderr, "[movprobe] VIDEO END (%s)\n", why);
+    }
+}
 
 namespace ps2_stubs
 {
@@ -1115,6 +1128,10 @@ namespace ps2_stubs
             playback.streamEnded = true;
             playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
             flushDecoderIfEnded(playback);
+            if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+                std::cerr << "[movprobe] MPEG finishPlaybackStream mpeg=0x" << std::hex << mpegAddr
+                          << std::dec << " framesLeft=" << playback.decodedFrames.size() << std::endl;
+            movprobeVideoEnd("finish");
         }
 
         void appendPssBytes(uint32_t mpegAddr,
@@ -1820,6 +1837,9 @@ namespace ps2_stubs
             static std::atomic<uint32_t> n{0};
             if (n.fetch_add(1) < 4u) std::fprintf(stderr, "[mpegtrace] %s\n", __func__);
         }
+        if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+            std::fprintf(stderr, "[movprobe] MPEG Create mpeg=0x%x a0=0x%x a1=0x%x a2=0x%x\n",
+                         getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7));
         const uint32_t param_1 = getRegU32(ctx, 4); // a0
         const uint32_t param_2 = getRegU32(ctx, 5); // a1
         const uint32_t param_3 = getRegU32(ctx, 6); // a2
@@ -1906,6 +1926,9 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
         g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+        if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+            std::fprintf(stderr, "[movprobe] MPEG Delete mpeg=0x%x\n", mpegAddr);
+        movprobeVideoEnd("delete");
         setReturnU32(ctx, 0u);
     }
 
@@ -2222,6 +2245,13 @@ namespace ps2_stubs
         // Everything before this (Sofdec logo screen, menus) looks deceptively similar in the
         // draw logs, and attributing those to the movie has already cost several hours.
         ::g_ps2FmvActive.store(1u, std::memory_order_relaxed);
+        if (::g_ps2MovieActive.exchange(1u, std::memory_order_relaxed) == 0u)
+        {
+            const uint64_t sess = ::g_ps2MovieSession.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+                std::fprintf(stderr, "[movprobe] VIDEO INIT session=%llu mpeg=0x%x haveFrame=%d\n",
+                             (unsigned long long)sess, mpegAddr, haveFrame ? 1 : 0);
+        }
         ::ps2GsEmitFmvFrame(); // publish the movie frame currently in VRAM
 
         // [mpegtrace] Did a decoded frame actually come back, and at what size? Distinguishes
@@ -2342,6 +2372,20 @@ namespace ps2_stubs
             ++g_mpeg_stub_state.isEndTraceCount;
         }
 
+        if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+        {
+            static uint32_t s_lastEnd = 0xffffffffu;
+            const uint32_t e = ended ? 1u : 0u;
+            if (e != s_lastEnd)
+            {
+                s_lastEnd = e;
+                std::cerr << "[movprobe] MPEG IsEnd mpeg=0x" << std::hex << mpegAddr << std::dec
+                          << " ended=" << e << " frames=" << playback.decodedFrames.size()
+                          << " sawInput=" << playback.sawInput << std::endl;
+            }
+        }
+        if (ended) movprobeVideoEnd("isend");
+
         setReturnS32(ctx, (ended && playback.decodedFrames.empty()) ? 1 : 0);
     }
 
@@ -2359,6 +2403,9 @@ namespace ps2_stubs
     {
         (void)runtime;
         const uint32_t param_1 = getRegU32(ctx, 4);
+        if (const char *v = std::getenv("PS2X_MOVIEPROBE"); v && v[0] && v[0] != '0')
+            std::fprintf(stderr, "[movprobe] MPEG Reset mpeg=0x%x\n", param_1);
+        movprobeVideoEnd("reset");
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);

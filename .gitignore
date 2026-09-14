@@ -49,3 +49,8 @@ build_*/
 
 # Agent instructions file, local only
 AGENTS.md
+
+# local deploy output + video scratch (game content, never commit)
+deploy/
+fmv_build/
+launcher-build-log.txt

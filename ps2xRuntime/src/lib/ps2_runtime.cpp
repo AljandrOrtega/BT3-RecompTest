@@ -1,6 +1,7 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
@@ -31,6 +32,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/CD.h"   // [fmvoverride] ps2_stubs::overrideCdFile
 #include "ps2_host_backend.h"
 #include "ps2_settings_overlay.h"
 #include "raylib.h" // window icon (deploy assets/icon.png)
@@ -1266,9 +1268,20 @@ bool PS2Runtime::initialize(const char *title)
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
             // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
             // from the moment it opens and the "[texreplace] indexed N" line appears at boot.
-            // (The textures/ folder itself ships in the repo and is staged next to the binary by
-            // CMake; the create-if-absent inside buildIndex is only a fallback for a foreign CWD.)
+            // (The pack lives in <exeDir>/data/Textures -- the deploy's data/ dir next to the
+            // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
+        }
+        {   // [fmvoverride] If the opening-video override is active (env, or Texture Replacement on
+            // with the pack installed), serve the pack's opening PSS/ADX in place of the game's.
+            // Per-file: a missing pack asset keeps the original file.
+            if (ps2x_fmv::enabled())
+            {
+                const std::string pss = ps2x_fmv::packAsset("ZS3USOP.PSS");
+                if (!pss.empty()) ps2_stubs::overrideCdFile("\\DATA\\ZS3USOP.PSS;1", pss);
+                const std::string adx = ps2x_fmv::packAsset("ZS3USOP.ADX");
+                if (!adx.empty()) ps2_stubs::overrideCdFile("\\DATA\\ZS3USOP.ADX;1", adx);
+            }
         }
         // [barblock] manual pacing: the present thread must service guest barriers every few
         // hundred microseconds, which it cannot do while asleep inside EndDrawing's frame cap.
@@ -4288,6 +4301,36 @@ void PS2Runtime::run()
                     g_bt3StateLive.store(st, std::memory_order_relaxed);
                 }
             }
+            {   // [movprobe] PS2X_MOVIEPROBE=1: log the movie state block (0x00301048) and
+                // g_ps2FmvActive on every change, every heartbeat (bit3 = finished/skipped).
+                static const bool s_mp = [](){ const char *v = std::getenv("PS2X_MOVIEPROBE"); return v && v[0] && v[0] != '0'; }();
+                if (s_mp)
+                {
+                    extern std::atomic<uint32_t> g_ps2FmvActive;   // defined in ps2_gs_gpu.cpp
+                    extern std::atomic<uint32_t> g_ps2MovieActive; // [movsync]
+                    const uint32_t fmv = g_ps2FmvActive.load(std::memory_order_relaxed) != 0u ? 1u : 0u;
+                    const uint32_t mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u ? 1u : 0u;
+                    if (const uint8_t *rd = m_memory.getRDRAM())
+                    {
+                        uint32_t st = 0u, lvl = 0u;
+                        std::memcpy(&st, rd + (0x301048u & PS2_RAM_MASK), 4);
+                        std::memcpy(&lvl, rd + (0x301050u & PS2_RAM_MASK), 4);
+                        static uint32_t s_st = 0xffffffffu, s_lvl = 0xffffffffu, s_fmv = 2u, s_mov = 2u;
+                        if (st != s_st || lvl != s_lvl || fmv != s_fmv || mov != s_mov)
+                        {
+                            s_st = st; s_lvl = lvl; s_fmv = fmv; s_mov = mov;
+                            std::cerr << "[movprobe] @301048=0x" << std::hex << st
+                                      << " [b0=" << (st & 1u) << " b2=" << ((st >> 2) & 1u)
+                                      << " b3=" << ((st >> 3) & 1u) << "]"
+                                      << std::dec << " level=" << lvl << " fmvActive=" << fmv
+                                      << " movieActive=" << mov
+                                      << " vsync=" << ps2_syscalls::GetCurrentVSyncTick()
+                                      << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                                      << std::dec << std::endl;
+                        }
+                    }
+                }
+            }
             if ((s_hbTick % 600u) == 0u)
             {
                 // BT3 overlay game-state: FUN_00336a90 switches on *(*(0x2ff10c)+0x18).
@@ -4368,12 +4411,12 @@ void PS2Runtime::run()
                           << " fade=" << fadeState << "/" << fadeLevel
                           << " introSub=" << s_introSub << " introTimer=" << s_introTimer << "/1800"
                           << std::dec << std::endl;
-                // ===================== [hstate] Jerarquía legible de estados =====================
-                // Traduce bt3State (raw) a fase + sub-fase humana. BOOT y MENU están mapeados con
-                // offsets ya documentados en tasks/main_menu_state_machine.md y tasks/ESTATUS.md.
-                // FIGHT/IN_FIGHT todavía no tienen los offsets de "tipo de combate"
-                // jugador vs CPU / 2 jugadores) identificados -> ver el bloque [fightprobe] más abajo,
-                // que es el que junta la evidencia para poder completar este switch.
+                // ===================== [hstate] Readable state hierarchy =====================
+                // Translates bt3State (raw) to a human phase + sub-phase. BOOT and MENU are mapped
+                // with offsets already documented in tasks/main_menu_state_machine.md and tasks/ESTATUS.md.
+                // FIGHT/IN_FIGHT do not yet have the "match type" offsets (player vs CPU / 2 players)
+                // identified -> see the [fightprobe] block below, which gathers the evidence to
+                // complete this switch.
                 if (const uint8_t *rd = m_memory.getRDRAM())
                 {
                     auto r32safe = [&](uint32_t addr) -> uint32_t {
@@ -4393,11 +4436,11 @@ void PS2Runtime::run()
                     case 0x01u:
                     {
                         phase = "BOOT";
-                        extern std::atomic<uint32_t> g_ps2FmvActive; // [hstate] definido en ps2_gs_gpu.cpp
+                        extern std::atomic<uint32_t> g_ps2FmvActive; // [hstate] defined in ps2_gs_gpu.cpp
                         const bool fmv = g_ps2FmvActive.load(std::memory_order_relaxed) != 0u;
                         const ps2_stubs::MemoryCardDebugSnapshot mc = ps2_stubs::getMemoryCardDebugSnapshot();
-                        // Heurística best-effort: refinar una vez que tengamos logs reales de un boot
-                        // completo (memcard aparece antes de que exista introTimer > 0).
+                        // Best-effort heuristic: refine once we have real logs of a full boot
+                        // (memcard shows up before introTimer > 0 exists).
                         if (!mc.openFiles.empty())
                             sub = "MEMCARD_LOAD(openFiles=" + std::to_string(mc.openFiles.size())
                                 + ",lastCmd=" + hex32(mc.lastCmd) + ")";
@@ -4409,7 +4452,7 @@ void PS2Runtime::run()
                         else if (s_introTimer > 0)
                             sub = "TITLE_SPLASH(timer=" + std::to_string(s_introTimer) + "/1800)";
                         else
-                            sub = "SPLASH_LOGOS(sin marcador exacto todavia)";
+                            sub = "SPLASH_LOGOS(no exact marker yet)";
                         break;
                     }
                     case 0x04u:
@@ -4423,8 +4466,8 @@ void PS2Runtime::run()
                             const uint32_t subStruct = r32safe(mainStruct + 0x9A4u);
                             const uint32_t menuState = (subStruct && subStruct != 0xffffffffu)
                                 ? r32safe(subStruct + 0x40u) : 0xffffffffu;
-                            // Cursor/selección/estado del item activo: *(0x3B38E8)+0x12C/0x138/0x13C
-                            // (offsets documentados en tasks/ESTATUS.md y main_menu_state_machine.md).
+                            // Cursor/selection/state of the active item: *(0x3B38E8)+0x12C/0x138/0x13C
+                            // (offsets documented in tasks/ESTATUS.md and main_menu_state_machine.md).
                             const uint32_t itemBase = r32safe(0x3B38E8u);
                             int32_t cursor = -1, selection = -1; uint32_t itemState = 0xffffffffu;
                             if (itemBase != 0u && itemBase != 0xffffffffu)
@@ -4446,14 +4489,14 @@ void PS2Runtime::run()
                             else o << hex32(itemState);
                             sub = o.str();
                         }
-                        else sub = "mainStruct=0 (menu aun no inicializado)";
+                        else sub = "mainStruct=0 (menu not initialised yet)";
                         break;
                     }
                     case 0x06u: phase = "LOADING"; break;
                     case 0x26u: case 0x28u: case 0x29u:
                         phase = "PREFIGHT_SETUP"; sub = "raw=" + hex32(bt3State); break;
-                    case 0x27u: phase = "FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
-                    case 0x2Du: phase = "IN_FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
+                    case 0x27u: phase = "FIGHT";   sub = "mode=? (see [fightprobe])"; break;
+                    case 0x2Du: phase = "IN_FIGHT";   sub = "mode=? (see [fightprobe])"; break;
                     case 0x38u: phase = "POST_FIGHT"; break;
                     default: break;
                     }
@@ -4461,16 +4504,16 @@ void PS2Runtime::run()
                     std::cerr << "[hstate] phase=" << phase << " sub=" << sub
                               << " raw=" << hex32(bt3State) << std::endl;
                 }
-                // ===================== [fightprobe] Diagnóstico de tipo de combate =====================
-                // PS2X_FIGHTPROBE=1: en cada transición de bt3state hacia 0x26/0x27/0x2D vuelca:
-                //  (a) qué puertos de pad están siendo efectivamente leídos (readCount creciendo)
-                //      -> distingue CPU vs CPU (ningún puerto avanza) de P1 vs CPU (solo puerto 0)
-                //      de P1 vs P2 local (puertos 0 y 1).
-                //  (b) un hexdump de la región 0x3C00-0x3D00 del main-struct del menú (selección de
-                //      personaje/escenario/dificultad que se hizo en 0x04 antes de entrar a la pelea).
-                // Correr 3 veces (CPU-CPU, jugador-CPU, jugador-jugador local) y diffear las líneas
-                // [fightprobe] pegadas: el/los bytes que cambien de forma consistente entre corridas
-                // son el flag de "tipo de control" que hoy no está identificado.
+                // ===================== [fightprobe] Match-type diagnostic =====================
+                // PS2X_FIGHTPROBE=1: on every bt3state transition to 0x26/0x27/0x2D it dumps:
+                //  (a) which pad ports are actually being read (readCount growing)
+                //      -> distinguishes CPU vs CPU (no port advances) from P1 vs CPU (only port 0)
+                //      from local P1 vs P2 (ports 0 and 1).
+                //  (b) a hexdump of region 0x3C00-0x3D00 of the menu main-struct (character/stage/
+                //      difficulty selection made in 0x04 before entering the fight).
+                // Run 3 times (CPU-CPU, player-CPU, local player-player) and diff the pasted
+                // [fightprobe] lines: the byte(s) that change consistently between runs are the
+                // "control type" flag that is not identified today.
                 {
                     static const bool s_fightProbeOn = [](){
                         const char *v = std::getenv("PS2X_FIGHTPROBE"); return v && v[0] && v[0] != '0';
@@ -4508,25 +4551,25 @@ void PS2Runtime::run()
                         std::cerr << o.str() << std::endl;
                     }
                 }
-                // ===================== [menuhex] Estado del main menu =====================
-                // PS2X_MENUHEX=1: sondea TODOS los estados (0x04 root, 0x3e OPTIONS, 0x2c etc).
-                // vuelca cada vez que cambia el estado del menu.
-                //   mainPtr   = *(0x2FF10C)      (main game-state struct, ya usada por hstate)
+                // ===================== [menuhex] Main menu state =====================
+                // PS2X_MENUHEX=1: probes ALL states (0x04 root, 0x3e OPTIONS, 0x2c, etc).
+                // dumps each time the menu state changes.
+                //   mainPtr   = *(0x2FF10C)      (main game-state struct, also used by hstate)
                 //     +0x18   = screen_state_id  (bt3State)
-                //     +0x2C   = selected_entry_ID (la entry actualmente seleccionada)
-                //     +0x148  = cursor (indice en la lista de entries, 0-9)
+                //     +0x2C   = selected_entry_ID (the currently selected entry)
+                //     +0x148  = cursor (index into the entry list, 0-9)
                 //     +0x14   = visibility_flags (bit 6 = menu visible)
                 //     +0x68C  = transition_flags
                 //   dispPtr   = *(0x2FF28C)
                 //     +0x08   = display_filter (0-127)
                 //     +0xA0C  = frame_counter (0-24)
-                // Mas las jump tables fijas de overlay (ya confirmadas legibles):
+                // Plus the fixed overlay jump tables (already confirmed readable):
                 //   0x3B4290 jumpTable (10 handlers), 0x3B42C0 dispatch2 (5 handlers).
                 {
                     static const bool s_menuHexOn = [](){
                         const char *v = std::getenv("PS2X_MENUHEX"); return v && v[0] && v[0] != '0';
                     }();
-                    static std::string s_menuHexLastKey;   // fingerprint del ultimo estado volcado
+                    static std::string s_menuHexLastKey;   // fingerprint of the last dumped state
                     if (s_menuHexOn)
                     {
                         if (const uint8_t *rd3 = m_memory.getRDRAM())
@@ -4537,7 +4580,7 @@ void PS2Runtime::run()
                             const uint32_t mainPtr = r32m(0x2FF10Cu);
                             if (mainPtr == 0u || mainPtr == 0xffffffffu)
                             {
-                                s_menuHexLastKey.clear();   // aun no inicializado: resetear fingerprint
+                                s_menuHexLastKey.clear();   // not initialised yet: reset the fingerprint
                             }
                             else
                             {
@@ -4571,10 +4614,10 @@ void PS2Runtime::run()
                                       << " frame=" << frameCtr;
                                     std::cerr << m.str() << std::endl;
 
-                                    // "caption" deducida: selEntry -> nombre de entry (10 entries)
+                                    // deduced caption: selEntry -> entry name (10 entries)
                                     static const char *kEntryNames[10] = {
                                         "DRAGON_ROAD", "ULTIMATE_BATTLE", "WORLD_TOURNAMENT", "DUEL", "DRAGON_NET",
-                                        "EVOLUCION_Z", "ENTRENAMIENTO", "DATA_CENTER", "REF_PERSONAJES", "OPCIONES"
+                                        "EVOLUTION_Z", "TRAINING", "DATA_CENTER", "CHARACTER_REFERENCE", "OPTIONS"
                                     };
                                     const int32_t cur = static_cast<int32_t>(selectedEntry);
                                     if (cur >= 0 && cur < 10)
@@ -4585,7 +4628,7 @@ void PS2Runtime::run()
                                     else
                                     {
                                     std::cerr << "[menuhex] selEntry=" << cur
-                                              << " (fuera de rango 0-9, indice de submenu?)" << std::endl;
+                                              << " (out of range 0-9, submenu index?)" << std::endl;
                                     }
 
                                     // (b) Item state jump table (10 handlers)
@@ -4606,7 +4649,7 @@ void PS2Runtime::run()
                                         std::cerr << d.str() << std::dec << std::endl;
                                     }
 
-                                    // (d) seleccion de la struct principal: ventana +0x00..+0x30 y +0x140..+0x150
+                                    // (d) main struct selection: window +0x00..+0x30 and +0x140..+0x150
                                     {
                                         std::ostringstream n;
                                         n << "[menuhex] mainPtr+0x00:";
@@ -4953,10 +4996,52 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
+        // [fmvoverride] Replace the opening movie's presentation with the injected 4K video at
+        // native resolution. Drawn with raylib's default alpha blend; aspect = the source's (4:3)
+        // or full-window when widescreen is active. The GS present blit is skipped while showing it.
+        bool fmvDrew = false;
+        {
+            extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
+            ps2x_fmv::FmvOverrideFrame of{};
+            if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+            {
+                static Texture2D s_fmvTex{};
+                static int s_tw = 0, s_th = 0;
+                static uint64_t s_gen = ~0ull;
+                if (of.w != s_tw || of.h != s_th)
+                {
+                    if (s_fmvTex.id != 0) UnloadTexture(s_fmvTex);
+                    Image im{};
+                    im.data = const_cast<uint8_t *>(of.rgba);
+                    im.width = of.w; im.height = of.h; im.mipmaps = 1;
+                    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    s_fmvTex = LoadTextureFromImage(im);
+                    SetTextureFilter(s_fmvTex, TEXTURE_FILTER_BILINEAR);
+                    s_tw = of.w; s_th = of.h; s_gen = ~0ull;
+                }
+                if (of.gen != s_gen) { UpdateTexture(s_fmvTex, of.rgba); s_gen = of.gen; }
+                float dw = 0.0f, dh = 0.0f;
+                if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
+                {
+                    dw = screenWidth; dh = screenHeight;
+                }
+                else
+                {
+                    const float s = std::min(screenWidth / (float)of.w, screenHeight / (float)of.h);
+                    dw = (float)of.w * s; dh = (float)of.h * s;
+                }
+                const Rectangle fsrc{0.0f, 0.0f, (float)of.w, (float)of.h};
+                const Rectangle fdst{(screenWidth - dw) * 0.5f, (screenHeight - dh) * 0.5f, dw, dh};
+                const Color ftint{255, 255, 255, (unsigned char)(of.alpha * 255.0f + 0.5f)};
+                DrawTexturePro(s_fmvTex, fsrc, fdst, Vector2{0.0f, 0.0f}, 0.0f, ftint);
+                fmvDrew = true;
+            }
+        }
         // Blend-free present: the GPU FBO's alpha channel now carries GS dest-alpha (the
         // game's per-pixel masks, legitimately 0 over most of the frame) — alpha-blending
         // the final blit would punch the frame transparent to the clear color.
         const auto _tBlit = std::chrono::steady_clock::now();
+        if (!fmvDrew) {
         rlSetBlendFactorsSeparate(0x0001 /*GL_ONE*/, 0x0000 /*GL_ZERO*/, 0x0001, 0x0000, 0x8006 /*GL_FUNC_ADD*/, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         // [rscale] present the scaled scene with LINEAR sampling: at render scale N the
@@ -4982,6 +5067,7 @@ void PS2Runtime::run()
         if (s_pEdge) SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
+        }
         { extern double g_fpBlit; g_fpBlit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBlit).count(); }
         {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
             // stream of transitions; a static picture shows two lines total).

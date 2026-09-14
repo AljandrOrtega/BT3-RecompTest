@@ -181,10 +181,10 @@ fi
 
 # ---- 4. stage layout ---------------------------------------------------------
 cp -v "$RUNNER"   "$OUT/stage/bt3-runner" | sed 's/^/  /'
-# [fps60] the 60 fps pacing rules must sit beside the runner, or the overlay toggle is inert: the runtime refuses to
-# enable without them. The staged copy is named bt3-runner and lives here, not in the build dir, so copy them too.
+# [fps60] the 60 fps pacing table ships in the save folder (savedata/fps60_sites.txt): the runtime refuses to
+# enable the toggle without it, and looks it up there by default.
 if [[ -f "$SRC/games/bt3/fps60_sites.txt" ]]; then
-    cp -v "$SRC/games/bt3/fps60_sites.txt" "$OUT/stage/fps60_sites.txt" | sed 's/^/  /'
+    cp -v "$SRC/games/bt3/fps60_sites.txt" "$OUT/stage/savedata/fps60_sites.txt" | sed 's/^/  /'
 fi
 cp -v "$LAUNCHER" "$OUT/stage/Launcher"       | sed 's/^/  /'
 if [[ -d "$SRC/ps2xRuntime/src/launcher/assets" ]]; then
@@ -192,17 +192,12 @@ if [[ -d "$SRC/ps2xRuntime/src/launcher/assets" ]]; then
     cp -rv "$SRC/ps2xRuntime/src/launcher/assets/." "$OUT/stage/assets/" | sed 's/^/  /'
 fi
 
-# Game data from the ISO extraction (--gen-only left it in games/bt3/work/).
-# Keyed the same way as setup.py's deploy_tree() so the stage is playable.
-WORK="$SRC/games/bt3/work"
-if [[ -d "$WORK" ]]; then
-    log "copying game data (work/ -> stage/data)"
-    mkdir -p "$OUT/stage/data"
-    for name in BIN DATA IRX SYSTEM.CNF; do
-        [[ -e "$WORK/$name" ]] && cp -rv "$WORK/$name" "$OUT/stage/data/" | sed 's/^/  /'
-    done
-    [[ -f "$WORK/SLUS_216.78" ]] && cp -v "$WORK/SLUS_216.78" "$OUT/stage/data/" | sed 's/^/  /'
-fi
+# No game data in the release: the recompiled runner ships as binaries only.
+# The game files (SLUS_216.78 + BIN/ DATA/ IRX/ SYSTEM.CNF) are the user's own,
+# extracted by the launcher's install wizard from their ISO into <install>/data,
+# never distributed. games/bt3/work/ holds just the two build inputs pulled from
+# the ISO (SLUS_216.78 for the VU microcode, BIN/DBZP.BIN for the overlay) and
+# must not leak into the stage.
 
 chmod +x "$OUT/stage/bt3-runner" "$OUT/stage/Launcher"
 

@@ -85,4 +85,9 @@ namespace ps2_stubs
     // Resolve a PS2 CD path to an extracted host file, assigning a pseudo-LBN.
     // Used by the DVCI file-resolver when the ISO image is unavailable.
     bool dvciFindExtractedFile(const char *ps2Path, uint32_t &lbnOut, uint32_t &sizeOut);
+
+    // [fmvoverride] Pre-register (or replace) a guest CD path so its reads are served from an
+    // alternate host file (e.g. the texture pack's opening PSS/ADX). No-op if the host file is
+    // missing. Must run before the game first resolves the path.
+    void overrideCdFile(const std::string &ps2Path, const std::filesystem::path &hostPath);
 }

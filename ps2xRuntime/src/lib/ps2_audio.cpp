@@ -81,10 +81,10 @@ namespace ps2_vag
 
 // Frames per raylib AudioStream sub-buffer. Feeds are aligned to this exactly (see
 // serviceStreams): a partial feed leaves the rest of the sub-buffer unfilled and is heard as
-// rapid pause/unpause stutter. At 24kHz this is ~85ms; raylib double-buffers, so it gives ~170ms
-// of slack -- enough to ride out a dropped frame without underrunning (the reported "stereo goes
-// out of sync when I lose fps").
-static constexpr size_t kStreamChunkFrames = 1024;
+// rapid pause/unpause stutter. 2048 frames: at 24kHz this is ~170ms; raylib double-buffers, so
+// it gives ~340ms of slack. At 48kHz (the opening movie's rate) it is ~42ms / ~85ms slack --
+// enough to ride out the frame stalls of the 4K FMV override upload without crackling.
+static constexpr size_t kStreamChunkFrames = 2048;
 
 struct PS2AudioBackend::Impl
 {

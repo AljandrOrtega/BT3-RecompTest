@@ -9,6 +9,10 @@
 // "undefined reference to (anonymous namespace)::g_guestThreadCpuNs".
 extern std::atomic<uint64_t> g_guestThreadCpuNs;
 
+// [skipforce] FMV-active latch (defined in ps2_gs_gpu.cpp); gates the forced skip button.
+extern std::atomic<uint32_t> g_ps2FmvActive;
+extern std::atomic<uint32_t> g_ps2ForceSkipFrames;   // [skipforce] countdown poked by the FMV override
+
 // [framegate] vsync tick source, declared at file scope for the same reason as the above.
 namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
 // [fightgate] FILE SCOPE (a block-scope extern inside this file's anonymous namespace would declare a different symbol).
@@ -54,6 +58,7 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
 #include <vector>
 #include <unordered_map>
 #include <cstring>
+#include <cstdlib>   // [skipforce] std::strtoul
 
 // [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
 extern PS2Runtime::RecompiledFunction g_ps2OverlayFunctionTable[];
@@ -409,6 +414,32 @@ namespace
                 b0 = static_cast<uint8_t>(b0 & ~0x08u); // START
                 b1 = static_cast<uint8_t>(b1 & ~0x40u); // CROSS
             }
+        }
+        // [skipforce] Force the skip button. Either PS2X_FORCE_SKIP=<n> (holds while the FMV is
+        // live for the first <n> pad reads) or the g_ps2ForceSkipFrames countdown the FMV override
+        // pokes to end the native movie. PS2X_FORCE_SKIP_BTNS=<hex> overrides the cleared bits.
+        bool forceSkip = false;
+        static const bool s_skipEnv = std::getenv("PS2X_FORCE_SKIP") != nullptr;
+        if (s_skipEnv && g_ps2FmvActive.load(std::memory_order_relaxed) != 0u)
+        {
+            static const uint32_t s_skipFrames = [](){
+                const char *v = std::getenv("PS2X_FORCE_SKIP");
+                return v ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u; }();
+            static std::atomic<uint32_t> s_done{0};
+            if (s_done.fetch_add(1) < s_skipFrames) forceSkip = true;
+        }
+        else if (g_ps2ForceSkipFrames.load(std::memory_order_relaxed) > 0u)
+        {
+            g_ps2ForceSkipFrames.fetch_sub(1u, std::memory_order_relaxed);
+            forceSkip = true;
+        }
+        if (forceSkip)
+        {
+            static const uint32_t s_skipMask = [](){
+                const char *v = std::getenv("PS2X_FORCE_SKIP_BTNS");
+                return v ? (uint32_t)std::strtoul(v, nullptr, 16) : 0x4008u; }();
+            b0 = static_cast<uint8_t>(b0 & ~(uint8_t)(s_skipMask & 0xffu));
+            b1 = static_cast<uint8_t>(b1 & ~(uint8_t)((s_skipMask >> 8) & 0xffu));
         }
         p[0] = b0; // buttons low
         p[1] = b1; // buttons high
@@ -4419,7 +4450,7 @@ namespace
         if (const uint8_t *h = getMemPtr(rdram, 0x2e6370u))
             adxf = *reinterpret_cast<const uint32_t *>(h);
         {
-            static const bool s_lg = std::getenv("PS2X_OVLOG") != nullptr;
+            static const bool s_lg = std::getenv("PS2X_OVLOG") != nullptr || std::getenv("PS2X_MOVIEPROBE") != nullptr;   // [movprobe]
             if (s_lg && vsync != s_lastVsync)
             {
                 int st = -1, already = -1, total = -1;
@@ -4604,9 +4635,95 @@ namespace
         }
     }
 
+    // [movprobe] PS2X_MOVIEPROBE=1: opening-movie flow points. The movie state block is the
+    // guest u32 at 0x00301048. START = sub_00126D40 (state := 1), STOP = sub_00126DD8
+    // (state := 2), END/SKIP predicate = FUN_00126E88 = (state >> 3) & 1, sequencer =
+    // f_35de58 (overlay). All trampoline to the originals.
+    PS2Runtime::RecompiledFunction g_orig126D40 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig126DD8 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig126E88 = nullptr;
+    PS2Runtime::RecompiledFunction g_orig35DE58 = nullptr;
+
+    static uint32_t movprobeU32(uint8_t *rdram, uint32_t addr)
+    {
+        uint32_t v = 0xffffffffu;
+        if (const uint8_t *p = getMemPtr(rdram, addr)) std::memcpy(&v, p, 4);
+        return v;
+    }
+
+    void bt3MovieStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // sub_00126D40
+    {
+        std::cerr << "[movprobe] START sub_126D40 a0=0x" << std::hex << getRegU32(ctx, 4)
+                  << " a1=0x" << getRegU32(ctx, 5) << " a2=0x" << getRegU32(ctx, 6)
+                  << " a3=0x" << getRegU32(ctx, 7)
+                  << " state_before=0x" << movprobeU32(rdram, 0x301048u)
+                  << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        if (g_orig126D40) g_orig126D40(rdram, ctx, runtime);
+        std::cerr << "[movprobe] START done state=0x" << std::hex
+                  << movprobeU32(rdram, 0x301048u) << std::dec << std::endl;
+    }
+
+    void bt3MovieStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // sub_00126DD8
+    {
+        std::cerr << "[movprobe] STOP sub_126DD8 a0=0x" << std::hex << getRegU32(ctx, 4)
+                  << " a1=0x" << getRegU32(ctx, 5) << " a2=0x" << getRegU32(ctx, 6)
+                  << " a3=0x" << getRegU32(ctx, 7)
+                  << " state_before=0x" << movprobeU32(rdram, 0x301048u)
+                  << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        if (g_orig126DD8) g_orig126DD8(rdram, ctx, runtime);
+        std::cerr << "[movprobe] STOP done state=0x" << std::hex
+                  << movprobeU32(rdram, 0x301048u) << std::dec << std::endl;
+    }
+
+    void bt3MovieEndPred(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00126E88
+    {
+        if (g_orig126E88) g_orig126E88(rdram, ctx, runtime);
+        const uint32_t v0 = getRegU32(ctx, 2);
+        static uint32_t s_last = 0xffffffffu;
+        if (v0 != s_last)
+        {
+            s_last = v0;
+            std::cerr << "[movprobe] ENDPRED FUN_126E88 v0=" << v0
+                      << " state=0x" << std::hex << movprobeU32(rdram, 0x301048u)
+                      << " level=" << std::dec << movprobeU32(rdram, 0x301050u)
+                      << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
+    }
+
+    void bt3MovieSeq(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // f_35de58 (overlay)
+    {
+        static uint32_t s_entries = 0u;
+        if (s_entries < 12u)
+        {
+            ++s_entries;
+            std::cerr << "[movprobe] SEQ f_35de58 enter a0=0x" << std::hex << getRegU32(ctx, 4)
+                      << " state=0x" << movprobeU32(rdram, 0x301048u)
+                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
+        if (g_orig35DE58) g_orig35DE58(rdram, ctx, runtime);
+    }
+
     void applyBt3SoundInitBypass(PS2Runtime &runtime)
     {
         std::cerr << "[game_overrides] BT3: sound init bypass + lock-callback stub" << std::endl;
+        if (const char *mv = std::getenv("PS2X_MOVIEPROBE"); mv && mv[0] && mv[0] != '0')
+        {
+            g_orig126D40 = runtime.lookupFunction(0x00126D40u);
+            if (g_orig126D40) runtime.replaceFunction(0x00126D40u, &bt3MovieStart);
+            g_orig126DD8 = runtime.lookupFunction(0x00126DD8u);
+            if (g_orig126DD8) runtime.replaceFunction(0x00126DD8u, &bt3MovieStop);
+            g_orig126E88 = runtime.lookupFunction(0x00126E88u);
+            if (g_orig126E88) runtime.replaceFunction(0x00126E88u, &bt3MovieEndPred);
+            const uint32_t slot35 = (0x0035DE58u - g_ps2OverlayFunctionTableBase) / 4u;
+            if (slot35 < g_ps2OverlayFunctionTableSlotCount && g_ps2OverlayFunctionTable[slot35])
+            {
+                g_orig35DE58 = g_ps2OverlayFunctionTable[slot35];
+                g_ps2OverlayFunctionTable[slot35] = &bt3MovieSeq;
+            }
+            std::fprintf(stderr, "[movprobe] hooks start=%d stop=%d endpred=%d seq=%d\n",
+                         g_orig126D40 ? 1 : 0, g_orig126DD8 ? 1 : 0,
+                         g_orig126E88 ? 1 : 0, g_orig35DE58 ? 1 : 0);
+        }
         if (std::getenv("PS2X_PROBE_STREAM"))
         {
             g_orig27f518 = runtime.lookupFunction(0x0027e938u);

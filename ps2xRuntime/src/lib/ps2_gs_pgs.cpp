@@ -297,6 +297,10 @@ struct State
         V q[3]; int qn = 0;
         bool frameHad3d = false, active = false; int no3dRun = 0; uint64_t lastSwap = ~0ull;
         uint64_t mappedVerts = 0, hudPrims = 0, scissorsMapped = 0, splitPrims = 0; float lastInv = 1.0f;
+        // [wsjit] debounce of the raw squeeze: menus draw the HUD with alternating frame widths
+        // (512/640), which made inv oscillate frame-to-frame (visible jitter). Only commit a value
+        // that is stable for two consecutive evaluations.
+        float lastRawInv = 0.f; int invRun = 0; bool invInit = false;
         // [pgsink] RGBAQ writes since the last kick (packet offsets; packed = 16-byte qword, else 8-byte reg), for the darkener
         struct RgbaW { size_t off; bool packed; }; RgbaW rgba[8]; int rgbaN = 0;
         RgbaW uv[8]; int uvN = 0;   // [pgsink] UV writes since the last kick (the edge-detect shift rewrite)
@@ -1368,8 +1372,25 @@ void wsHudRewriteLocked(State &s, uint8_t *data, size_t size)
         const float fh = s.baseH ? float(s.baseH) : 448.0f;
         if (g_ps2xWsHudInv < 0.999f && dw && dh)
         {
-            inv = (float(dh) / fh * s_pixk) / (float(dw) / fw);
-            if (inv < 0.4f) inv = 0.4f; if (inv > 1.0f) inv = 1.0f;
+            float raw = (float(dh) / fh * s_pixk) / (float(dw) / fw);
+            if (raw < 0.4f) raw = 0.4f; if (raw > 1.0f) raw = 1.0f;
+            // [wsjit] debounce: commit the raw squeeze only once it repeats; hold the last value
+            // otherwise. Kills the frame-to-frame 512/640 alternation without changing steady state.
+            if (!h.invInit) { h.lastInv = raw; h.lastRawInv = raw; h.invRun = 1; h.invInit = true; }
+            else if (raw == h.lastRawInv) { if (++h.invRun >= 2) h.lastInv = raw; }
+            else { h.lastRawInv = raw; h.invRun = 1; }
+            inv = h.lastInv;
+            static const bool s_jit = [](){ const char *v = std::getenv("PS2X_WSJIT"); return v && v[0] && v[0] != '0'; }();
+            if (s_jit)
+            {
+                static float s_lr = -1.0f;
+                if (raw != s_lr)
+                {
+                    s_lr = raw;
+                    std::fprintf(stderr, "[wsjit] dw=%u dh=%u fw=%.0f fh=%.0f raw=%.4f committed=%.4f\n",
+                                 dw, dh, fw, fh, raw, inv);
+                }
+            }
         }
     }
     h.lastInv = inv;

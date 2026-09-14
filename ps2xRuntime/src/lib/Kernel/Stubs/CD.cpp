@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cctype>   // [movprobe] std::tolower
 #include "ps2_compat.h"
 #include <atomic>
 #include <cstdio>
@@ -719,6 +720,18 @@ namespace ps2_stubs
                                                        << " sectors=0x" << resolvedEntry.sectors
                                                        << std::dec << std::endl);
         }
+        {   // [movprobe] PS2X_MOVIEPROBE=1: log movie/audio file (.PSS/.ADX) resolutions.
+            static const bool s_mp = [](){ const char *v = std::getenv("PS2X_MOVIEPROBE"); return v && v[0] && v[0] != '0'; }();
+            if (s_mp)
+            {
+                std::string low = path;
+                for (char &c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (low.find(".pss") != std::string::npos || low.find(".adx") != std::string::npos)
+                    std::cerr << "[movprobe] cdsearch \"" << sanitizeForLog(path) << "\" -> lbn=0x"
+                              << std::hex << resolvedEntry.baseLbn << std::dec
+                              << " size=" << resolvedEntry.sizeBytes << std::endl;
+            }
+        }
         setReturnS32(ctx, 1);
     }
 
@@ -911,5 +924,29 @@ namespace ps2_stubs
             return true;
         }
         return false;
+    }
+
+    void overrideCdFile(const std::string &ps2Path, const std::filesystem::path &hostPath)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(hostPath, ec))
+            return;
+        const std::string key = cdPathKey(ps2Path);
+        if (key.empty())
+            return;
+        const uint64_t sz = std::filesystem::file_size(hostPath, ec);
+        if (ec)
+            return;
+
+        CdFileEntry entry;
+        entry.hostPath = hostPath;
+        entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(sz, 0xFFFFFFFFu));
+        entry.baseLbn = g_nextPseudoLbn;
+        entry.sectors = sectorsForBytes(entry.sizeBytes);
+        g_nextPseudoLbn += entry.sectors + 1;
+        g_cdFilesByKey[key] = entry;   // replace any prior registration
+
+        std::fprintf(stderr, "[fmvoverride] cd override \"%s\" -> %s (%u bytes)\n",
+                     ps2Path.c_str(), hostPath.string().c_str(), entry.sizeBytes);
     }
 }
