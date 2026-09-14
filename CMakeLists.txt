@@ -11,6 +11,20 @@ endif()
 
 project(PS2RetroX)
 
+# 64-bit only. A 32-bit configure -- on Windows that is the plain "Developer Command Prompt for VS",
+# whose default target is x86; the x64 one is a separate Start-menu entry -- compiles most of the tree
+# and then dies at link with ~20 undefined `_glBindTexture`-style symbols, which reads as a missing
+# OpenGL library rather than as the wrong architecture. Stop at configure and name the real cause.
+# (It also shrinks DrawCmd from 352 to 320 bytes, tripping a guard in the GPU renderer first.)
+if(CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR
+        "PS2RetroX requires a 64-bit toolchain; this one targets ${CMAKE_SIZEOF_VOID_P}-byte pointers.\n"
+        "  Windows: configure from the \"x64 Native Tools Command Prompt for VS\" (not the plain\n"
+        "           \"Developer Command Prompt\", which defaults to x86), and delete the existing\n"
+        "           build directory first -- CMake caches the architecture.\n"
+        "  Visual Studio generator: pass -A x64.")
+endif()
+
 
 # [windows] Pin the C runtime for the WHOLE tree. third_party/parallel-gs sets the STATIC CRT when nobody else has
 # ("if (NOT CMAKE_MSVC_RUNTIME_LIBRARY)"), so without this the backend builds /MT while the runtime builds /MD and
