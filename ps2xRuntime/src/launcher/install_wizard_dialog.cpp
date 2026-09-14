@@ -2,6 +2,7 @@
 #include "install_wizard_dialog.h"
 
 #include "afs_extract_worker.h"
+#include "archive_extract.h"
 #include "extract_worker.h"
 #include "iso9660.h"
 
@@ -11,14 +12,11 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileDialog>
-#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QProcess>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QStackedWidget>
-#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QVBoxLayout>
@@ -32,48 +30,6 @@ constexpr qint64 kMiB = 1024 * 1024;
 QString fmtMb(qint64 bytes)
 {
     return QString::number(bytes / kMiB);
-}
-
-QString pickUnpacker()
-{
-    static const char *kTools[] = {"7zz", "7z", "unrar", "bsdtar", "tar"};
-    for (const char *t : kTools)
-    {
-        const QString tool = QLatin1String(t);
-        if (!QStandardPaths::findExecutable(tool).isEmpty())
-            return tool;
-    }
-    return QString();
-}
-
-bool runUnpacker(const QString &tool, const QString &archive, const QString &dest, QString *err)
-{
-    QStringList args;
-    if (tool == QLatin1String("7zz") || tool == QLatin1String("7z"))
-        args = {QStringLiteral("x"), QStringLiteral("-y"), QStringLiteral("-o") + dest, archive};
-    else if (tool == QLatin1String("unrar"))
-        args = {QStringLiteral("x"), QStringLiteral("-y"), archive, dest + QLatin1Char('/')};
-    else if (tool == QLatin1String("bsdtar") || tool == QLatin1String("tar"))
-        args = {QStringLiteral("-xf"), archive, QStringLiteral("-C"), dest};
-    else
-    {
-        *err = QStringLiteral("The extraction failed. Please extract the ISO manually.");
-        return false;
-    }
-
-    QProcess p;
-    p.start(tool, args);
-    while (p.state() != QProcess::NotRunning)
-    {
-        if (!p.waitForFinished(50))
-            QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
-    }
-    if (p.exitStatus() != QProcess::NormalExit || p.exitCode() != 0)
-    {
-        *err = QStringLiteral("The extraction failed. Please extract the ISO manually.");
-        return false;
-    }
-    return true;
 }
 
 QString findImageRecursive(const QString &root, int depth)
@@ -409,13 +365,6 @@ void InstallWizardDialog::attemptVerify(const QString &dumpPath)
 
 QString InstallWizardDialog::resolveInnerImage(const QString &dumpPath, QString *err)
 {
-    const QString tool = pickUnpacker();
-    if (tool.isEmpty())
-    {
-        *err = QStringLiteral("The extraction failed. Please extract the ISO manually.");
-        return QString();
-    }
-
     const QString unpackDir = m_tmp->path() + QStringLiteral("/unpack");
     if (!QDir().mkpath(unpackDir))
     {
@@ -423,8 +372,20 @@ QString InstallWizardDialog::resolveInnerImage(const QString &dumpPath, QString 
         return QString();
     }
 
-    if (!runUnpacker(tool, dumpPath, unpackDir, err))
+    // libarchive, in-process: same code path on every platform, no external 7z.
+    QString extractErr;
+    const bool ok = archivex::extract(
+        dumpPath, unpackDir,
+        [](quint64, quint64) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 30);
+            return true;
+        },
+        &extractErr);
+    if (!ok)
+    {
+        *err = QStringLiteral("The extraction failed. Please extract the ISO manually.");
         return QString();
+    }
 
     const QString image = findImageRecursive(unpackDir, 3);
     if (image.isEmpty())

@@ -15,11 +15,10 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QProcess>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QRegularExpression>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QVBoxLayout>
 
 namespace
@@ -248,68 +247,49 @@ void TexInstallDialog::onDownloadFinished()
 
 void TexInstallDialog::beginExtract(const QString &archivePath)
 {
-    const QString tool = texpack::pickUnpacker();
-    if (tool.isEmpty())
-    {
-        fail(QStringLiteral("No unpacker found. Install 7-Zip, unrar or libarchive (bsdtar)."));
-        return;
-    }
-
     m_dest = texpack::dir();
     QDir().mkpath(m_dest);
 
     m_exBar->setVisible(true);
-    if (tool == QLatin1String("bsdtar") || tool == QLatin1String("tar"))
-        m_exBar->setRange(0, 0);   // no percentage from tar
-    else
-        m_exBar->setRange(0, 100);
+    m_exBar->setRange(0, 0);   // busy until the worker reports the total
     m_exBar->setValue(0);
     setStatus(QStringLiteral("Extracting to %1…").arg(m_dest));
 
-    QStringList args;
-    if (tool == QLatin1String("7zz") || tool == QLatin1String("7z"))
-        args = {QStringLiteral("x"), QStringLiteral("-y"), QStringLiteral("-bsp1"),
-                QStringLiteral("-o") + m_dest, archivePath};
-    else if (tool == QLatin1String("unrar"))
-        args = {QStringLiteral("x"), QStringLiteral("-y"), QStringLiteral("-bsp1"),
-                archivePath, m_dest + QLatin1Char('/')};
-    else
-        args = {QStringLiteral("-xf"), archivePath, QStringLiteral("-C"), m_dest};
+    // libarchive runs in-process on a worker thread so the dialog stays live.
+    m_extThread = new QThread;
+    m_worker = new ArchiveExtractWorker;
+    m_worker->moveToThread(m_extThread);
+    connect(m_extThread, &QThread::finished, m_worker, &QObject::deleteLater);
+    connect(m_extThread, &QThread::finished, m_extThread, &QObject::deleteLater);
+    connect(m_worker, &ArchiveExtractWorker::progress, this, &TexInstallDialog::onExtractProgress);
+    connect(m_worker, &ArchiveExtractWorker::done, this, &TexInstallDialog::onExtractDone);
+    connect(m_worker, &ArchiveExtractWorker::done, m_extThread, &QThread::quit);
+    m_extThread->start();
 
-    m_proc = new QProcess(this);
-    m_proc->setProcessChannelMode(QProcess::MergedChannels);
-    connect(m_proc, &QProcess::readyReadStandardOutput, this, &TexInstallDialog::onExtractOutput);
-    connect(m_proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, &TexInstallDialog::onExtractFinished);
-    m_proc->start(tool, args);
+    QMetaObject::invokeMethod(m_worker, "doWork", Qt::QueuedConnection,
+                              Q_ARG(QString, archivePath), Q_ARG(QString, m_dest));
 }
 
-void TexInstallDialog::onExtractOutput()
+void TexInstallDialog::onExtractProgress(qint64 done, qint64 total)
 {
-    if (!m_proc || m_exBar->maximum() != 100)
+    if (total <= 0)
         return;
-    const QString out = QString::fromLatin1(m_proc->readAllStandardOutput());
-    static const QRegularExpression re(QStringLiteral("(\\d{1,3})%"));
-    auto it = re.globalMatch(out);
-    while (it.hasNext())
-    {
-        const int pct = it.next().captured(1).toInt();
-        m_exBar->setValue(qBound(0, pct, 100));
-    }
+    if (m_exBar->maximum() != 100)
+        m_exBar->setRange(0, 100);
+    m_exBar->setValue(static_cast<int>(done * 100 / total));
 }
 
-void TexInstallDialog::onExtractFinished(int exitCode, QProcess::ExitStatus status)
+void TexInstallDialog::onExtractDone(bool ok, const QString &msg)
 {
-    if (m_proc)
-    {
-        m_proc->deleteLater();
-        m_proc = nullptr;
-    }
+    // The thread and worker self-delete via finished() -> deleteLater().
+    m_worker = nullptr;
+    m_extThread = nullptr;
+
     // Free the downloaded archive as soon as it is unpacked.
     delete m_tmp;
     m_tmp = nullptr;
 
-    if (exitCode == 0 && status == QProcess::NormalExit)
+    if (ok)
     {
         m_ok = true;
         m_exBar->setValue(100);
@@ -320,9 +300,9 @@ void TexInstallDialog::onExtractFinished(int exitCode, QProcess::ExitStatus stat
         SettingsManager::instance().save();
         emit installed();
     }
-    else
+    else if (!m_aborting)
     {
-        fail(QStringLiteral("Extraction failed (exit %1).").arg(exitCode));
+        fail(msg.isEmpty() ? QStringLiteral("Extraction failed.") : msg);
     }
     m_browse->setEnabled(true);
     m_download->setEnabled(true);
@@ -351,13 +331,18 @@ void TexInstallDialog::abortDownload()
 
 void TexInstallDialog::abortExtract()
 {
-    if (m_proc)
+    if (!m_worker && !m_extThread)
+        return;
+    m_aborting = true;
+    if (m_worker)
+        m_worker->requestCancel();
+    if (m_extThread)
     {
-        m_proc->kill();
-        m_proc->waitForFinished(3000);
-        m_proc->deleteLater();
-        m_proc = nullptr;
+        m_extThread->quit();
+        m_extThread->wait(5000);
     }
+    m_worker = nullptr;
+    m_extThread = nullptr;
 }
 
 void TexInstallDialog::closeEvent(QCloseEvent *e)

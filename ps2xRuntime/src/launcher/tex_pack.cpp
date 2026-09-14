@@ -7,7 +7,6 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
-#include <QStandardPaths>
 
 namespace texpack
 {
@@ -18,15 +17,6 @@ const char *const kSha256 = "9d2d225d281545b08b3a8f4f02f2ebf79c8a6d61d62b84fea7d
 QString dir()
 {
     return apppaths::userRoot() + QStringLiteral("/data/Textures");
-}
-
-QString pickUnpacker()
-{
-    static const char *kTools[] = {"7zz", "7z", "unrar", "bsdtar", "tar"};
-    for (const char *t : kTools)
-        if (!QStandardPaths::findExecutable(QLatin1String(t)).isEmpty())
-            return QLatin1String(t);
-    return QString();
 }
 
 QString sha256File(const QString &path)

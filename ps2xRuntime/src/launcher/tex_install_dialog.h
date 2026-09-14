@@ -5,7 +5,8 @@
 // extraction bar; both paths verify the pinned sha256 before extracting.
 
 #include <QDialog>
-#include <QProcess>
+
+#include "archive_extract.h"
 
 class QLabel;
 class QProgressBar;
@@ -15,6 +16,7 @@ class QNetworkReply;
 class QFile;
 class QElapsedTimer;
 class QTemporaryDir;
+class QThread;
 
 class TexInstallDialog : public QDialog
 {
@@ -35,8 +37,8 @@ private slots:
     void onDownloadReadyRead();
     void onDownloadProgress(qint64 received, qint64 total);
     void onDownloadFinished();
-    void onExtractOutput();
-    void onExtractFinished(int exitCode, QProcess::ExitStatus status);
+    void onExtractProgress(qint64 done, qint64 total);
+    void onExtractDone(bool ok, const QString &msg);
 
 private:
     void setStatus(const QString &text);
@@ -60,7 +62,9 @@ private:
     QTemporaryDir *m_tmp = nullptr;
     QString m_tmpPath;
 
-    QProcess *m_proc = nullptr;
+    QThread *m_extThread = nullptr;
+    ArchiveExtractWorker *m_worker = nullptr;
     QString m_dest;
-    bool m_ok = false;   // set once extraction finished cleanly
+    bool m_ok = false;        // set once extraction finished cleanly
+    bool m_aborting = false;  // suppress the error box while closing
 };
