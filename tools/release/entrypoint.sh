@@ -192,6 +192,20 @@ if [[ -d "$SRC/ps2xRuntime/src/launcher/assets" ]]; then
     cp -rv "$SRC/ps2xRuntime/src/launcher/assets/." "$OUT/stage/assets/" | sed 's/^/  /'
 fi
 
+# Licences have to accompany the distributed binaries: GPL-3.0 for this project
+# and LGPL-3.0 for the bundled paraLLEl-GS backend.
+cp -v "$SRC/LICENSE" "$OUT/stage/LICENSE" | sed 's/^/  /'
+if [[ -f "$PGS_DIR/COPYING.LGPLv3" ]]; then
+    cp -v "$PGS_DIR/COPYING.LGPLv3" "$OUT/stage/COPYING.LGPLv3" | sed 's/^/  /'
+fi
+
+# Default settings.toml: the launcher's first-run wizard keeps it when present
+# (the runtime and the launcher share the same file), so a fresh install starts
+# with known-good values instead of a bare dir.
+if [[ -f "$SRC/tools/release/settings.toml.default" ]]; then
+    cp -v "$SRC/tools/release/settings.toml.default" "$OUT/stage/savedata/settings.toml" | sed 's/^/  /'
+fi
+
 # No game data in the release: the recompiled runner ships as binaries only.
 # The game files (SLUS_216.78 + BIN/ DATA/ IRX/ SYSTEM.CNF) are the user's own,
 # extracted by the launcher's install wizard from their ISO into <install>/data,

@@ -1,3 +1,39 @@
+# Launcher/Overlay pre-release: Post-FX fuera + escala interna por resolución — 2026-09-13
+
+## Contexto
+- El launcher y el overlay exponen un toggle "Post-FX" y un combo "Internal Resolution"
+  (1x/2x/3x/4x). Para la primera release se eliminan ambos de la UI y el sistema de
+  reescalado pasa a ser built-in derivado de la resolución elegida.
+- Post-FX estaba OFF por defecto en todos los puntos (Settings=false, SettingsManager=false,
+  `GsGpuRenderer::postfxEnabled()` default false, `PS2X_POSTFX` NO baked en main.cpp) →
+  es seguro borrar hasta la env var.
+- Mapeo aprobado por el usuario: 1x = 720p, 2x = >720p hasta 1080p, 3x = ≥1440p en adelante.
+  Se añade preset 4K (3840x2160 → 3x). El 4x queda deshabilitado (nada lo genera) hasta que funcione.
+
+## Elementos verificables
+- [x] Header compartido `include/runtime/ps2_render_scale.h` con `ps2xRenderScaleForHeight`.
+- [x] Post-FX: 0 refs a `postfx`/`PS2X_POSTFX` en código (solo comentarios descriptivos de draw classes).
+- [x] Launcher: sin combo "Internal Resolution"; lista de resolución con 4K; escala derivada
+      en cambio de Window Size y al inicializar (re-derivación de INIs viejas).
+- [x] Overlay: sin combo "Internal Resolution"; 4K en Window Size; escala derivada en
+      resolución/fullscreen (live en paraLLEl-GS).
+- [x] `render_scale` INI se sigue persistando (derivado) y preloadSettings lo aplica.
+- [x] Build completo del launcher (g++ 16.2 + ccache + mold, -O2): EXIT=0, 0 warnings/errors;
+      binario `ps2xRuntime/src/launcher/build/Launcher`. `tab_video.cpp` y `settings_manager.cpp` limpios.
+- [ ] Compilación de ps2xRuntime (raylib/imgui por FetchContent; pendiente — el usuario pidió
+      build del launcher para validar el cambio de escala/Post-FX).
+
+## Revisión
+- Balance de llaves en `ps2_gs_gpu_renderer.cpp`, `ps2_settings_overlay.cpp`, `tab_video.cpp`:
+  idéntico al HEAD (el +1 del overlay es un falso positivo del checker pre-existente).
+- El bloque runtime de Post-FX quedó como gates incondicionales (comportamiento = default OFF anterior).
+
+## Notas
+- El bloque runtime `if (!s_postfx) {…gates…}` se convierte a gates SIEMPRE activos
+  (comportamiento visual idéntico al default actual, validado a 30fps).
+- `ps2xRenderScaleForHeight(h)`: `h<=720 → 1`; `h<=1080 → 2`; `else → 3`.
+---
+
 # Extracción de archivos con nombres reales ("propper names and formats")
 
 ## Contexto / Diagnóstico

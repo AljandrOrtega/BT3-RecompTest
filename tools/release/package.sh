@@ -15,6 +15,9 @@
 #   lib/                bundled shared libs (incl. lib/qt6/plugins)
 #   assets/             sky theme + fonts
 #   savedata/BASLUS-21678DBZT3/   placeholder created by the wizard later
+#   savedata/fps60_sites.txt     60 fps pacing rules
+#   savedata/settings.toml       default settings (kept by the first run)
+#   LICENSE / COPYING.LGPLv3     GPL-3.0 + paraLLEl-GS LGPL-3.0 texts
 # Game data is NOT shipped: the launcher installs it from the user's ISO.
 set -euo pipefail
 
@@ -34,8 +37,12 @@ TMP_TREE="$OUT_DIR/$TREE_NAME"
 rm -rf "$TMP_TREE"; mkdir -p "$TMP_TREE"
 cp -a "$STAGE"/Launcher "$STAGE"/bt3-runner "$TMP_TREE"/
 cp -a "$STAGE"/lib "$STAGE"/assets "$TMP_TREE"/
+# Licences must travel with the binaries (GPL-3.0 + LGPL-3.0 for paraLLEl-GS).
+cp -a "$STAGE"/LICENSE "$STAGE"/COPYING.LGPLv3 "$TMP_TREE"/
 mkdir -p "$TMP_TREE/savedata/BASLUS-21678DBZT3"
-[[ -f "$STAGE/savedata/fps60_sites.txt" ]] && cp -a "$STAGE/savedata/fps60_sites.txt" "$TMP_TREE/savedata/"   # [fps60] pacing table
+# [fps60] pacing table + default settings.toml ship next to the saves.
+[[ -f "$STAGE/savedata/fps60_sites.txt" ]] && cp -a "$STAGE/savedata/fps60_sites.txt" "$TMP_TREE/savedata"
+[[ -f "$STAGE/savedata/settings.toml" ]] && cp -a "$STAGE/savedata/settings.toml" "$TMP_TREE/savedata"
 
 cp "$ROOT/tools/release/install-game.sh.in" "$TMP_TREE/install game.sh"
 chmod +x "$TMP_TREE/install game.sh"

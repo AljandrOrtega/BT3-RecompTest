@@ -74,10 +74,11 @@ This is an assessment only; no behavior was changed while writing it.
    older installs that lack it, a `.7z` download cannot be extracted. Consider
    bundling `7zr` or linking libarchive in the launcher.
 
-5. **Windows packaging is experimental.** `tools/release/` provides a Docker-based
-   Linux release and `tools/macos/deploy.py` for macOS; there is no Windows
-   packaging script. `games/bt3/setup.py` has a Windows branch. The new code adds
-   nothing Windows-specific.
+5. **Windows packaging is now a real flow.** `tools/release-windows/` provides a
+   Docker-based Windows release (clang-cl + xwin + lld-link, Qt MSVC kit,
+   FFmpeg prebuilt, VC++ runtime DLLs, PE dependency gate) at 1/1 parity with the
+   Linux `tools/release/` flow; see its README. `games/bt3/setup.py` has a
+   Windows branch. The new code adds nothing Windows-specific.
 
 ## References
 

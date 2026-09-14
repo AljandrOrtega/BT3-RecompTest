@@ -50,21 +50,27 @@ reuse an existing `games/bt3/work/` tree and only rebuild the runner.
 `tools/release/package.sh` then wraps everything into the single release
 artifact. See `docs/DEPLOY.md` for the full picture.
 
-**Windows (experimental):** install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
-(the "Desktop development with C++" workload, which includes CMake, plus its optional
-components "C++ Clang Compiler for Windows" and "MSBuild support for LLVM (clang-cl) toolset":
-the build needs Clang, MSVC cannot compile the generated VU1 code) and Python 3;
-`tar` for ISO extraction ships with Windows 10+. Then, from a regular terminal:
+**Windows:** no toolchain to install — the build runs inside a
+[Docker](https://www.docker.com/products/docker-desktop/) container that
+cross-compiles for Windows (clang-cl + xwin + lld-link; no Visual Studio).
+You need **Docker Desktop** and **Git for Windows** (for `bash`). The simplest
+route is to double-click `tools\release-windows\build-windows.bat`: it starts
+Docker Desktop if needed, prompts for your ISO (or accepts a `.iso` dragged on
+top of it), runs the whole build + PE gate, and offers to package the zip. The
+same driver from Git Bash / WSL:
 
-```
-git clone https://github.com/z3xox/BT3-Recomp.git
-cd BT3-Recomp
-python games\bt3\setup.py C:\path\to\bt3-usa.iso --deploy C:\path\where\deploy
+```sh
+tools/release-windows/build-windows.sh --iso /path/to/bt3-usa.iso --jobs 16
+tools/release-windows/package.sh
 ```
 
-12 GB+ RAM recommended on Windows; the Windows build is young — expect rough
-edges and please report issues. The output is the same portable tree
-(`Launcher.exe`, `bt3-runner.exe`, `data/`, …), zipped for distribution.
+The container generates the ~7,800 runner sources natively (`setup.py
+--gen-only`), cross-compiles the runner and the Qt launcher, and gates the
+output — every PE import must resolve and the bundle layout must be complete.
+Result: `build/release-windows/out/stage/` plus `BT3-Recomp-x86_64.zip` +
+`.sha256`. The game data is never shipped; the launcher's install wizard reads
+your ISO. 12 GB+ RAM recommended. See `tools/release-windows/README.md` for
+the full parity notes.
 
 The pipeline extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,

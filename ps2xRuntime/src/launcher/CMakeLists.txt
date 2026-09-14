@@ -35,6 +35,12 @@ file(GLOB LAUNCHER_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 add_executable(Launcher ${LAUNCHER_SOURCES})
+# [windows] Qt GUI app under a WIN32 subsystem: without this the plain
+# add_executable produces a console-subsystem exe and a terminal window pops up
+# on every launch (the runtime suppresses its own via PS2X_SHOW_WINDOWS_CONSOLE).
+if(WIN32)
+    set_target_properties(Launcher PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         execute_process(COMMAND sw_vers -productVersion
