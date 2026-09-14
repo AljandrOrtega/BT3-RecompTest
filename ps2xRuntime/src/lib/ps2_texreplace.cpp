@@ -155,7 +155,11 @@ namespace
         else
         {
             const char *xd = ps2xExeDirC();
-            root = ((xd && xd[0]) ? fs::path(xd) : fs::path(".")) / "data" / "Textures";
+            // .string() is REQUIRED for Windows: fs::path::string_type is std::string on POSIX
+            // but std::wstring on Windows, so the implicit conversion yields a wstring and there
+            // is no matching operator= for std::string. Linux/clang accepts this silently, so
+            // this class of break can only be caught by an actual Windows build.
+            root = (((xd && xd[0]) ? fs::path(xd) : fs::path(".")) / "data" / "Textures").string();
             fs::create_directories(root, ec);   // harmless if it already exists
             ec.clear();
         }
