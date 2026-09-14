@@ -10,7 +10,7 @@ writes to directly (ps2xRuntime/src/runner_overlay/) and which apply_patches.py 
 sees (it only patches the `runner` tree from the main config.toml recomp pass — see
 setup.py step 5 vs. step "generating overlay sources from BIN/DBZP.BIN"). Without this
 step, any hand-edit to overlay_functions.cpp is silently discarded the next time
-gen_overlay.py runs (it's gitignored/generated) — see modding-docs/lessons.md, Lección 17.
+gen_overlay.py runs (it's gitignored/generated) — see modding-docs/lessons.md, Lesson 17.
 
 Patches are idempotent (marker string checked first) and the script fails loudly if an
 anchor is missing, since that means DBZP.BIN or the generator changed and the patch

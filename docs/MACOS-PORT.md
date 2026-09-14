@@ -1,330 +1,347 @@
-# Port a macOS — estado actual y plan
+# macOS port — current status and plan
 
-## Actualización de implementación · 2026-09-09
+## Implementation update · 2026-09-09
 
-El informe original que sigue se conserva como diagnóstico inicial; sus afirmaciones
-«no compila» y «no se ha compilado» describen el checkout anterior al port.
+The original report below is kept as the initial diagnosis; its "does not compile"
+and "has not been compiled" statements describe the checkout before the port.
 
-Cambios implementados:
+Changes implemented:
 
-- B1–B3: sampler EE desactivado en plataformas sin backend; el contador de fases
-  usa `mach_absolute_time()` en macOS, incluida la calibración del runtime.
-- B4: lector evdev con stub fuera de Linux, sin quitar la pestaña de bindings.
-  La captura se deshabilita y se mantienen los índices lógicos de mandos y las
-  configuraciones guardadas. Los mandos del juego siguen usando GLFW.
-- Otro bloqueo real: `Kernel/Syscalls/Thread.cpp` incluía `xmmintrin.h` sin guarda.
-  Ahora usa la cabecera SIMD del runtime.
-- CMake selecciona SIMD según la arquitectura de salida y rechaza Universal 2;
-  macOS compila sin contracción FMA para conservar los redondeos separados.
-- El runner resuelve su directorio con `_NSGetExecutablePath()`; el fallback
-  anterior de `/proc/self/exe` ubicaba mal preferencias y assets en macOS.
-- La primera generación real expuso una carrera del recompilador: un resultado
-  recién terminado podía seguir en `readyCode` al comprobar si faltaba una función.
-  Se corrigió la comprobación y el límite de resultados pendientes.
-- `build_and_deploy_macos.sh` y `tools/macos/deploy.py` preparan un `.app` con
-  `macdeployqt`, revisión de dependencias/arquitecturas/versión mínima y firma ad-hoc.
-  Datos, partidas y ajustes quedan fuera del bundle, en
+- B1–B3: EE sampler disabled on platforms without a backend; the phase counter
+  uses `mach_absolute_time()` on macOS, including the runtime calibration.
+- B4: evdev reader stubbed outside Linux, without removing the bindings tab.
+  Capture is disabled and the logical pad indices and saved configurations are
+  kept. The game's pad input still goes through GLFW.
+- Another real blocker: `Kernel/Syscalls/Thread.cpp` included `xmmintrin.h`
+  without a guard. It now uses the runtime's SIMD header.
+- CMake selects SIMD by output architecture and rejects Universal 2; macOS builds
+  without FMA contraction to preserve separate roundings.
+- The runner resolves its directory with `_NSGetExecutablePath()`; the previous
+  `/proc/self/exe` fallback mislocated preferences and assets on macOS.
+- The first real generation exposed a recompiler race: a freshly finished result
+  could still sit in `readyCode` while checking whether a function was missing.
+  The check and the pending-result cap were fixed.
+- `build_and_deploy_macos.sh` and `tools/macos/deploy.py` prepare a `.app` with
+  `macdeployqt`, a dependency/architecture/minimum-version audit and ad-hoc
+  signing. Data, saves and settings stay outside the bundle, in
   `~/Library/Application Support/BT3-Recomp/`.
 
-Comandos del port:
+Port commands:
 
 ```sh
 brew install cmake ninja pkg-config ffmpeg qt
-python3 games/bt3/setup.py /ruta/bt3-usa.iso --jobs 3
-./build_and_deploy_macos.sh --skip-setup --output /ruta/BT3-Recomp.app
+python3 games/bt3/setup.py /path/bt3-usa.iso --jobs 3
+./build_and_deploy_macos.sh --skip-setup --output /path/BT3-Recomp.app
 ```
 
-La versión mínima por defecto es la del Mac de compilación. No se promete una
-versión más antigua que la requerida por las dylibs de Homebrew. La firma ad-hoc
-es para uso local: no equivale a Developer ID ni a notarización.
+The default minimum version is that of the build Mac. Nothing older than what the
+Homebrew dylibs require is promised. Ad-hoc signing is for local use: it is not
+equivalent to Developer ID or notarization.
 
-Pruebas efectuadas hasta ahora en Apple Silicon, macOS 26.2, AppleClang 17:
+Tests done so far on Apple Silicon, macOS 26.2, AppleClang 17:
 
-- Verificación SHA-256 de la ISO USA y generación completa de runner y overlay.
-- Compilación del runtime y del launcher Qt; arranque breve del launcher, también
-  desde un directorio de trabajo distinto al del bundle.
-- Bundle ARM64 autónomo de 178 MB: dependencias externas auditadas, firma ad-hoc
-  verificada con `codesign --verify --deep --strict` y plugin Cocoa incluido.
-- Ejecución del runner empaquetado con los datos extraídos de `SLUS-21678`: inicia
-  Cocoa/OpenGL 4.1 sobre Apple M1 Pro, Core Audio, carga el ELF y entra al bucle
-  del juego; el cierre solicitado termina limpiamente.
-- Veinte generaciones paralelas del mapa de gaps coinciden byte a byte con la
-  generación secuencial (`tools/tests/recomp_parallel_smoke.py`).
-- Pruebas MMI/SIMD contra referencias escalares: pasan en ARM64 y en x86-64 bajo
-  Rosetta. Contador de fases y stubs también probados en ambas arquitecturas.
+- SHA-256 verification of the USA ISO and full runner and overlay generation.
+- Build of the runtime and the Qt launcher; brief launcher start, also from a
+  working directory other than the bundle's.
+- Self-contained 178 MB ARM64 bundle: external dependencies audited, ad-hoc
+  signature verified with `codesign --verify --deep --strict`, Cocoa plugin included.
+- Running the packaged runner with the data extracted from `SLUS-21678`: it starts
+  Cocoa/OpenGL 4.1 on an Apple M1 Pro, Core Audio, loads the ELF and enters the game
+  loop; a requested quit ends cleanly.
+- Twenty parallel gap-map generations match the sequential generation byte for byte
+  (`tools/tests/recomp_parallel_smoke.py`).
+- MMI/SIMD tests against scalar references: pass on ARM64 and on x86-64 under
+  Rosetta. Phase counter and stubs also tested on both architectures.
 
-La compilación completa del runner y la prueba gráfica básica pasan en Apple Silicon.
-La paridad visual con un Mac Intel físico, el rendimiento en combate, el audio y
-los mandos reales requieren validación adicional. El backend Metal/MoltenVK y el
-profiler EE nativo de la fase opcional no se implementaron.
+The full runner build and the basic graphical test pass on Apple Silicon. Visual
+parity with a physical Intel Mac, combat performance, audio and real pads need
+further validation. The Metal/MoltenVK backend and the native EE profiler of the
+optional phase were not implemented.
 
 ---
 
-> **Informe técnico** · BT3-Recomp (SLUS-21678) · 2026-09-09
+> **Technical report** · BT3-Recomp (SLUS-21678) · 2026-09-09
 >
 > | | |
 > |---|---|
-> | Commit analizado | `813b6a6` (`main`, limpia) |
-> | Método | Análisis estático del árbol |
-> | Compilado / ejecutado | **No** |
-> | Soporte declarado hoy | Linux · Windows (experimental) |
+> | Commit analysed | `813b6a6` (`main`, clean) |
+> | Method | Static analysis of the tree |
+> | Compiled / run | **No** |
+> | Support declared today | Linux · Windows (experimental) |
 
-Estado del repositorio frente a macOS, los cuatro puntos que impiden compilar hoy, y un plan
-por fases con puertas de decisión. **El núcleo es portable; el empaquetado no lo es en absoluto.**
-
----
-
-## Índice
-
-1. [Veredicto](#0-veredicto)
-2. [Qué es esto, para quien llegue de nuevo](#1-qué-es-esto-para-quien-llegue-de-nuevo)
-3. [Lo que ya funciona sin tocar nada](#2-lo-que-ya-funciona-sin-tocar-nada)
-4. [Bloqueos de compilación](#3-bloqueos-de-compilación)
-5. [Empaquetado: aquí está el trabajo de verdad](#4-empaquetado-aquí-está-el-trabajo-de-verdad)
-6. [Techo gráfico: el coste que hay que aceptar](#5-techo-gráfico-el-coste-que-hay-que-aceptar)
-7. [Riesgo SIMD en Apple Silicon](#6-riesgo-simd-en-apple-silicon)
-8. [Plan por fases](#7-plan-por-fases)
-9. [Trampas conocidas](#8-trampas-conocidas)
-10. [Punto de arranque](#9-punto-de-arranque)
-11. [Qué no se ha verificado](#10-qué-no-se-ha-verificado)
+Repository status with respect to macOS, the four points that block a build today,
+and a phased plan with decision gates. **The core is portable; the packaging is not
+remotely portable.**
 
 ---
 
-## 0. Veredicto
+## Index
 
-macOS **no está soportado hoy** y no compila. Pero el trabajo es menor de lo que el README
-sugiere: no hay `mmap`, ni JIT, ni memoria ejecutable, ni `dlopen`, ni ensamblador inline. La
-memoria invitada es `new uint8_t[]` plano. El renderer es OpenGL 3.3, dentro del techo de macOS.
-La ruta ARM64 vía `sse2neon` ya existe en el CMake, con un caso `APPLE` escrito explícitamente.
-
-Los bloqueos de compilación son **cuatro sitios en tres ficheros**, todos en código opcional (dos
-profilers y el lector evdev del launcher). Un día de trabajo debería dar un binario que arranca en
-un Mac Intel.
-
-El coste real está en dos sitios distintos:
-
-- **El empaquetado**, que es ELF de punta a punta y hay que reescribir, no parchear.
-- **El rendimiento**, porque macOS se queda sin el camino rápido de vértices que el propio
-  repositorio describe como determinante en máquinas modestas.
+1. [Verdict](#0-verdict)
+2. [What this is, for newcomers](#1-what-this-is-for-newcomers)
+3. [What already works untouched](#2-what-already-works-untouched)
+4. [Build blockers](#3-build-blockers)
+5. [Packaging: the real work lives here](#4-packaging-the-real-work-lives-here)
+6. [Graphics ceiling: the cost to accept](#5-graphics-ceiling-the-cost-to-accept)
+7. [SIMD risk on Apple Silicon](#6-simd-risk-on-apple-silicon)
+8. [Phased plan](#7-phased-plan)
+9. [Known pitfalls](#8-known-pitfalls)
+10. [Entry point](#9-entry-point)
+11. [What has not been verified](#10-what-has-not-been-verified)
 
 ---
 
-## 1. Qué es esto, para quien llegue de nuevo
+## 0. Verdict
 
-BT3-Recomp no es un emulador. Es una **recompilación estática**: el ejecutable MIPS del juego
-(PS2, USA, SLUS-21678) y su overlay se traducen a **~7.800 ficheros C++** en tiempo de compilación,
-a partir de la ISO del propio usuario, y se enlazan contra un runtime que emula el hardware
-alrededor (GS, VIF, VU1, IOP, pads) con un renderer OpenGL. El repositorio no contiene código ni
-assets del juego.
+macOS **is not supported today** and does not compile. But the work is smaller than
+the README suggests: there is no `mmap`, no JIT, no executable memory, no `dlopen`,
+no inline assembly. Guest memory is plain `new uint8_t[]`. The renderer is OpenGL 3.3,
+within macOS's ceiling. The ARM64 path via `sse2neon` already exists in CMake, with an
+explicit `APPLE` case.
 
-Consecuencia importante para el port: **no hay generación de código en ejecución**. Nada de páginas
-`PROT_EXEC`, nada que choque con la firma de código ni con el *hardened runtime* de macOS. Eso
-elimina de golpe la parte que normalmente hace difícil portar un emulador a Apple.
+The build blockers are **four sites in three files**, all in optional code (two
+profilers and the launcher's evdev reader). A day's work should yield a binary that
+starts on an Intel Mac.
 
-| Componente | Rol | Relevancia para macOS |
+The real cost is in two places:
+
+- **Packaging**, which is ELF end to end and has to be rewritten, not patched.
+- **Performance**, because macOS loses the fast vertex path that the repository
+  itself describes as decisive on modest machines.
+
+---
+
+## 1. What this is, for newcomers
+
+BT3-Recomp is not an emulator. It is a **static recompilation**: the game's MIPS
+executable (PS2, USA, SLUS-21678) and its overlay are translated to **~7,800 C++
+files** at build time, from the user's own ISO, and linked against a runtime that
+emulates the surrounding hardware (GS, VIF, VU1, IOP, pads) with an OpenGL renderer.
+The repository contains no game code or assets.
+
+An important consequence for the port: **there is no code generation at run time**.
+No `PROT_EXEC` pages, nothing that clashes with code signing or macOS's *hardened
+runtime*. That removes at a stroke the part that normally makes porting an emulator
+to Apple hard.
+
+| Component | Role | Relevance to macOS |
 |---|---|---|
-| `ps2xRecomp` | El recompilador: ELF → C++ | C++ puro, portable. Sin hallazgos. |
-| `ps2xRuntime` | Runtime + renderer + runner del juego | Donde están los 4 bloqueos. |
-| `ps2xRuntime/src/launcher` | Launcher Qt6 (configuración, wizard) | Sin guardas de plataforma. Bloqueo. |
-| `ps2xAnalyzer` / `ps2xTest` | Herramientas de análisis y tests | Sin hallazgos de plataforma. |
-| `ps2xStudio` | Editor; 4 fetches git al configurar | `OFF` por defecto en setup.py. Ignorar. |
-| `games/bt3/setup.py` | Pipeline: ISO → generación → build | Solo dos ramas: Windows y «el resto». |
-| `build_and_deploy.sh` | Ensambla el ELF autoextraíble | Inservible en macOS. Reescritura. |
-| `tools/release/` | Release reproducible en Docker | Sin equivalente macOS. Ver fase 4. |
+| `ps2xRecomp` | The recompiler: ELF → C++ | Pure C++, portable. No findings. |
+| `ps2xRuntime` | Runtime + renderer + game runner | Where the 4 blockers are. |
+| `ps2xRuntime/src/launcher` | Qt6 launcher (settings, wizard) | No platform guards. Blocker. |
+| `ps2xAnalyzer` / `ps2xTest` | Analysis tools and tests | No platform findings. |
+| `ps2xStudio` | Editor; 4 git fetches at configure time | `OFF` by default in setup.py. Ignore. |
+| `games/bt3/setup.py` | Pipeline: ISO → generation → build | Only two branches: Windows and "the rest". |
+| `build_and_deploy.sh` | Assembles the self-extracting ELF | Useless on macOS. Rewrite. |
+| `tools/release/` | Reproducible release in Docker | No macOS equivalent. See phase 4. |
 
-> El pipeline de generación tarda unos minutos con `--jobs 16`; el default conservador es `-j3`.
-> Pide ~16 GB de RAM y ~10 GB de disco.
+> The generation pipeline takes a few minutes at `--jobs 16`; the conservative default
+> is `-j3`. It asks for ~16 GB of RAM and ~10 GB of disk.
 
 ---
 
-## 2. Lo que ya funciona sin tocar nada
+## 2. What already works untouched
 
-Conviene inventariarlo primero, porque es la mayor parte del sistema y evita trabajo especulativo.
+It is worth inventorying it first, because it is most of the system and it avoids
+speculative work.
 
-| Pieza | Evidencia | Por qué no es problema |
+| Piece | Evidence | Why it is not a problem |
 |---|---|---|
-| Memoria invitada | `ps2_memory.cpp:362-403` | RDRAM, scratchpad, IOP RAM, VRAM del GS y VU0/VU1 son `new uint8_t[]`. Cero `mmap`, cero `MAP_FIXED`. |
-| Detección de arquitectura | `CMakeLists.txt:43-49` | `CMAKE_SYSTEM_PROCESSOR` casa `arm64`, que es lo que reporta macOS en Apple Silicon. |
-| Ruta SIMD para ARM | `CMakeLists.txt:56-90` | Trae `sse2neon` v1.9.1 por FetchContent y define `USE_SSE2NEON`. La rama `AARCH64 AND APPLE` (líneas 72-74) ya está escrita. |
-| Cabecera de macros SIMD | `ps2_runtime_macros.h:8-14` | `_MSC_VER` → `USE_SSE2NEON` → `immintrin.h`. Los tres caminos ya existen. |
-| Los ~7.800 ficheros generados | `ps2_recompiler.cpp:105`<br>`function_emitter.cpp:45` | El codegen emite **únicamente** `#include "ps2_runtime_macros.h"`. Arreglar esa cabecera arregla todo el código generado de golpe. |
-| Nombres de hilo | `ThreadNaming.h:47` | Ya tiene rama `__APPLE__` con la firma correcta de `pthread_setname_np`. |
-| evdev del runtime | `ps2xRuntime/CMakeLists.txt:426` | `if(UNIX AND NOT APPLE)` ya excluye `pad_evdev_linux.cpp`. |
-| Mandos | `pad_config.cpp:7` | `PadEvdevStub` sustituye al lector nativo donde no hay evdev. Los mandos entran por GLFW, que en macOS usa IOKit. **No es un bloqueo.** |
-| Los 27 `__linux__` | 6 ficheros | Todos son evdev o *thread pinning* (`ps2_runtime.cpp:360`, `:4133`, `:5285`). Funcionalidad opcional, ya compila fuera limpiamente. |
-| Carga de GL por nombre | `ps2_gs_gpu_renderer.cpp:389` | Usa `dlsym(RTLD_DEFAULT, …)`, que funciona igual en macOS. |
-| Shaders | 11 sitios, `#version 330` | GLSL 3.30 entra en el techo GL 4.1 de macOS. Sin *compute*, sin SSBO. |
-| Dependencias | `ps2xRuntime/CMakeLists.txt:65-170`, `:361-372` | raylib 5.5, imgui (`docking`) y rlImGui por FetchContent; FFmpeg por `pkg-config`. Todo resoluble con Homebrew. |
-| Parche de raylib | `patches/raylib-5.5-ps2x.patch` | Solo toca `src/config.h` y `src/rlgl.h`. Neutral de plataforma; se aplica igual. |
-| Extracción de la ISO | `setup.py:50-58` | Busca `bsdtar` y cae a `tar`. El `tar` de macOS *es* bsdtar y lee ISO9660 directamente. |
-| Compilador | README | El código VU1 generado requiere Clang (MSVC no puede compilarlo). En macOS Clang es el compilador por defecto: ventaja, no obstáculo. |
+| Guest memory | `ps2_memory.cpp:362-403` | RDRAM, scratchpad, IOP RAM, GS VRAM and VU0/VU1 are `new uint8_t[]`. Zero `mmap`, zero `MAP_FIXED`. |
+| Architecture detection | `CMakeLists.txt:43-49` | `CMAKE_SYSTEM_PROCESSOR` matches `arm64`, which is what macOS reports on Apple Silicon. |
+| SIMD path for ARM | `CMakeLists.txt:56-90` | Fetches `sse2neon` v1.9.1 via FetchContent and defines `USE_SSE2NEON`. The `AARCH64 AND APPLE` branch (lines 72-74) is already written. |
+| SIMD macro header | `ps2_runtime_macros.h:8-14` | `_MSC_VER` → `USE_SSE2NEON` → `immintrin.h`. All three paths already exist. |
+| The ~7,800 generated files | `ps2_recompiler.cpp:105`<br>`function_emitter.cpp:45` | The codegen emits **only** `#include "ps2_runtime_macros.h"`. Fixing that header fixes all the generated code at once. |
+| Thread names | `ThreadNaming.h:47` | Already has an `__APPLE__` branch with the correct `pthread_setname_np` signature. |
+| Runtime evdev | `ps2xRuntime/CMakeLists.txt:426` | `if(UNIX AND NOT APPLE)` already excludes `pad_evdev_linux.cpp`. |
+| Pads | `pad_config.cpp:7` | `PadEvdevStub` replaces the native reader where there is no evdev. Pads come in through GLFW, which uses IOKit on macOS. **Not a blocker.** |
+| The 27 `__linux__` | 6 files | All are evdev or thread pinning (`ps2_runtime.cpp:360`, `:4133`, `:5285`). Optional functionality; already compiles cleanly elsewhere. |
+| GL loading by name | `ps2_gs_gpu_renderer.cpp:389` | Uses `dlsym(RTLD_DEFAULT, …)`, which works the same on macOS. |
+| Shaders | 11 sites, `#version 330` | GLSL 3.30 fits macOS's GL 4.1 ceiling. No *compute*, no SSBO. |
+| Dependencies | `ps2xRuntime/CMakeLists.txt:65-170`, `:361-372` | raylib 5.5, imgui (`docking`) and rlImGui via FetchContent; FFmpeg via `pkg-config`. All resolvable with Homebrew. |
+| raylib patch | `patches/raylib-5.5-ps2x.patch` | Touches only `src/config.h` and `src/rlgl.h`. Platform-neutral; applies the same. |
+| ISO extraction | `setup.py:50-58` | Looks for `bsdtar` and falls back to `tar`. macOS's `tar` *is* bsdtar and reads ISO9660 directly. |
+| Compiler | README | The generated VU1 code requires Clang (MSVC cannot compile it). On macOS Clang is the default compiler: an advantage, not an obstacle. |
 
 > [!TIP]
-> **El hallazgo que más ahorra.** Los ficheros generados solo incluyen `ps2_runtime_macros.h`. No
-> hay que tocar el codegen ni regenerar nada para dar soporte a Apple Silicon a nivel de SIMD: la
-> cabecera ya resuelve las tres familias de intrínsecos y los 30.084 usos de `_mm_*` del runtime
-> pasan por ella.
+> **The finding that saves the most.** The generated files include only
+> `ps2_runtime_macros.h`. There is no need to touch the codegen or regenerate anything
+> to support Apple Silicon at the SIMD level: the header already resolves the three
+> intrinsic families and the runtime's 30,084 uses of `_mm_*` go through it.
 
 ---
 
-## 3. Bloqueos de compilación
+## 3. Build blockers
 
-Cuatro sitios. Ninguno afecta a funcionalidad del juego: dos profilers opt-in y el lector evdev del
-launcher. Todos se resuelven con guardas de plataforma y stubs.
+Four sites. None affects game functionality: two opt-in profilers and the launcher's
+evdev reader. All are resolved with platform guards and stubs.
 
-### B1 — El profiler EE usa APIs exclusivas de glibc/Linux
+### B1 — The EE profiler uses Linux/glibc-only APIs
 
-**Fichero:** `ps2xRuntime/src/lib/ps2_eeprof.cpp:20-35` y siguientes
+**File:** `ps2xRuntime/src/lib/ps2_eeprof.cpp:20-35` and following
 
-**Qué rompe:**
+**What breaks:**
 
-- `timer_create(CLOCK_THREAD_CPUTIME_ID, …)` (`:255`) y `timer_settime` (`:259`) — los timers POSIX
-  no existen en macOS.
-- `SIGEV_THREAD_ID` y `sev._sigev_un._tid` (`:254`) — extensión de Linux.
-- `syscall(SYS_gettid)` (`:254`) — no hay `SYS_gettid` en macOS.
-- `((ucontext_t*)uc)->uc_mcontext.gregs[REG_RIP]` (`:150`) — layout de glibc x86-64; en macOS es
-  `uc_mcontext->__ss.__rip`, y en ARM64 no hay RIP.
+- `timer_create(CLOCK_THREAD_CPUTIME_ID, …)` (`:255`) and `timer_settime` (`:259`) —
+  POSIX timers do not exist on macOS.
+- `SIGEV_THREAD_ID` and `sev._sigev_un._tid` (`:254`) — a Linux extension.
+- `syscall(SYS_gettid)` (`:254`) — there is no `SYS_gettid` on macOS.
+- `((ucontext_t*)uc)->uc_mcontext.gregs[REG_RIP]` (`:150`) — glibc x86-64 layout; on
+  macOS it is `uc_mcontext->__ss.__rip`, and on ARM64 there is no RIP.
 
-**Por qué duele:** el fichero está en la lista de fuentes de `ps2_runtime`
-(`ps2xRuntime/CMakeLists.txt:398`), así que se compila siempre. La rama `#else` asume Linux sin
-comprobarlo.
+**Why it hurts:** the file is in `ps2_runtime`'s source list
+(`ps2xRuntime/CMakeLists.txt:398`), so it is always compiled. The `#else` branch
+assumes Linux without checking.
 
-**Arreglo:** reguardar la rama como `#if defined(__linux__)` y dejar stubs no-op en macOS. Es un
-profiler activado por `PS2X_EEPROF`: no se pierde nada del juego. Un port completo lo
-reimplementaría con `dispatch_source` + `thread_get_state`.
+**Fix:** guard the branch as `#if defined(__linux__)` and leave no-op stubs on macOS.
+It is a profiler enabled by `PS2X_EEPROF`: nothing of the game is lost. A full port
+would reimplement it with `dispatch_source` + `thread_get_state`.
 
-**Esfuerzo:** ≈1 h para el stub. 1-2 días si se quiere el profiler funcionando de verdad (no urgente).
+**Effort:** ≈1 h for the stub. 1-2 days if the profiler is wanted working for real
+(not urgent).
 
-### B2 — `x86intrin.h` y `__rdtsc()` sin guarda
+### B2 — `x86intrin.h` and `__rdtsc()` without a guard
 
-**Fichero:** `ps2xRuntime/include/runtime/ps2_guestprof.h:7`, con usos en `:20`, `:29`, `:38`
+**File:** `ps2xRuntime/include/runtime/ps2_guestprof.h:7`, used at `:20`, `:29`, `:38`
 
-**Qué rompe:** `#include <x86intrin.h>` incondicional. En Apple Silicon la cabecera no existe y
-`__rdtsc()` tampoco (`sse2neon` ofrece `_rdtsc()`, con un underscore).
+**What breaks:** unconditional `#include <x86intrin.h>`. On Apple Silicon the header
+does not exist and neither does `__rdtsc()` (`sse2neon` offers `_rdtsc()`, with one
+underscore).
 
-**Arreglo:** un shim: en `__aarch64__` leer `cntvct_el0` vía `__builtin_arm_rsr64`, o
-`mach_absolute_time()`. Ojo: la frecuencia del contador ARM no es la del TSC, y `ps2_runtime.cpp`
-calibra los ticks contra el reloj de pared en cada impresión, así que el ratio se corrige solo.
+**Fix:** a shim: on `__aarch64__` read `cntvct_el0` via `__builtin_arm_rsr64`, or
+`mach_absolute_time()`. Careful: the ARM counter frequency is not the TSC's, and
+`ps2_runtime.cpp` calibrates ticks against the wall clock on every print, so the ratio
+corrects itself.
 
-**Esfuerzo:** ≈30 min.
+**Effort:** ≈30 min.
 
-### B3 — Un `__rdtsc()` más, fuera del guardado
+### B3 — One more `__rdtsc()`, outside the guard
 
-**Fichero:** `ps2xRuntime/src/lib/ps2_runtime.cpp:5226`
+**File:** `ps2xRuntime/src/lib/ps2_runtime.cpp:5226`
 
-**Qué rompe:** mismo intrínseco, en el bloque de calibración de `guestprof`. Se arregla con el shim
-de B2; se lista aparte para que no se olvide al hacer grep solo en cabeceras.
+**What breaks:** the same intrinsic, in `guestprof`'s calibration block. Fixed with
+B2's shim; listed separately so it is not missed when grepping only headers.
 
-**Esfuerzo:** incluido en B2.
+**Effort:** included in B2.
 
-### B4 — El launcher Qt no tenía ninguna guarda de plataforma *(resuelto aguas arriba)*
+### B4 — The Qt launcher had no platform guards *(resolved upstream)*
 
-**Estado:** ya no hace falta nada aquí. El diagnóstico original era que
-`src/launcher/evdev_reader.cpp` y `src/launcher/tab_bindings.cpp` incluían `<linux/input.h>` sin
-guardas y que `src/launcher/CMakeLists.txt` los metía en la compilación con un `file(GLOB *.cpp)`,
-de modo que el launcher nunca había compilado fuera de Linux.
+**Status:** nothing is needed here any more. The original diagnosis was that
+`src/launcher/evdev_reader.cpp` and `src/launcher/tab_bindings.cpp` included
+`<linux/input.h>` without guards and that `src/launcher/CMakeLists.txt` pulled them
+into the build with a `file(GLOB *.cpp)`, so the launcher had never compiled outside
+Linux.
 
-El puerto de input multiplataforma de upstream (`input_reader.{h,cpp}`, GLFW para joysticks y
-eventos de teclado de Qt) eliminó `evdev_reader` por completo y con él la raíz del problema: no
-queda un solo `linux/input.h` ni `/dev/input` en el launcher, y el mismo código compila en Linux,
-Windows y macOS. Este puerto ya no toca esos ficheros; la solución de upstream es mejor que el
-stub «no disponible» que se había previsto aquí.
+Upstream's multiplatform input port (`input_reader.{h,cpp}`, GLFW for joysticks and Qt
+key events) removed `evdev_reader` entirely and with it the root of the problem: not a
+single `linux/input.h` or `/dev/input` is left in the launcher, and the same code
+compiles on Linux, Windows and macOS. This port no longer touches those files;
+upstream's solution is better than the "unavailable" stub that had been planned here.
 
-**Esfuerzo:** 0 — resuelto aguas arriba.
+**Effort:** 0 — resolved upstream.
 
-> Verificado **ausente** en todo el árbol (excluyendo `thirdparty/`): ensamblador inline,
-> `__builtin_ia32_*`, `__cpuid`, `mmap`, `VirtualAlloc`, `dlopen`. El único `sys/syscall.h` es el de
-> B1 y los únicos `linux/input.h` son los de B4 más `pad_evdev_linux.cpp`, que ya está excluido.
+> Verified **absent** across the whole tree (excluding `thirdparty/`): inline assembly,
+> `__builtin_ia32_*`, `__cpuid`, `mmap`, `VirtualAlloc`, `dlopen`. The only
+> `sys/syscall.h` is B1's and the only `linux/input.h` are B4's plus
+> `pad_evdev_linux.cpp`, which is already excluded.
 
 ---
 
-## 4. Empaquetado: aquí está el trabajo de verdad
+## 4. Packaging: the real work lives here
 
-> **Nota de actualización.** Upstream pasó desde entonces a distribuir una **carpeta portable**
-> idéntica en Linux, Windows y macOS, en lugar del ELF autoextraíble. La tabla de abajo se
-> conserva porque el análisis de cada dependencia de Linux sigue siendo válido, y porque explica
-> por qué en macOS la ruta es un bundle `.app`; lo que ya no aplica es el stub autoextraíble.
+> **Update note.** Upstream has since moved to shipping an **identical portable
+> folder** on Linux, Windows and macOS, instead of the self-extracting ELF. The table
+> below is kept because the analysis of each Linux dependency is still valid, and
+> because it explains why the macOS path is a `.app` bundle; what no longer applies is
+> the self-extracting stub.
 
+The Linux distribution format is **a single self-extracting ELF**:
+`[static stub][tar+zstd payload][32 B footer]`. On first start it unpacks into
+`~/.cache/bt3-recomp/<seed>/`, where the *seed* comes from the payload hash, so each
+rebuild invalidates its own cache. It is documented in `docs/DEPLOY.md`.
 
-El formato de distribución en Linux es **un único ELF autoextraíble**:
-`[stub estático][payload tar+zstd][footer de 32 B]`. En el primer arranque se descomprime en
-`~/.cache/bt3-recomp/<seed>/`, donde la *seed* viene del hash del payload, de forma que cada
-rebuild invalida su propia caché. Está documentado en `docs/DEPLOY.md`.
+**None of this carries over to macOS.** It is not a matter of patching the script: the
+whole concept (statically linked stub, `LD_LIBRARY_PATH`, ELF format) has no
+equivalent.
 
-**Nada de esto se traslada a macOS.** No es cuestión de parchear el script: el concepto entero
-(stub enlazado estáticamente, `LD_LIBRARY_PATH`, formato ELF) no tiene equivalente.
-
-| Dependencia de Linux | Dónde | Equivalente en macOS |
+| Linux dependency | Where | macOS equivalent |
 |---|---|---|
-| `gcc -static` | `build_and_deploy.sh:88` | **Ninguno.** macOS no permite enlazar libc estáticamente. El stub no es viable. |
+| `gcc -static` | `build_and_deploy.sh:88` | **None.** macOS does not allow linking libc statically. The stub is not viable. |
 | `readlink("/proc/self/exe")` | `tools/selfx/stub.c:276` | `_NSGetExecutablePath()` |
-| `LD_LIBRARY_PATH` | `stub.c:372`, `:417` | `@rpath` / `@executable_path` vía `install_name_tool` |
-| `ldd` + `mapfile` | `build_and_deploy.sh:97` | `otool -L`. Y `mapfile` no existe en el bash 3.2 de Apple. |
-| Lista negra de glibc | `build_and_deploy.sh:112` | Innecesaria: macOS no tiene el problema de `GLIBC_PRIVATE`. |
+| `LD_LIBRARY_PATH` | `stub.c:372`, `:417` | `@rpath` / `@executable_path` via `install_name_tool` |
+| `ldd` + `mapfile` | `build_and_deploy.sh:97` | `otool -L`. And `mapfile` does not exist in Apple's bash 3.2. |
+| glibc blacklist | `build_and_deploy.sh:112` | Unnecessary: macOS does not have the `GLIBC_PRIVATE` problem. |
 | `sha256sum` | `build_and_deploy.sh:125` | `shasum -a 256` |
 | `nproc` | `build_and_deploy.sh:27` | `sysctl -n hw.ncpu` |
-| `realpath -m` | `build_and_deploy.sh:49` | No existe. `python3 -c os.path.abspath` o coreutils de brew. |
-| Ruta Qt6 fija | `build_and_deploy.sh:148` | `/usr/lib/cmake/Qt6/Qt6Config.cmake` nunca existirá; usar `CMAKE_PREFIX_PATH` con `brew --prefix qt6`. |
-| Concatenar ELF + footer | `build_and_deploy.sh:128-135` | Bundle `.app`, o DMG. Mach-O no admite este truco tal cual. |
-| Copia del runner | `setup.py:212-217` | La rama `else` asume Linux; en macOS cae aquí por `os.name == "posix"` (`setup.py:36`). |
-| Release en Docker | `tools/release/` | Ubuntu 22.04 fija el suelo glibc 2.35, con `check_floor.sh` como puerta. En macOS el equivalente es `-mmacosx-version-min` + `MACOSX_DEPLOYMENT_TARGET`, y no hay contenedor: hace falta un Mac. |
+| `realpath -m` | `build_and_deploy.sh:49` | Does not exist. `python3 -c os.path.abspath` or brew's coreutils. |
+| Hard-coded Qt6 path | `build_and_deploy.sh:148` | `/usr/lib/cmake/Qt6/Qt6Config.cmake` will never exist; use `CMAKE_PREFIX_PATH` with `brew --prefix qt6`. |
+| Concatenate ELF + footer | `build_and_deploy.sh:128-135` | `.app` bundle, or DMG. Mach-O does not support this trick as-is. |
+| Runner copy | `setup.py:212-217` | The `else` branch assumes Linux; on macOS it lands here through `os.name == "posix"` (`setup.py:36`). |
+| Docker release | `tools/release/` | Ubuntu 22.04 sets the glibc 2.35 floor, with `check_floor.sh` as the gate. On macOS the equivalent is `-mmacosx-version-min` + `MACOSX_DEPLOYMENT_TARGET`, and there is no container: a Mac is needed. |
 
-### Forma que debería tomar
+### The shape it should take
 
-- Un bundle `BT3-Recomp.app`: binario en `Contents/MacOS`, dylibs en `Contents/Frameworks`, assets
-  en `Contents/Resources`, más un `Info.plist` con la versión mínima de sistema.
-- `install_name_tool` / `@rpath` para reubicar dylibs. Existen `dylibbundler` y `macdeployqt`;
-  **`macdeployqt`** resuelve además los plugins de Qt, que es la parte que siempre se olvida y
-  produce el fallo «could not find the Qt platform plugin cocoa».
-- `codesign --sign -` (ad-hoc) como mínimo. Sin firma, Gatekeeper mata cualquier binario que el
-  usuario haya descargado. Para distribuir de verdad hacen falta Developer ID + notarización, lo que
-  implica cuenta de pago de Apple: **decisión de producto, no técnica**.
-- Universal 2 (`x86_64;arm64`) es posible con `CMAKE_OSX_ARCHITECTURES`, pero duplica un build que
-  ya es de 7.800 unidades de traducción. Recomendación: dos artefactos separados.
-
----
-
-## 5. Techo gráfico: el coste que hay que aceptar
-
-macOS congeló OpenGL en **4.1** (y lo declaró obsoleto en 10.14). El renderer usa dos cosas por
-encima de esa línea. Las dos degradan solas, sin fallar — y ahí está el problema: no se rompe, se
-ralentiza en silencio.
-
-### R1 — Se pierde el anillo de vértices persistente
-
-**Qué:** `glBufferStorage` con `GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT` requiere
-`GL_ARB_buffer_storage` (GL 4.4). Es la optimización `[vbring]` del parche de raylib.
-
-**Comportamiento:** está gateada en `patches/raylib-5.5-ps2x.patch:104` por
-`glBufferStorage != NULL`, así que macOS cae al camino original de `glBufferSubData`. Funciona. Pero
-según el comentario del propio parche, ese camino costaba **~80 ms de GPU por segundo y ~2,5 µs de
-CPU por flush**, con ~3.000 flushes por frame, y «dominaba las máquinas de gama baja».
-
-**Implicación:** hay que medir antes de prometer nada. Si un Mac moderno absorbe el coste, no hay
-problema; si no, la salida es un backend Metal o Vulkan vía MoltenVK, y eso ya es otro proyecto, no
-un port.
-
-### R2 — `glTextureBarrier` cae a `glFinish()`
-
-**Qué:** `glTextureBarrier` es GL 4.5 (o `NV_texture_barrier`). `ps2_gs_gpu_renderer.cpp:392-396`
-lo busca por `dlsym`, prueba la variante NV, y si no hay ninguna ejecuta `glFinish()`: un
-sincronizado completo de la tubería donde solo se pedía una barrera de textura.
-
-**Atenuante:** el comentario de `:866` dice que para el caso `[rtsnap]` ni `glFinish` ni
-`glTextureBarrier` resolvían nada y que la solución fue un blit del framebuffer. Es decir: el camino
-crítico ya no depende de la barrera. El impacto es menor que R1.
+- A `BT3-Recomp.app` bundle: binary in `Contents/MacOS`, dylibs in `Contents/Frameworks`,
+  assets in `Contents/Resources`, plus an `Info.plist` with the minimum system version.
+- `install_name_tool` / `@rpath` to relocate dylibs. There are `dylibbundler` and
+  `macdeployqt`; **`macdeployqt`** also resolves the Qt plugins, which is the part that
+  is always forgotten and produces the "could not find the Qt platform plugin cocoa"
+  failure.
+- `codesign --sign -` (ad-hoc) at minimum. Without a signature, Gatekeeper kills any
+  binary the user has downloaded. To distribute for real, Developer ID + notarization
+  are needed, which implies a paid Apple account: **a product decision, not a technical
+  one**.
+- Universal 2 (`x86_64;arm64`) is possible with `CMAKE_OSX_ARCHITECTURES`, but it
+  duplicates a build that is already 7,800 translation units. Recommendation: two
+  separate artifacts.
 
 ---
 
-## 6. Riesgo SIMD en Apple Silicon
+## 5. Graphics ceiling: the cost to accept
 
-El runtime tiene **30.084 usos de intrínsecos `_mm_*`** (excluyendo `thirdparty/`) repartidos por el
-rasterizador, el GS, el intérprete VIF1 y VU1. En ARM64 todos pasan por `sse2neon`. Ese es el punto
-donde un port puede producir bugs sutiles y caros de diagnosticar: no fallos de compilación, sino
-píxeles y geometría ligeramente mal por diferencias de redondeo o saturación.
+macOS froze OpenGL at **4.1** (and deprecated it in 10.14). The renderer uses two
+things above that line. Both degrade on their own, without failing — and that is the
+problem: it does not break, it slows down silently.
 
-La buena noticia es que el conjunto de intrínsecos de SSE4.1 realmente usados es corto, y
-`sse2neon` v1.9.1 los cubre todos:
+### R1 — The persistent vertex ring is lost
+
+**What:** `glBufferStorage` with `GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT` requires
+`GL_ARB_buffer_storage` (GL 4.4). It is the `[vbring]` optimization of the raylib patch.
+
+**Behaviour:** it is gated in `patches/raylib-5.5-ps2x.patch:104` by
+`glBufferStorage != NULL`, so macOS falls back to the original `glBufferSubData` path.
+It works. But according to the patch's own comment, that path cost **~80 ms of GPU per
+second and ~2.5 µs of CPU per flush**, with ~3,000 flushes per frame, and "dominated
+low-end machines".
+
+**Implication:** measure before promising anything. If a modern Mac absorbs the cost,
+there is no problem; if not, the way out is a Metal or Vulkan backend via MoltenVK, and
+that is another project, not a port.
+
+### R2 — `glTextureBarrier` falls back to `glFinish()`
+
+**What:** `glTextureBarrier` is GL 4.5 (or `NV_texture_barrier`).
+`ps2_gs_gpu_renderer.cpp:392-396` looks it up with `dlsym`, tries the NV variant, and if
+neither is present runs `glFinish()`: a full pipeline sync where only a texture barrier
+was requested.
+
+**Mitigating:** the comment at `:866` says that for the `[rtsnap]` case neither
+`glFinish` nor `glTextureBarrier` solved anything and that the fix was a framebuffer
+blit. That is: the critical path no longer depends on the barrier. The impact is
+smaller than R1.
+
+---
+
+## 6. SIMD risk on Apple Silicon
+
+The runtime has **30,084 uses of `_mm_*` intrinsics** (excluding `thirdparty/`) spread
+across the rasterizer, the GS, the VIF1 interpreter and VU1. On ARM64 all of them go
+through `sse2neon`. That is where a port can produce subtle bugs that are expensive to
+diagnose: not build failures, but pixels and geometry slightly off from rounding or
+saturation differences.
+
+The good news is that the set of SSE4.1 intrinsics actually used is short, and
+`sse2neon` v1.9.1 covers all of them:
 
 ```
 _mm_blendv_epi8   _mm_blendv_ps     _mm_cvtepi32_ps
@@ -332,160 +349,164 @@ _mm_extract_epi32 _mm_extract_epi64 _mm_insert_epi8
 _mm_max_epi32     _mm_min_epi32     _mm_mullo_epi32
 ```
 
-Además, `ps2_runtime_macros.h` no usa los intrínsecos en crudo: los envuelve en macros `PS2_*` por
-instrucción MMI del R5900 (`PS2_PEXTLW`, `PS2_PADDW`, `PS2_PMAXW`…). Eso concentra la superficie de
-riesgo en un fichero y da un sitio natural donde escribir tests diferenciales x86 ↔ ARM si aparecen
-discrepancias.
+Also, `ps2_runtime_macros.h` does not use the intrinsics raw: it wraps them in `PS2_*`
+macros per R5900 MMI instruction (`PS2_PEXTLW`, `PS2_PADDW`, `PS2_PMAXW`…). That
+concentrates the risk surface in one file and gives a natural place to write x86 ↔ ARM
+differential tests if discrepancies appear.
 
 > [!IMPORTANT]
-> **No empezar por Apple Silicon.** Un Mac Intel valida el port *sin* meter `sse2neon` en la
-> ecuación: si el juego pinta mal en Intel, el problema es del port; si pinta bien en Intel y mal en
-> ARM, el problema es SIMD. Separar esas dos variables ahorra días.
+> **Do not start on Apple Silicon.** An Intel Mac validates the port *without* putting
+> `sse2neon` into the equation: if the game renders wrong on Intel, the problem is the
+> port; if it renders fine on Intel and wrong on ARM, the problem is SIMD. Separating
+> those two variables saves days.
 
 ---
 
-## 7. Plan por fases
+## 7. Phased plan
 
-Las fases están numeradas porque el orden importa: cada una tiene una puerta que evita gastar
-trabajo en la siguiente sobre una base que no se sostiene.
+The phases are numbered because the order matters: each has a gate that avoids spending
+work on the next one on a foundation that does not hold.
 
-### Fase 1 — Compilar en Mac Intel · ≈1 día · B1·B2·B3·B4
+### Phase 1 — Build on an Intel Mac · ≈1 day · B1·B2·B3·B4
 
-Resolver los cuatro bloqueos con guardas y stubs. Nada de reimplementar profilers ni backends de
-input: el objetivo es un binario que enlaza. Dependencias por Homebrew
-(`cmake ninja pkg-config ffmpeg qt6 zstd`) y configurar con `CMAKE_PREFIX_PATH` apuntando a Qt6.
+Resolve the four blockers with guards and stubs. No reimplementing profilers or input
+backends: the goal is a binary that links. Dependencies via Homebrew
+(`cmake ninja pkg-config ffmpeg qt6 zstd`) and configure with `CMAKE_PREFIX_PATH`
+pointing at Qt6.
 
-**Puerta:** `ps2EntryRunner` enlaza y arranca sin caerse antes del primer frame.
+**Gate:** `ps2EntryRunner` links and starts without crashing before the first frame.
 
-### Fase 2 — Que pinte · ≈1-3 días · sin empaquetar
+### Phase 2 — Make it render · ≈1-3 days · no packaging
 
-Ejecutar desde `build/ps2xRuntime` con `PS2X_CD_IMAGE` apuntando a la ISO, sin bundle ni launcher.
-Aquí se descubre si el perfil *core* estricto de macOS acepta el renderer, si los mandos entran por
-GLFW, y si audio y vídeo (FFmpeg) funcionan. Es la fase con más incertidumbre real y donde vive el
-riesgo del proyecto.
+Run from `build/ps2xRuntime` with `PS2X_CD_IMAGE` pointing at the ISO, without a bundle
+or the launcher. Here it is discovered whether macOS's strict *core* profile accepts the
+renderer, whether pads come in through GLFW, and whether audio and video (FFmpeg) work.
+It is the phase with the most real uncertainty and where the project's risk lives.
 
-**Puerta:** un combate jugable a velocidad razonable. Medir aquí el impacto de R1 antes de decidir
-cualquier cosa sobre backends gráficos.
+**Gate:** a playable fight at a reasonable speed. Measure R1's impact here before
+deciding anything about graphics backends.
 
-### Fase 3 — Apple Silicon · ≈2-5 días · riesgo alto, poco predecible
+### Phase 3 — Apple Silicon · ≈2-5 days · high, poorly predictable risk
 
-Compilar en arm64 y validar `sse2neon` contra el comportamiento observado en Intel: mismas escenas,
-misma captura, comparar. Los fallos aquí son visuales y silenciosos, no crashes. La estimación es la
-menos fiable del informe.
+Build on arm64 and validate `sse2neon` against the behaviour observed on Intel: same
+scenes, same capture, compare. The failures here are visual and silent, not crashes.
+This is the least reliable estimate in the report.
 
-**Puerta:** paridad visual con la build Intel en un conjunto acordado de escenas.
+**Gate:** visual parity with the Intel build on an agreed set of scenes.
 
-### Fase 4 — Bundle `.app` y distribución · ≈2-3 días · reescritura, no parche
+### Phase 4 — `.app` bundle and distribution · ≈2-3 days · rewrite, not patch
 
-Un `build_and_deploy_macos.sh` nuevo, hermano del de Linux, no una versión con `if`. Bundle,
-`macdeployqt`, firma ad-hoc, y un `MACOSX_DEPLOYMENT_TARGET` declarado que cumpla el papel que en
-Linux cumple el suelo de glibc 2.35. Actualizar `README.md` y `docs/DEPLOY.md`, que hoy afirman
-«Linux o Windows».
+A new `build_and_deploy_macos.sh`, sibling of the Linux one, not an `if` version.
+Bundle, `macdeployqt`, ad-hoc signing, and a declared `MACOSX_DEPLOYMENT_TARGET` that
+plays the role the glibc 2.35 floor plays on Linux. Update `README.md` and
+`docs/DEPLOY.md`, which today state "Linux or Windows".
 
-**Puerta:** el `.app` arranca en un Mac que no es el de compilación y sin herramientas de desarrollo
-instaladas.
+**Gate:** the `.app` starts on a Mac that is not the build machine and without
+development tools installed.
 
-### Fase 5 — Opcional: recuperar lo degradado · solo si la fase 2 lo pide
+### Phase 5 — Optional: recover what degraded · only if phase 2 asks for it
 
-Profiler EE nativo (`dispatch_source` + `thread_get_state`), input nativo vía IOKit/GameController
-para lo que GLFW no mapee, y —si el rendimiento no llegó— backend Metal o MoltenVK. Cada punto es
-independiente y ninguno bloquea la distribución.
+Native EE profiler (`dispatch_source` + `thread_get_state`), native input via
+IOKit/GameController for what GLFW does not map, and — if performance did not get
+there — a Metal or MoltenVK backend. Each point is independent and none blocks
+distribution.
 
-### Resumen de estimaciones
+### Estimates summary
 
-| Hito | Estimación | Confianza |
+| Milestone | Estimate | Confidence |
 |---|---|---|
-| Compila y arranca (Intel) | 1-2 días | Alta — el trabajo está identificado línea a línea |
-| Jugable sin empaquetar (Intel) | +1-3 días | Media — depende de sorpresas del driver GL |
-| Paridad en Apple Silicon | +2-5 días | Baja — depende de cuántos bugs de `sse2neon` aparezcan |
-| `.app` distribuible | +2-3 días | Alta — trabajo conocido, solo laborioso |
-| **Total, ambas arquitecturas** | **1-2 semanas** | Media |
+| Compiles and starts (Intel) | 1-2 days | High — the work is identified line by line |
+| Playable without packaging (Intel) | +1-3 days | Medium — depends on GL driver surprises |
+| Parity on Apple Silicon | +2-5 days | Low — depends on how many `sse2neon` bugs appear |
+| Distributable `.app` | +2-3 days | High — known work, just laborious |
+| **Total, both architectures** | **1-2 weeks** | Medium |
 
-Sin contar notarización de Apple, que es trámite administrativo y cuenta de pago.
-
----
-
-## 8. Trampas conocidas
-
-Cosas que van a costar tiempo a quien no las sepa de antemano.
-
-- **No parchear `build_and_deploy.sh`.** Tiene siete dependencias de Linux entrelazadas, una de
-  ellas (`gcc -static`) sin equivalente. Un script hermano sale más limpio y no rompe el camino de
-  Linux, que funciona.
-- **El bash de macOS es 3.2.** Cualquier script nuevo que use `mapfile`, `${x,,}` o arrays
-  asociativos falla en un Mac limpio. O se ceñe a bash 3.2, o declare explícitamente que necesita el
-  bash de Homebrew.
-- **El launcher de Qt6 sin `macdeployqt` arrancará en la máquina de compilación y en ninguna otra.**
-  El fallo típico es «could not find the Qt platform plugin cocoa», y confunde porque el binario
-  existe y tiene permisos.
-- **Gatekeeper.** Un `.app` sin firmar que se descargue queda en cuarentena y no arranca; en local
-  funciona, en manos de otro no. Es la clase de bug que aparece justo al publicar.
-- **La región está fijada.** Los mapas de funciones comiteados son del ejecutable USA (SLUS-21678).
-  El port no cambia eso y no hay que prometer otras regiones.
-- **`ps2xStudio` hace cuatro fetches git al configurar** y ya abortó builds de usuarios por un fallo
-  de red. `setup.py` lo pone en `OFF` salvo `PS2X_SETUP_STUDIO=1`; un `cmake` a mano sobre la raíz sí
-  lo activa. Mantenerlo apagado durante el port.
-- **El build por defecto es `-j3`.** Con 7.800 unidades de traducción eso es una eternidad. Pasar
-  `--jobs` con el número de núcleos, vigilando la RAM (~16 GB recomendados).
+Not counting Apple notarization, which is administrative paperwork and a paid account.
 
 ---
 
-## 9. Punto de arranque
+## 8. Known pitfalls
 
-Para quien continúe: esto es lo que hay que ejecutar primero, antes de escribir una línea.
+Things that will cost time to anyone who does not know them in advance.
+
+- **Do not patch `build_and_deploy.sh`.** It has seven intertwined Linux dependencies,
+  one of them (`gcc -static`) with no equivalent. A sibling script comes out cleaner and
+  does not break the Linux path, which works.
+- **macOS's bash is 3.2.** Any new script using `mapfile`, `${x,,}` or associative arrays
+  fails on a clean Mac. Either stick to bash 3.2, or explicitly declare that it needs
+  Homebrew's bash.
+- **The Qt6 launcher without `macdeployqt` will start on the build machine and nowhere
+  else.** The typical failure is "could not find the Qt platform plugin cocoa", and it
+  confuses because the binary exists and has permissions.
+- **Gatekeeper.** An unsigned `.app` that gets downloaded is quarantined and will not
+  start; it works locally, but not in someone else's hands. It is the kind of bug that
+  shows up right when you publish.
+- **The region is fixed.** The committed function maps are for the USA executable
+  (SLUS-21678). The port does not change that and no other regions should be promised.
+- **`ps2xStudio` does four git fetches at configure time** and has already aborted user
+  builds on a network failure. `setup.py` sets it `OFF` unless `PS2X_SETUP_STUDIO=1`; a
+  manual `cmake` on the root does enable it. Keep it off during the port.
+- **The default build is `-j3`.** With 7,800 translation units that is an eternity. Pass
+  `--jobs` with the core count, watching RAM (~16 GB recommended).
+
+---
+
+## 9. Entry point
+
+For whoever continues: this is what to run first, before writing a line.
 
 ```sh
-# 1. Dependencias (Mac Intel para la fase 1)
+# 1. Dependencies (Intel Mac for phase 1)
 brew install cmake ninja pkg-config ffmpeg qt6 zstd python@3.12
 
-# 2. Confirmar los 4 bloqueos en el checkout actual (deben salir estos y solo estos)
+# 2. Confirm the 4 blockers in the current checkout (these and only these should show)
 grep -rn "x86intrin\|__rdtsc" ps2xRuntime/include ps2xRuntime/src
 grep -rn "linux/input.h" ps2xRuntime/src/launcher
 sed -n '20,35p;150p;250,260p' ps2xRuntime/src/lib/ps2_eeprof.cpp
 
-# 3. Configurar solo el runtime; Studio fuera, Qt6 localizado por brew
+# 3. Configure only the runtime; Studio off, Qt6 located by brew
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DPS2X_BUILD_STUDIO=OFF \
   -DCMAKE_PREFIX_PATH="$(brew --prefix qt6)"
 
-# 4. Pipeline completo desde la ISO (ajustar --jobs a los nucleos reales)
-python3 games/bt3/setup.py /ruta/bt3-usa.iso --jobs 10
+# 4. Full pipeline from the ISO (adjust --jobs to the real cores)
+python3 games/bt3/setup.py /path/bt3-usa.iso --jobs 10
 
-# 5. Ejecutar sin empaquetar (fase 2)
+# 5. Run without packaging (phase 2)
 cd build/ps2xRuntime
-PS2X_CD_IMAGE=/ruta/bt3-usa.iso ./ps2EntryRunner ../../games/bt3/work/SLUS_216.78
+PS2X_CD_IMAGE=/path/bt3-usa.iso ./ps2EntryRunner ../../games/bt3/work/SLUS_216.78
 ```
 
-Variables de entorno útiles durante el diagnóstico, todas ya en el código: `PS2X_VBRING=0`
-(desactiva el anillo de vértices, para comparar con el camino lento), `PS2X_RTSNAP=0`,
-`PS2X_GUESTPROF=1`, `PS2X_EEPROF`, `PS2X_PIN` (solo Linux).
+Environment variables useful during diagnosis, all already in the code: `PS2X_VBRING=0`
+(disables the vertex ring, to compare with the slow path), `PS2X_RTSNAP=0`,
+`PS2X_GUESTPROF=1`, `PS2X_EEPROF`, `PS2X_PIN` (Linux only).
 
 ---
 
-## 10. Qué no se ha verificado
+## 10. What has not been verified
 
-Honestidad sobre el alcance de este informe, para que nadie lo tome por más de lo que es.
+Honesty about the scope of this report, so nobody takes it for more than it is.
 
-- **No se ha compilado nada.** Todo el informe es lectura del código en el commit `813b6a6`. Los
-  bloqueos B1-B4 están identificados por inspección, no por un error de compilador. Es muy probable
-  que la primera compilación real destape más, típicamente cabeceras transitivas y
+- **Nothing has been compiled.** The whole report is a reading of the code at commit
+  `813b6a6`. Blockers B1-B4 are identified by inspection, not by a compiler error. It is
+  very likely that the first real build uncovers more, typically transitive headers and
   warnings-as-errors.
-- **No se ha ejecutado el juego** en ninguna plataforma, así que el comportamiento del renderer bajo
-  el perfil *core* estricto de macOS es predicción razonada, no dato.
-- **No se ha auditado `thirdparty/`** más allá de comprobar que `xxhash.h` no aporta problemas.
-  Puede haber más ahí.
-- **No se han revisado los ~7.800 ficheros generados** uno a uno; la conclusión de que basta con
-  `ps2_runtime_macros.h` viene de que el codegen solo emite ese include (`ps2_recompiler.cpp:105`,
-  `function_emitter.cpp:45`).
-- **Sin CI.** El repositorio no tiene workflows de GitHub; el único artefacto de release automatizado
-  es `tools/release/Dockerfile`, que es Linux. Un macOS en CI necesitaría runners macOS, que es coste
-  y decisión aparte.
+- **The game has not been run** on any platform, so the renderer's behaviour under
+  macOS's strict *core* profile is reasoned prediction, not data.
+- **`thirdparty/` has not been audited** beyond checking that `xxhash.h` brings no
+  problems. There may be more in there.
+- **The ~7,800 generated files have not been reviewed** one by one; the conclusion that
+  `ps2_runtime_macros.h` is enough comes from the codegen emitting only that include
+  (`ps2_recompiler.cpp:105`, `function_emitter.cpp:45`).
+- **No CI.** The repository has no GitHub workflows; the only automated release artifact
+  is `tools/release/Dockerfile`, which is Linux. macOS in CI would need macOS runners,
+  which is a cost and a decision apart.
 
 ---
 
-*Informe elaborado por análisis estático del árbol en `main` @ `813b6a6`, 2026-09-09. Todas las
-referencias `fichero:línea` corresponden a ese commit y se desplazarán con futuros cambios.*
+*Report produced by static analysis of the tree at `main` @ `813b6a6`, 2026-09-09. All
+`file:line` references correspond to that commit and will drift with future changes.*
 
-*BT3-Recomp se construye sobre PS2Recomp. El repositorio no contiene código, assets ni media del
-juego: la recompilación parte de la ISO del propio usuario.*
+*BT3-Recomp is built on PS2Recomp. The repository contains no game code, assets or
+media: the recompilation starts from the user's own ISO.*

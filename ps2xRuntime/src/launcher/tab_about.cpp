@@ -49,12 +49,12 @@ AboutTab::AboutTab(QWidget *parent)
         "<b>z3xox</b> — owner / lead developer<br>"
         "&nbsp;&nbsp;&nbsp;recompiler, runtime (EE/GS/VU1/scheduler), renderer, game overrides, generators")));
     creditsLay->addWidget(richLabel(QStringLiteral(
-        "<b>RexxColder</b> — supporter / colaborador<br>"
-        "&nbsp;&nbsp;&nbsp;optimización (perf/async, batching), launcher + install wizard + ISO9660, "
+        "<b>RexxColder</b> — support / collaborator<br>"
+        "&nbsp;&nbsp;&nbsp;optimization (perf/async, batching), launcher + install wizard + ISO9660, "
         "input &amp; gamepads, build/release (Docker CI, floor gate, packaging), deploy, "
         "game-data (AFS/AFL), docs")));
     creditsLay->addWidget(richLabel(QStringLiteral(
-        "<b>valenvivaldi</b> — colaborador<br>"
+        "<b>valenvivaldi</b> — collaborator<br>"
         "&nbsp;&nbsp;&nbsp;port macOS arm64, packaging, audio")));
     root->addWidget(credits);
 

@@ -4411,12 +4411,12 @@ void PS2Runtime::run()
                           << " fade=" << fadeState << "/" << fadeLevel
                           << " introSub=" << s_introSub << " introTimer=" << s_introTimer << "/1800"
                           << std::dec << std::endl;
-                // ===================== [hstate] Jerarquía legible de estados =====================
-                // Traduce bt3State (raw) a fase + sub-fase humana. BOOT y MENU están mapeados con
-                // offsets ya documentados en tasks/main_menu_state_machine.md y tasks/ESTATUS.md.
-                // FIGHT/IN_FIGHT todavía no tienen los offsets de "tipo de combate"
-                // jugador vs CPU / 2 jugadores) identificados -> ver el bloque [fightprobe] más abajo,
-                // que es el que junta la evidencia para poder completar este switch.
+                // ===================== [hstate] Readable state hierarchy =====================
+                // Translates bt3State (raw) to a human phase + sub-phase. BOOT and MENU are mapped
+                // with offsets already documented in tasks/main_menu_state_machine.md and tasks/ESTATUS.md.
+                // FIGHT/IN_FIGHT do not yet have the "match type" offsets (player vs CPU / 2 players)
+                // identified -> see the [fightprobe] block below, which gathers the evidence to
+                // complete this switch.
                 if (const uint8_t *rd = m_memory.getRDRAM())
                 {
                     auto r32safe = [&](uint32_t addr) -> uint32_t {
@@ -4436,11 +4436,11 @@ void PS2Runtime::run()
                     case 0x01u:
                     {
                         phase = "BOOT";
-                        extern std::atomic<uint32_t> g_ps2FmvActive; // [hstate] definido en ps2_gs_gpu.cpp
+                        extern std::atomic<uint32_t> g_ps2FmvActive; // [hstate] defined in ps2_gs_gpu.cpp
                         const bool fmv = g_ps2FmvActive.load(std::memory_order_relaxed) != 0u;
                         const ps2_stubs::MemoryCardDebugSnapshot mc = ps2_stubs::getMemoryCardDebugSnapshot();
-                        // Heurística best-effort: refinar una vez que tengamos logs reales de un boot
-                        // completo (memcard aparece antes de que exista introTimer > 0).
+                        // Best-effort heuristic: refine once we have real logs of a full boot
+                        // (memcard shows up before introTimer > 0 exists).
                         if (!mc.openFiles.empty())
                             sub = "MEMCARD_LOAD(openFiles=" + std::to_string(mc.openFiles.size())
                                 + ",lastCmd=" + hex32(mc.lastCmd) + ")";
@@ -4452,7 +4452,7 @@ void PS2Runtime::run()
                         else if (s_introTimer > 0)
                             sub = "TITLE_SPLASH(timer=" + std::to_string(s_introTimer) + "/1800)";
                         else
-                            sub = "SPLASH_LOGOS(sin marcador exacto todavia)";
+                            sub = "SPLASH_LOGOS(no exact marker yet)";
                         break;
                     }
                     case 0x04u:
@@ -4466,8 +4466,8 @@ void PS2Runtime::run()
                             const uint32_t subStruct = r32safe(mainStruct + 0x9A4u);
                             const uint32_t menuState = (subStruct && subStruct != 0xffffffffu)
                                 ? r32safe(subStruct + 0x40u) : 0xffffffffu;
-                            // Cursor/selección/estado del item activo: *(0x3B38E8)+0x12C/0x138/0x13C
-                            // (offsets documentados en tasks/ESTATUS.md y main_menu_state_machine.md).
+                            // Cursor/selection/state of the active item: *(0x3B38E8)+0x12C/0x138/0x13C
+                            // (offsets documented in tasks/ESTATUS.md and main_menu_state_machine.md).
                             const uint32_t itemBase = r32safe(0x3B38E8u);
                             int32_t cursor = -1, selection = -1; uint32_t itemState = 0xffffffffu;
                             if (itemBase != 0u && itemBase != 0xffffffffu)
@@ -4489,14 +4489,14 @@ void PS2Runtime::run()
                             else o << hex32(itemState);
                             sub = o.str();
                         }
-                        else sub = "mainStruct=0 (menu aun no inicializado)";
+                        else sub = "mainStruct=0 (menu not initialised yet)";
                         break;
                     }
                     case 0x06u: phase = "LOADING"; break;
                     case 0x26u: case 0x28u: case 0x29u:
                         phase = "PREFIGHT_SETUP"; sub = "raw=" + hex32(bt3State); break;
-                    case 0x27u: phase = "FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
-                    case 0x2Du: phase = "IN_FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
+                    case 0x27u: phase = "FIGHT";   sub = "mode=? (see [fightprobe])"; break;
+                    case 0x2Du: phase = "IN_FIGHT";   sub = "mode=? (see [fightprobe])"; break;
                     case 0x38u: phase = "POST_FIGHT"; break;
                     default: break;
                     }
@@ -4504,16 +4504,16 @@ void PS2Runtime::run()
                     std::cerr << "[hstate] phase=" << phase << " sub=" << sub
                               << " raw=" << hex32(bt3State) << std::endl;
                 }
-                // ===================== [fightprobe] Diagnóstico de tipo de combate =====================
-                // PS2X_FIGHTPROBE=1: en cada transición de bt3state hacia 0x26/0x27/0x2D vuelca:
-                //  (a) qué puertos de pad están siendo efectivamente leídos (readCount creciendo)
-                //      -> distingue CPU vs CPU (ningún puerto avanza) de P1 vs CPU (solo puerto 0)
-                //      de P1 vs P2 local (puertos 0 y 1).
-                //  (b) un hexdump de la región 0x3C00-0x3D00 del main-struct del menú (selección de
-                //      personaje/escenario/dificultad que se hizo en 0x04 antes de entrar a la pelea).
-                // Correr 3 veces (CPU-CPU, jugador-CPU, jugador-jugador local) y diffear las líneas
-                // [fightprobe] pegadas: el/los bytes que cambien de forma consistente entre corridas
-                // son el flag de "tipo de control" que hoy no está identificado.
+                // ===================== [fightprobe] Match-type diagnostic =====================
+                // PS2X_FIGHTPROBE=1: on every bt3state transition to 0x26/0x27/0x2D it dumps:
+                //  (a) which pad ports are actually being read (readCount growing)
+                //      -> distinguishes CPU vs CPU (no port advances) from P1 vs CPU (only port 0)
+                //      from local P1 vs P2 (ports 0 and 1).
+                //  (b) a hexdump of region 0x3C00-0x3D00 of the menu main-struct (character/stage/
+                //      difficulty selection made in 0x04 before entering the fight).
+                // Run 3 times (CPU-CPU, player-CPU, local player-player) and diff the pasted
+                // [fightprobe] lines: the byte(s) that change consistently between runs are the
+                // "control type" flag that is not identified today.
                 {
                     static const bool s_fightProbeOn = [](){
                         const char *v = std::getenv("PS2X_FIGHTPROBE"); return v && v[0] && v[0] != '0';
@@ -4551,25 +4551,25 @@ void PS2Runtime::run()
                         std::cerr << o.str() << std::endl;
                     }
                 }
-                // ===================== [menuhex] Estado del main menu =====================
-                // PS2X_MENUHEX=1: sondea TODOS los estados (0x04 root, 0x3e OPTIONS, 0x2c etc).
-                // vuelca cada vez que cambia el estado del menu.
-                //   mainPtr   = *(0x2FF10C)      (main game-state struct, ya usada por hstate)
+                // ===================== [menuhex] Main menu state =====================
+                // PS2X_MENUHEX=1: probes ALL states (0x04 root, 0x3e OPTIONS, 0x2c, etc).
+                // dumps each time the menu state changes.
+                //   mainPtr   = *(0x2FF10C)      (main game-state struct, also used by hstate)
                 //     +0x18   = screen_state_id  (bt3State)
-                //     +0x2C   = selected_entry_ID (la entry actualmente seleccionada)
-                //     +0x148  = cursor (indice en la lista de entries, 0-9)
+                //     +0x2C   = selected_entry_ID (the currently selected entry)
+                //     +0x148  = cursor (index into the entry list, 0-9)
                 //     +0x14   = visibility_flags (bit 6 = menu visible)
                 //     +0x68C  = transition_flags
                 //   dispPtr   = *(0x2FF28C)
                 //     +0x08   = display_filter (0-127)
                 //     +0xA0C  = frame_counter (0-24)
-                // Mas las jump tables fijas de overlay (ya confirmadas legibles):
+                // Plus the fixed overlay jump tables (already confirmed readable):
                 //   0x3B4290 jumpTable (10 handlers), 0x3B42C0 dispatch2 (5 handlers).
                 {
                     static const bool s_menuHexOn = [](){
                         const char *v = std::getenv("PS2X_MENUHEX"); return v && v[0] && v[0] != '0';
                     }();
-                    static std::string s_menuHexLastKey;   // fingerprint del ultimo estado volcado
+                    static std::string s_menuHexLastKey;   // fingerprint of the last dumped state
                     if (s_menuHexOn)
                     {
                         if (const uint8_t *rd3 = m_memory.getRDRAM())
@@ -4580,7 +4580,7 @@ void PS2Runtime::run()
                             const uint32_t mainPtr = r32m(0x2FF10Cu);
                             if (mainPtr == 0u || mainPtr == 0xffffffffu)
                             {
-                                s_menuHexLastKey.clear();   // aun no inicializado: resetear fingerprint
+                                s_menuHexLastKey.clear();   // not initialised yet: reset the fingerprint
                             }
                             else
                             {
@@ -4614,10 +4614,10 @@ void PS2Runtime::run()
                                       << " frame=" << frameCtr;
                                     std::cerr << m.str() << std::endl;
 
-                                    // "caption" deducida: selEntry -> nombre de entry (10 entries)
+                                    // deduced caption: selEntry -> entry name (10 entries)
                                     static const char *kEntryNames[10] = {
                                         "DRAGON_ROAD", "ULTIMATE_BATTLE", "WORLD_TOURNAMENT", "DUEL", "DRAGON_NET",
-                                        "EVOLUCION_Z", "ENTRENAMIENTO", "DATA_CENTER", "REF_PERSONAJES", "OPCIONES"
+                                        "EVOLUTION_Z", "TRAINING", "DATA_CENTER", "CHARACTER_REFERENCE", "OPTIONS"
                                     };
                                     const int32_t cur = static_cast<int32_t>(selectedEntry);
                                     if (cur >= 0 && cur < 10)
@@ -4628,7 +4628,7 @@ void PS2Runtime::run()
                                     else
                                     {
                                     std::cerr << "[menuhex] selEntry=" << cur
-                                              << " (fuera de rango 0-9, indice de submenu?)" << std::endl;
+                                              << " (out of range 0-9, submenu index?)" << std::endl;
                                     }
 
                                     // (b) Item state jump table (10 handlers)
@@ -4649,7 +4649,7 @@ void PS2Runtime::run()
                                         std::cerr << d.str() << std::dec << std::endl;
                                     }
 
-                                    // (d) seleccion de la struct principal: ventana +0x00..+0x30 y +0x140..+0x150
+                                    // (d) main struct selection: window +0x00..+0x30 and +0x140..+0x150
                                     {
                                         std::ostringstream n;
                                         n << "[menuhex] mainPtr+0x00:";

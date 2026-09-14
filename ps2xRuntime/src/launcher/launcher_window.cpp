@@ -268,7 +268,11 @@ void LauncherWindow::checkGameData()
     m_gameDataValid = (DiscVerify::verifyInstalledData(m_dataDir) == DiscVerify::State::Valid);
 
     if (m_play)
-        m_play->setEnabled((!m_gameElf.isEmpty() || m_plainRunner) && m_gameDataValid);
+    {
+        const bool enabled = (!m_gameElf.isEmpty() || m_plainRunner) && m_gameDataValid;
+        m_play->setEnabled(enabled);
+        setButtonGlow(m_play, m_playGlow, m_playGlowAnim, enabled);   // [glow] PLAY pulses while enabled
+    }
 
     updateHint();
 }
@@ -340,37 +344,53 @@ void LauncherWindow::onSettingsClicked()
 
 void LauncherWindow::startSettingsGlow()
 {
-    if (!m_settings || m_settingsGlow)
-        return;
-    m_settingsGlow = new QGraphicsDropShadowEffect(m_settings);
-    m_settingsGlow->setOffset(0, 0);
-    m_settingsGlow->setBlurRadius(6.0);
-    m_settingsGlow->setColor(QColor(255, 158, 26, 210));   // dbz::kAccent halo
-    m_settings->setGraphicsEffect(m_settingsGlow);
-
-    m_settingsGlowAnim = new QPropertyAnimation(m_settingsGlow, "blurRadius", this);
-    m_settingsGlowAnim->setDuration(1200);
-    m_settingsGlowAnim->setLoopCount(-1);
-    m_settingsGlowAnim->setEasingCurve(QEasingCurve::InOutSine);
-    m_settingsGlowAnim->setKeyValueAt(0.0, 6.0);
-    m_settingsGlowAnim->setKeyValueAt(0.5, 30.0);
-    m_settingsGlowAnim->setKeyValueAt(1.0, 6.0);
-    m_settingsGlowAnim->start();
+    setButtonGlow(m_settings, m_settingsGlow, m_settingsGlowAnim, true);
 }
 
 void LauncherWindow::stopSettingsGlow()
 {
-    if (m_settingsGlowAnim)
+    setButtonGlow(m_settings, m_settingsGlow, m_settingsGlowAnim, false);
+}
+
+void LauncherWindow::setButtonGlow(QPushButton *btn, QGraphicsDropShadowEffect *&fx,
+                                   QPropertyAnimation *&anim, bool on)
+{
+    if (!btn)
+        return;
+
+    if (on)
     {
-        m_settingsGlowAnim->stop();
-        delete m_settingsGlowAnim;
-        m_settingsGlowAnim = nullptr;
+        if (fx)
+            return;   // already glowing
+        fx = new QGraphicsDropShadowEffect(btn);
+        fx->setOffset(0, 0);
+        fx->setBlurRadius(6.0);
+        fx->setColor(QColor(255, 158, 26, 210));   // dbz::kAccent halo
+        btn->setGraphicsEffect(fx);
+
+        anim = new QPropertyAnimation(fx, "blurRadius", this);
+        anim->setDuration(1200);
+        anim->setLoopCount(-1);
+        anim->setEasingCurve(QEasingCurve::InOutSine);
+        anim->setKeyValueAt(0.0, 6.0);
+        anim->setKeyValueAt(0.5, 30.0);
+        anim->setKeyValueAt(1.0, 6.0);
+        anim->start();
     }
-    if (m_settingsGlow)
+    else
     {
-        // setGraphicsEffect(nullptr) makes QWidget delete the previous effect.
-        m_settings->setGraphicsEffect(nullptr);
-        m_settingsGlow = nullptr;
+        if (anim)
+        {
+            anim->stop();
+            delete anim;
+            anim = nullptr;
+        }
+        if (fx)
+        {
+            // setGraphicsEffect(nullptr) makes QWidget delete the previous effect.
+            btn->setGraphicsEffect(nullptr);
+            fx = nullptr;
+        }
     }
 }
 

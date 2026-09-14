@@ -38,6 +38,10 @@ private:
     // first-time user (no settings.toml yet) is drawn to Settings > Misc.
     void startSettingsGlow();
     void stopSettingsGlow();
+    // [glow] soft orange halo that pulses forever. PLAY uses it whenever the
+    // button is enabled; SETTINGS only on first boot.
+    void setButtonGlow(QPushButton *btn, QGraphicsDropShadowEffect *&fx,
+                       QPropertyAnimation *&anim, bool on);
 
     QLabel *m_hint = nullptr;
     QPushButton *m_play = nullptr;
@@ -54,4 +58,6 @@ private:
     bool m_wizardShown = false;
     QGraphicsDropShadowEffect *m_settingsGlow = nullptr;
     QPropertyAnimation *m_settingsGlowAnim = nullptr;
+    QGraphicsDropShadowEffect *m_playGlow = nullptr;
+    QPropertyAnimation *m_playGlowAnim = nullptr;
 };

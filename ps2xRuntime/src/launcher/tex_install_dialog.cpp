@@ -1,6 +1,7 @@
 #include "tex_install_dialog.h"
 
 #include "app_paths.h"
+#include "settings_manager.h"
 #include "tex_pack.h"
 
 #include <QCloseEvent>
@@ -313,6 +314,10 @@ void TexInstallDialog::onExtractFinished(int exitCode, QProcess::ExitStatus stat
         m_ok = true;
         m_exBar->setValue(100);
         setStatus(QStringLiteral("Installed."));
+        // The pack is now indexable: switch Texture Replacement on and persist it so
+        // the next run actually uses it (shared [video] texture_pack key).
+        SettingsManager::instance().setTexPack(true);
+        SettingsManager::instance().save();
         emit installed();
     }
     else
