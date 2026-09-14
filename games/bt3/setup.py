@@ -159,11 +159,11 @@ def configured() -> bool:
     project files, and `cmake --build` then dies with "MSB1009: Project file does not exist"."""
     if not (BUILD / "CMakeCache.txt").exists():
         return False
+    cache_text = (BUILD / "CMakeCache.txt").read_text(errors="replace")
     if IS_MACOS and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
-        cache = (BUILD / "CMakeCache.txt").read_text(errors="replace")
         desired = os.environ["MACOSX_DEPLOYMENT_TARGET"]
         if not any(line.startswith("CMAKE_OSX_DEPLOYMENT_TARGET:") and line.endswith("=" + desired)
-                   for line in cache.splitlines()):
+                   for line in cache_text.splitlines()):
             return False
     if IS_MACOS:
         # [pgs] A cache configured before the parallel-gs submodule was fetched
@@ -291,10 +291,10 @@ def main() -> None:
     elif not args.skip_setup:
         # A bare ELF build: the caller supplies SLUS_216.78 directly. BIN/DBZP.BIN
         # (the overlay source) still has to be present in WORK.
-        if work.exists():
-            make_writable(work)
+        if WORK.exists():
+            make_writable(WORK)
         shutil.copyfile(src, elf)
-        make_writable(work)
+        make_writable(WORK)
         print("NOTE: you passed a bare ELF. The build also needs the ISO's")
         print(f"      BIN/DBZP.BIN next to it in {WORK}.")
 

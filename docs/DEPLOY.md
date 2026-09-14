@@ -45,9 +45,10 @@ Python script that hosts the build pipeline (and is the base for Windows).
 | Script | Platform | Role |
 |---|---|---|
 | `build_and_deploy.sh` | Linux | Interactive build + deploy. Asks for the ISO and output dir, runs the full `setup.py` pipeline, bundles the runner's `ldd` library closure into `OUT/lib`, renames the runner to `bt3-runner`, builds the launcher (Qt 6 + GLFW, pulled via FetchContent), copies the release assets and writes `install game.sh`. |
-| `games/bt3/setup.py` | Both (Windows experimental) | The build pipeline: extract/verify ISO, build the recompiler, generate ~7,800 runner sources, apply patches, build the runner. Also has `--deploy` to assemble the playable tree. |
+| `games/bt3/setup.py` | All (container on Windows) | The build pipeline: extract/verify ISO, build the recompiler, generate ~7,800 runner sources, apply patches, build the runner. Also has `--deploy` to assemble the playable tree. On Windows it runs inside the release container (`--gen-only`, the codegen is target-agnostic) rather than natively on the shell. |
 | `build_and_deploy_macos.sh` | macOS (experimental) | Interactive build + deploy for macOS: runs the same `setup.py` pipeline, then assembles a self-contained `.app` (relocated dylibs, `Info.plist`, ad-hoc signing) via `tools/macos/deploy.py`. |
 | `tools/release/package.sh` | Linux | Wrap a finished deploy tree into `BT3-Recomp-x86_64.tar.gz` + `.sha256`. This is the only artifact that leaves the machine. |
+| `tools/release-windows/build-windows.sh` (+ `.bat`) | Windows (Docker) | Host driver: builds the Windows cross-build image, prompts for the ISO, cross-compiles the runner + Qt launcher (clang-cl/xwin/lld-link), bundles `stage/` and runs the PE gate. `.bat` = double-click entry point (auto-starts Docker Desktop). |
 
 ## Build + deploy (Linux)
 
@@ -82,17 +83,34 @@ and settings survive reinstallation. The folder itself remains fully portable:
 you can skip the install script and run `Launcher` straight from the unpacked
 tree.
 
-## Build + deploy (Windows, experimental)
+## Build + deploy (Windows, Docker)
+
+No Windows toolchain is required: the build runs inside a Docker container that
+cross-compiles for Windows (clang-cl + xwin + lld-link — no Visual Studio
+anywhere). You need Docker Desktop and Git for Windows (for `bash`).
+
+The double-click entry point is `tools\release-windows\build-windows.bat`: it
+starts Docker Desktop if it is not running (waits up to 120 s), prompts for your
+ISO path (or accepts a `.iso` dragged on top of the file), runs the build and the
+PE gate, and offers to package the zip when the gate passes. The identical driver
+from Git Bash / WSL:
 
 ```sh
-python games\bt3\setup.py C:\path\game.iso --deploy C:\path\deploy
+tools/release-windows/build-windows.sh --iso /path/to/bt3-usa.iso --jobs 16
+tools/release-windows/package.sh
 ```
 
-The same pipeline runs; on Windows the runner is copied as `bt3-runner.exe`,
-the launcher builds with MSVC/Clang (Qt 6 + GLFW), the DLL closure is copied to
-the output dir, and the tree is zipped instead of a tarball. No
-`LD_LIBRARY_PATH` games are needed — Windows resolves the bundled DLLs from the
-executable's own directory.
+The container generates the generated sources natively (`setup.py --gen-only` —
+the codegen is target-agnostic), cross-compiles the runner and the Qt 6
+launcher, bundles Qt, FFmpeg and the VC++ runtime DLLs into `lib/`, writes the
+portable tree to `build/release-windows/out/stage/` (`Launcher.exe`,
+`bt3-runner.exe`, `Launcher.bat`, `assets/`, `savedata/`, licences,
+`settings.toml`) and runs a PE gate — `check_windows_deps.py` (pefile) verifies
+that every PE import resolves either from `lib/` or to a Windows OS component,
+and that the layout is complete. `package.sh` then zips the tree into
+`BT3-Recomp-x86_64.zip` + `.sha256`. Windows resolves the bundled DLLs from the
+executable's own directory, so no `LD_LIBRARY_PATH` games are needed. The full
+parity notes live in `tools/release-windows/README.md`.
 
 ## macOS .app (experimental)
 

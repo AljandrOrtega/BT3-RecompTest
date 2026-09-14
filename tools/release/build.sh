@@ -24,12 +24,16 @@ ISO_DEFAULT="/home/rexx/Descargas/Roms/PS2/DragonBall Z - Budokai Tenkaichi 3.is
 JOBS="${BT3_RELEASE_JOBS:-$(nproc)}"
 REUSE_DEPS=0
 ISO=""
-for a in "$@"; do
-    case "$a" in
-        --reuse-deps) REUSE_DEPS=1 ;;
-        --jobs=*) JOBS="${a#--jobs=}" ;;
-        --iso) ISO="$2"; shift ;;
-        --iso=*) ISO="${a#--iso=}" ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reuse-deps) REUSE_DEPS=1; shift ;;
+        --jobs) JOBS="$2"; shift 2 ;;
+        --jobs=*) JOBS="${1#--jobs=}"; shift ;;
+        --iso) ISO="$2"; shift 2 ;;
+        --iso=*) ISO="${1#--iso=}"; shift ;;
+        --help|-h)
+            echo "usage: $0 [--iso PATH|none] [--reuse-deps] [--jobs N]"; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; echo "usage: $0 [--iso PATH|none] [--reuse-deps] [--jobs N]" >&2; exit 2 ;;
     esac
 done
 
