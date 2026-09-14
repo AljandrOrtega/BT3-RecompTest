@@ -7,6 +7,8 @@ class QLabel;
 class QPushButton;
 class QProcess;
 class QWidget;
+class QGraphicsDropShadowEffect;
+class QPropertyAnimation;
 
 class LauncherWindow : public QMainWindow
 {
@@ -32,6 +34,10 @@ private:
     void updateHint();
     void checkGameData();
     bool openInstallWizard();
+    // [firstboot] pulse the SETTINGS button until the user opens it, so a
+    // first-time user (no settings.toml yet) is drawn to Settings > Misc.
+    void startSettingsGlow();
+    void stopSettingsGlow();
 
     QLabel *m_hint = nullptr;
     QPushButton *m_play = nullptr;
@@ -46,4 +52,6 @@ private:
     bool m_plainRunner = false;
     bool m_gameDataValid = false;
     bool m_wizardShown = false;
+    QGraphicsDropShadowEffect *m_settingsGlow = nullptr;
+    QPropertyAnimation *m_settingsGlowAnim = nullptr;
 };

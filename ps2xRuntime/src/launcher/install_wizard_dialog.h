@@ -23,6 +23,9 @@ public:
     ~InstallWizardDialog() override;
 
     bool installed() const { return m_installed; }
+    // True when the user chose to install the texture pack on the final
+    // recommendation page (Next). The caller opens the texture installer.
+    bool wantTexturePack() const { return m_wantTexPack; }
 
 private slots:
     void onNextMissing();
@@ -67,12 +70,17 @@ private:
     QPushButton *m_close = nullptr;
     QPushButton *m_retryInstall = nullptr;
 
+    // Page D: post-install texture-pack recommendation (first install only).
+    QPushButton *m_recNext = nullptr;
+
     QTemporaryDir *m_tmp = nullptr;
     QString m_dumpPath;
     QString m_isoPath; // verified image ready for extraction
+    bool m_reinstall = false;
     bool m_verified = false;
     bool m_installed = false;
     bool m_inAfsPhase = false; // retry re-runs the AFS phase only
+    bool m_wantTexPack = false; // user pressed Next on the recommendation page
 
     QThread *m_thread = nullptr;
     ExtractWorker *m_worker = nullptr;

@@ -11,6 +11,8 @@ extern "C"
 #include <libswscale/swscale.h>
 }
 
+#include "runtime/ps2_toml.h"
+
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -80,40 +82,17 @@ namespace
         return std::filesystem::is_regular_file(p, ec);
     }
 
-    // [exeDir]/savedata/bt3_settings.ini -> [video] texture_pack. Cached (the launcher writes it
+    // [exeDir]/savedata/settings.toml -> [video] texture_pack. Cached (the launcher writes it
     // before launch). This is the "yes": Texture Replacement on means the pack is installed.
-    bool iniTexPack()
+    bool tomlTexPack()
     {
         static const bool s = []() {
-            std::ifstream f(exeDir() + "/savedata/bt3_settings.ini");
+            std::ifstream f(exeDir() + "/savedata/settings.toml");
             if (!f.is_open())
                 return false;
-            auto trim = [](std::string &x) {
-                while (!x.empty() && std::isspace(static_cast<unsigned char>(x.front()))) x.erase(x.begin());
-                while (!x.empty() && std::isspace(static_cast<unsigned char>(x.back()))) x.pop_back();
-            };
-            std::string line, section;
-            while (std::getline(f, line))
-            {
-                const auto hash = line.find_first_of("#;");
-                if (hash != std::string::npos) line.erase(hash);
-                trim(line);
-                if (line.empty()) continue;
-                if (line.front() == '[' && line.back() == ']')
-                {
-                    section = line.substr(1, line.size() - 2);
-                    trim(section);
-                    continue;
-                }
-                const auto eq = line.find('=');
-                if (eq == std::string::npos) continue;
-                std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-                trim(k);
-                trim(v);
-                if (section == "video" && k == "texture_pack")
-                    return (v == "1" || v == "true");
-            }
-            return false;
+            ps2x_toml::Document doc;
+            doc.parse(f);
+            return doc.getB("video.texture_pack", false);
         }();
         return s;
     }
@@ -288,7 +267,7 @@ namespace
 bool enabled()
 {
     if (!envOverridePath().empty()) return true;                 // PS2X_FMV_OVERRIDE wins
-    if (!iniTexPack()) return false;                             // [video] texture_pack must be on
+    if (!tomlTexPack()) return false;                            // [video] texture_pack must be on
     return fileExists(packVideoDir() + "/ZS3USOP_4k.mp4");       // ...and the pack ships the video
 }
 

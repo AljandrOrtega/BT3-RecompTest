@@ -24,7 +24,7 @@ Dragon Ball Budokai Tenkaichi 3 Recompiled/
 ├── lib/                    # runner's shared-library closure (Linux)
 ├── assets/                 # launcher artwork, fonts (background.png, icon.png, …)
 ├── savedata/
-│   ├── bt3_settings.ini    # user settings ([logging], [video], …)
+│   ├── settings.toml    # user settings ([logging], [video], …)
 │   └── pad_p1.conf / pad_p2.conf       # launcher bindings
 └── savedata_slot1/         # BASLUS-21678DBZT3 memory-card slot, kept across runs
 ```
@@ -161,7 +161,7 @@ codes so the runtime interprets them in-game without translation.
 ## Settings: `[logging] log_level`
 
 Diagnostics go to `logs/bt3.log` next to the game (fast rotation: the previous
-run is kept as `bt3.prev.log`). The verbosity is set in `savedata/bt3_settings.ini`:
+run is kept as `bt3.prev.log`). The verbosity is set in `savedata/settings.toml`:
 
 ```ini
 [logging]

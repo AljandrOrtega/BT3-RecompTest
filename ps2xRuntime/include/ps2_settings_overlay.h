@@ -69,7 +69,7 @@ public:
 
     static void preloadSettings();
     void syncFromRuntime();   // seed m_settings from live runtime state
-    // Set the directory that holds bt3_settings.ini (portable dist: <root>/savedata).
+    // Set the directory that holds settings.toml (portable dist: <root>/savedata).
     static void setConfigDirectory(const std::string &dir);
 
     struct DeviceInfo

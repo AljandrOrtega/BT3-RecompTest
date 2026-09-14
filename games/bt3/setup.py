@@ -199,7 +199,7 @@ def copytree_overlay(src: Path, dst: Path) -> None:
 def deploy_tree(runner: Path, out: Path) -> None:
     """Assemble the portable tree in OUT.
 
-    layout: OUT/savedata/ (bt3_settings.ini; existing user saves are preserved),
+    layout: OUT/savedata/ (settings.toml; existing user saves are preserved),
     OUT/assets/ (fonts). No game data is deployed: the launcher's install wizard
     extracts SLUS_216.78 + BIN/ DATA/ IRX/ SYSTEM.CNF from the user's own ISO
     into OUT/data on first run.
@@ -210,11 +210,11 @@ def deploy_tree(runner: Path, out: Path) -> None:
     print(f"== assembling deploy tree in {out}")
     out.mkdir(parents=True, exist_ok=True)
 
-    # settings: default bt3_settings.ini only if none deployed yet (user keeps their saves)
+    # settings: default settings.toml only if none deployed yet (user keeps their saves)
     save_dst = out / "savedata"
     save_dst.mkdir(parents=True, exist_ok=True)
-    cfg_src = runner.parent / "bt3_settings.ini"
-    cfg_dst = save_dst / "bt3_settings.ini"
+    cfg_src = runner.parent / "settings.toml"
+    cfg_dst = save_dst / "settings.toml"
     if cfg_src.exists() and not cfg_dst.exists():
         shutil.copy2(cfg_src, cfg_dst)
         print(f"  copied default settings -> {cfg_dst}")
