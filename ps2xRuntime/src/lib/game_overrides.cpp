@@ -4470,7 +4470,14 @@ namespace
         if (duelObj && stateObj)
         {
             wr32(rdram, duelObj + 0x110u, 1u);                                  // 1P VS 2P
-            wr32(rdram, duelObj + 0x114u, 0u);                                  // Single Battle
+            // 0x114 is the battle type: 0 Single, 1 Team, 2 DP. Taken from the netplay session
+            // (the host's choice, which it stamps into every packet) so both machines build the
+            // SAME match -- they each run this hook independently, so disagreeing here would set
+            // up two different fights.
+            wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
+            // +0x13c is the Battle Settings time limit, found by dumping RAM at four settings and
+            // keeping the only pointer-reachable value that tracked 3 -> 2 -> 1 -> 0 in order.
+            wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
             wr32(rdram, stateObj + 0x620u, rd32(rdram, duelObj + 0x110u));      // what 0x356234 does
             wr32(rdram, stateObj + 0x624u, rd32(rdram, duelObj + 0x114u));
         }

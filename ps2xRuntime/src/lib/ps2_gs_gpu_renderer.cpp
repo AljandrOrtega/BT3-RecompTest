@@ -5002,8 +5002,16 @@ bool GsGpuRenderer::sameBatchState(const DrawCmd &a, const DrawCmd &b)
     // EVERY DrawCmd field except tri[], triCount and triMore. A field added to the struct and
     // forgotten here would render the HEAD's value for every triangle of a run -- a silent
     // wrong-pixel bug -- so the static_assert below fails the build when the struct grows.
-    static_assert(sizeof(DrawCmd) == 352,   // x86-64; bump only together with a re-read of the field list below
+    // This is a DEVELOPER GUARD, not a portability requirement: it exists so that adding a field
+    // to DrawCmd forces a re-read of the list below. Its expected size is whatever the reference
+    // toolchain (Linux x86-64, libstdc++) produces, so asserting it unconditionally turns any
+    // other toolchain into a build failure -- a Windows builder hit exactly that with 320 != 352
+    // while another Windows build of the same tree was fine. Keep the check where it is
+    // calibrated; everywhere else the field list is still reviewed by whoever edits the struct.
+#if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
+    static_assert(sizeof(DrawCmd) == 352,
                   "DrawCmd changed size: re-check sameBatchState() covers every new field, then update this size");
+#endif
     return a.texKey == b.texKey && a.isTriangle == b.isTriangle && a.isTransfer == b.isTransfer
         && a.isVramBlit == b.isVramBlit && a.depthOnly == b.depthOnly && a.wsHudApplied == b.wsHudApplied
         && a.isAliasPass == b.isAliasPass && a.aliasKind == b.aliasKind && a.isDecode == b.isDecode

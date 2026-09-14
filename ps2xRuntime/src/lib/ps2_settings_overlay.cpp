@@ -2048,6 +2048,12 @@ void PS2SettingsOverlay::drawNetplayTab()
         ImGui::Text("Status: %s", ps2NetPeerConnected() ? "CONNECTED" : "waiting for peer...");
         ImGui::Text("You are player %d", ps2NetLocalPlayer());
         ImGui::Text("Input delay: %u frames (%u ms at 30 fps)", ps2NetDelay(), ps2NetDelay() * 33u);
+        { const char *bn[] = {"Single Battle","Team Battle","DP Battle"};
+          const int bt = ps2NetBattleType();
+          const char *tn[] = {"60 s","90 s","180 s","240 s","no limit"};
+          const int tl = ps2NetTimeLimit();
+          ImGui::Text("Game mode: %s   |   time limit: %s",
+                      (bt >= 0 && bt < 3) ? bn[bt] : "?", (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
         if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
         ImGui::Separator();
         if (ImGui::Button("Disconnect"))
@@ -2061,6 +2067,8 @@ void PS2SettingsOverlay::drawNetplayTab()
     }
 
     static int  s_delay = 2;
+    static int  s_battle = 0;
+    static int  s_time = 3;
     static bool s_jump = true;
     ImGui::Checkbox("Go to character select once connected", &s_jump);
     ImGui::TextDisabled("Both sides jump together; the menus are hidden while it happens.");
@@ -2069,6 +2077,13 @@ void PS2SettingsOverlay::drawNetplayTab()
     // packet, which is why only one side needs a reachable port.
     ImGui::InputText("Host address (Join only)", s_peer, sizeof s_peer);
     ImGui::InputInt("Port", &s_port);
+    const char *kBattle[] = { "Single Battle", "Team Battle", "DP Battle" };
+    ImGui::Combo("Game mode", &s_battle, kBattle, 3);
+    // Battle Settings time-limit indices, confirmed in game:
+    //   0 = 60 s, 1 = 90 s, 2 = 180 s, 3 = 240 s (default), 4 = no limit
+    const char *kTime[] = { "60 seconds", "90 seconds", "180 seconds", "240 seconds (default)", "No limit" };
+    ImGui::Combo("Time limit", &s_time, kTime, 5);
+    ImGui::TextDisabled("The HOST's choices apply to both players.");
     ImGui::SliderInt("Input delay (frames)", &s_delay, 1, 10);
     ImGui::TextDisabled("BT3 runs at 30 fps, so each frame is 33 ms. Use 1 on the same machine,");
     ImGui::TextDisabled("2 on a LAN. Raise it only if you see stalls.");
@@ -2076,13 +2091,13 @@ void PS2SettingsOverlay::drawNetplayTab()
 
     if (ImGui::Button("Host (you are Player 1)"))
     {
-        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle); ps2NetSetTimeLimit(s_time);
         ps2NetHost(s_port, 1);
     }
     ImGui::SameLine();
     if (ImGui::Button("Join (you are Player 2)"))
     {
-        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);   // the host's game mode wins
         char hp[96]; std::snprintf(hp, sizeof hp, "%s:%d", s_peer, s_port);
         ps2NetJoin(hp, 2);
     }

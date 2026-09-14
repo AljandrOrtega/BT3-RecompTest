@@ -15,6 +15,10 @@ bool     ps2NetAutoJump();
 void     ps2NetSetDelay(int frames);                   // 1 loopback, 2 LAN; 1 frame = 33 ms
 void     ps2NetDisconnect(const char *why);            // tear down, restore local pads
 uint32_t ps2NetSession();                              // bumped per connect
+void     ps2NetSetBattleType(int t);                   // 0 Single, 1 Team, 2 DP (host decides)
+int      ps2NetBattleType();
+void     ps2NetSetTimeLimit(int t);                    // Battle Settings index, 3 = default
+int      ps2NetTimeLimit();
 void     ps2NetBeginAutoStart(const char *path);       // host: replay a canned menu sequence
 bool     ps2NetAutoInput(Ps2xNetInput &out);           // next canned input, if any
 bool     ps2NetAutoStartActive();
