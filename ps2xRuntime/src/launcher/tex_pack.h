@@ -16,9 +16,6 @@ namespace texpack
     // <deploy>/data/Textures
     QString dir();
 
-    // Preferred unpacker present on PATH (7zz/7z/unrar/bsdtar/tar), or empty.
-    QString pickUnpacker();
-
     // Lowercase hex sha256 of a file, or empty on error.
     QString sha256File(const QString &path);
 

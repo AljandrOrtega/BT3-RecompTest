@@ -34,6 +34,33 @@ FetchContent_MakeAvailable(glfw)
 file(GLOB LAUNCHER_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
+# --- libarchive: in-process 7z/zip/tar/rar extraction ---------------------
+# The launcher extracts archives itself via libarchive, so the portable tree no
+# longer needs a system 7z/unrar/tar and behaves identically on every platform.
+# Prefer the system library; fall back to a pinned, statically-built copy so the
+# result is reproducible on a bare distro / CI. ENABLE_LZMA must stay on: the
+# 7z/LZMA2 texture pack and disc dumps need it.
+set(LA_LINK "")
+set(LA_INCLUDES "")
+find_package(LibArchive QUIET)
+if(LibArchive_FOUND)
+    set(LA_LINK ${LibArchive_LIBRARIES})
+    set(LA_INCLUDES ${LibArchive_INCLUDE_DIRS})
+else()
+    message(STATUS "libarchive not found: fetching pinned static build (v3.8.1)")
+    include(FetchContent)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_TEST OFF CACHE BOOL "" FORCE)
+    set(ENABLE_TAR OFF CACHE BOOL "" FORCE)
+    set(ENABLE_CPIO OFF CACHE BOOL "" FORCE)
+    set(ENABLE_CAT OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(libarchive
+        URL https://github.com/libarchive/libarchive/releases/download/v3.8.1/libarchive-3.8.1.tar.gz
+        URL_HASH SHA256=bde832a5e3344dc723cfe9cc37f8e54bde04565bfe6f136bc1bd31ab352e9fab)
+    FetchContent_MakeAvailable(libarchive)
+    set(LA_LINK archive_static)
+endif()
+
 add_executable(Launcher ${LAUNCHER_SOURCES})
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -59,13 +86,15 @@ endif()
 target_include_directories(Launcher PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${LA_INCLUDES})
 
 target_link_libraries(Launcher PRIVATE
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::Gui
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
+    ${LA_LINK}
     glfw)
 
 if(NOT MSVC)
