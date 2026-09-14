@@ -2065,7 +2065,9 @@ void PS2SettingsOverlay::drawNetplayTab()
     ImGui::Checkbox("Go to character select once connected", &s_jump);
     ImGui::TextDisabled("Both sides jump together; the menus are hidden while it happens.");
     ImGui::Separator();
-    ImGui::InputText("Peer address", s_peer, sizeof s_peer);
+    // Only Join uses the address: hosting binds the port and learns the peer from its first
+    // packet, which is why only one side needs a reachable port.
+    ImGui::InputText("Host address (Join only)", s_peer, sizeof s_peer);
     ImGui::InputInt("Port", &s_port);
     ImGui::SliderInt("Input delay (frames)", &s_delay, 1, 10);
     ImGui::TextDisabled("BT3 runs at 30 fps, so each frame is 33 ms. Use 1 on the same machine,");
@@ -2085,9 +2087,9 @@ void PS2SettingsOverlay::drawNetplayTab()
         ps2NetJoin(hp, 2);
     }
     ImGui::Separator();
-    ImGui::TextWrapped("Host waits for the other machine. Once connected, the host walks both "
-                       "sides to character select automatically if PS2X_NET_AUTOSTART points at "
-                       "a recorded menu sequence.");
+    ImGui::TextWrapped("HOST: just press Host -- leave the address blank, give the other player "
+                       "your IP and this port. JOIN: type the host's IP above, then press Join. "
+                       "Only the host needs the UDP port reachable.");
 }
 
 void PS2SettingsOverlay::drawLoggingTab()
