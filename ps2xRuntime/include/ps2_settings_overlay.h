@@ -158,6 +158,7 @@ private:
     void drawVideoTab();
     void drawControllersTab();
     void drawLoggingTab();
+    void drawNetplayTab();   // [netplay]
     void drawGamepadTestArea(const std::array<uint8_t, 32> &btnDown,
                              const std::array<float, 6> &axis);
     void drawBindingsTable();

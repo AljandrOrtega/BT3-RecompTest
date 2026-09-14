@@ -416,6 +416,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
     src/lib/ps2_texreplace.cpp   # [texreplace] PCSX2-compatible texture identity
+    src/lib/ps2_netplay.cpp      # [netplay] deterministic lockstep transport
     src/lib/ps2_iop.cpp
     src/lib/ps2_iop_audio.cpp
     src/lib/ps2_iop_dbcman.cpp

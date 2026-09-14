@@ -1,6 +1,7 @@
 #include "ps2_runtime.h"   // [fps60] ps2Set60Fps
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
+#include "runtime/ps2_netplay.h"   // [netplay]
 #include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_audio.h"
@@ -1227,6 +1228,12 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                     drawControllersTab();
                     ImGui::EndTabItem();
                 }
+                if (ImGui::BeginTabItem("  Netplay"))
+                {
+                    m_activeTab = 4;
+                    drawNetplayTab();
+                    ImGui::EndTabItem();
+                }
                 if (ImGui::BeginTabItem("  Logging"))
                 {
                     m_activeTab = 3;
@@ -2016,6 +2023,71 @@ void PS2SettingsOverlay::drawBindingsPopup()
 
         ImGui::EndPopup();
     }
+}
+
+// [netplay] Host / Join without a terminal. The peer's address is remembered in the ini --
+// typing an IP on a gamepad is miserable, so recall matters more than a text field.
+// Join does BOTH things the user asked for: it connects AND, on the host, kicks off the canned
+// menu sequence so both sides land on character select together (see ps2NetBeginAutoStart).
+void PS2SettingsOverlay::drawNetplayTab()
+{
+    static char s_peer[64] = "127.0.0.1";
+    static int  s_port = 7777;
+    static bool s_loaded = false;
+    if (!s_loaded)
+    {
+        s_loaded = true;
+        if (const char *e = std::getenv("PS2X_NET_PEER")) { std::snprintf(s_peer, sizeof s_peer, "%s", e); }
+    }
+
+    ImGui::TextUnformatted("Online play (deterministic lockstep)");
+    ImGui::Separator();
+
+    if (ps2NetActive())
+    {
+        ImGui::Text("Status: %s", ps2NetPeerConnected() ? "CONNECTED" : "waiting for peer...");
+        ImGui::Text("You are player %d", ps2NetLocalPlayer());
+        ImGui::Text("Input delay: %u frames (%u ms at 30 fps)", ps2NetDelay(), ps2NetDelay() * 33u);
+        if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
+        ImGui::Separator();
+        if (ImGui::Button("Disconnect"))
+            ps2NetDisconnect("overlay");
+        ImGui::SameLine();
+        ImGui::TextDisabled("restores local pads and splitscreen");
+        ImGui::Separator();
+        ImGui::TextWrapped("Only buttons cross the wire. Each side renders its own player "
+                           "full-screen.");
+        return;
+    }
+
+    static int  s_delay = 2;
+    static bool s_jump = true;
+    ImGui::Checkbox("Go to character select once connected", &s_jump);
+    ImGui::TextDisabled("Both sides jump together; the menus are hidden while it happens.");
+    ImGui::Separator();
+    ImGui::InputText("Peer address", s_peer, sizeof s_peer);
+    ImGui::InputInt("Port", &s_port);
+    ImGui::SliderInt("Input delay (frames)", &s_delay, 1, 10);
+    ImGui::TextDisabled("BT3 runs at 30 fps, so each frame is 33 ms. Use 1 on the same machine,");
+    ImGui::TextDisabled("2 on a LAN. Raise it only if you see stalls.");
+    if (s_port < 1 || s_port > 65535) s_port = 7777;
+
+    if (ImGui::Button("Host (you are Player 1)"))
+    {
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);
+        ps2NetHost(s_port, 1);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Join (you are Player 2)"))
+    {
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);
+        char hp[96]; std::snprintf(hp, sizeof hp, "%s:%d", s_peer, s_port);
+        ps2NetJoin(hp, 2);
+    }
+    ImGui::Separator();
+    ImGui::TextWrapped("Host waits for the other machine. Once connected, the host walks both "
+                       "sides to character select automatically if PS2X_NET_AUTOSTART points at "
+                       "a recorded menu sequence.");
 }
 
 void PS2SettingsOverlay::drawLoggingTab()
