@@ -222,7 +222,7 @@ std::unordered_map<uint32_t, uint32_t> g_realFbpMap;
 // thread while the guest thread reads.
 #include <atomic>
 namespace {
-    std::atomic<int> g_uiGpu{-1}, g_uiGlow{-1}, g_uiPostfx{-1}, g_uiGlowFix{-1}, g_uiBilinear{-1},
+    std::atomic<int> g_uiGpu{-1}, g_uiGlow{-1}, g_uiGlowFix{-1}, g_uiBilinear{-1},
                      g_uiHalfTexel{-1}, g_uiSkipPost{-1}, g_uiSkipStaleVram{-1};
     std::atomic<int> g_uiRenderScale{-1};
     std::atomic<int> g_uiTexPack{-1};   // [texreplace]
@@ -240,10 +240,8 @@ namespace {
 }
 bool GsGpuRenderer::glowEnabled()          { return uiFlag(g_uiGlow, "PS2X_GLOW", false); }
 void GsGpuRenderer::setGlow(bool v)        { g_uiGlow.store(v ? 1 : 0); }
-bool GsGpuRenderer::postfxEnabled()        { return uiFlag(g_uiPostfx, "PS2X_POSTFX", false); }
 bool GsGpuRenderer::glowFixEnabled()       { return uiFlag(g_uiGlowFix, "PS2X_GLOWFIX", true); }
 void GsGpuRenderer::setGlowFix(bool v)     { g_uiGlowFix.store(v ? 1 : 0); }
-void GsGpuRenderer::setPostfx(bool v)      { g_uiPostfx.store(v ? 1 : 0); }
 bool GsGpuRenderer::bilinearEnabled()      { return uiFlag(g_uiBilinear, "PS2X_BILINEAR", true); }
 void GsGpuRenderer::setBilinear(bool v)    { g_uiBilinear.store(v ? 1 : 0); }
 bool GsGpuRenderer::halfTexelEnabled()     { return uiFlag(g_uiHalfTexel, "PS2X_HALFTEXEL", true); }
@@ -15219,12 +15217,10 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static const bool s_no52 = [](){ const char *v = std::getenv("PS2X_NO52"); return v && v[0] && v[0] != '0'; }();
             if (s_no52 && c.abe && c.blendMode == 0x52)
                 { PS2X_GATE_HIT(); continue; }
-            // PS2X_POSTFX (default OFF): fullscreen FBO->scene composites (the glow/heat-haze
-            // overlay chain). Until the bloom intermediate passes are numerically right, these
-            // paint the (black/degenerate) bloom result over the whole fight. Skip any LARGE
-            // fromFbo draw so the scene stays visible; small composites (portraits etc.) pass.
-            const bool s_postfx = GsGpuRenderer::postfxEnabled();   // [uitoggles]
-            if (!s_postfx)
+            // [postfx-removed] The PS2X_POSTFX toggle (default OFF) used to gate this
+            // block: with the flag off these fullscreen FBO->scene composite draws were
+            // always skipped. Post-FX was removed for release, so the gates are now
+            // unconditional -- identical to the validated default behaviour.
             {
                 // The glow/feedback composite paints the scene buffers in NARROW COLUMN STRIPS
                 // (16px each) — a coverage threshold never catches it. Gate ALL RT-sourced draws

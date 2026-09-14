@@ -1,6 +1,7 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
@@ -31,6 +32,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/CD.h"   // [fmvoverride] ps2_stubs::overrideCdFile
 #include "ps2_host_backend.h"
 #include "ps2_settings_overlay.h"
 #include "raylib.h" // window icon (deploy assets/icon.png)
@@ -1266,9 +1268,20 @@ bool PS2Runtime::initialize(const char *title)
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
             // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
             // from the moment it opens and the "[texreplace] indexed N" line appears at boot.
-            // (The textures/ folder itself ships in the repo and is staged next to the binary by
-            // CMake; the create-if-absent inside buildIndex is only a fallback for a foreign CWD.)
+            // (The pack lives in <exeDir>/data/Textures -- the deploy's data/ dir next to the
+            // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
+        }
+        {   // [fmvoverride] If the opening-video override is active (env, or Texture Replacement on
+            // with the pack installed), serve the pack's opening PSS/ADX in place of the game's.
+            // Per-file: a missing pack asset keeps the original file.
+            if (ps2x_fmv::enabled())
+            {
+                const std::string pss = ps2x_fmv::packAsset("ZS3USOP.PSS");
+                if (!pss.empty()) ps2_stubs::overrideCdFile("\\DATA\\ZS3USOP.PSS;1", pss);
+                const std::string adx = ps2x_fmv::packAsset("ZS3USOP.ADX");
+                if (!adx.empty()) ps2_stubs::overrideCdFile("\\DATA\\ZS3USOP.ADX;1", adx);
+            }
         }
         // [barblock] manual pacing: the present thread must service guest barriers every few
         // hundred microseconds, which it cannot do while asleep inside EndDrawing's frame cap.
@@ -4288,6 +4301,36 @@ void PS2Runtime::run()
                     g_bt3StateLive.store(st, std::memory_order_relaxed);
                 }
             }
+            {   // [movprobe] PS2X_MOVIEPROBE=1: log the movie state block (0x00301048) and
+                // g_ps2FmvActive on every change, every heartbeat (bit3 = finished/skipped).
+                static const bool s_mp = [](){ const char *v = std::getenv("PS2X_MOVIEPROBE"); return v && v[0] && v[0] != '0'; }();
+                if (s_mp)
+                {
+                    extern std::atomic<uint32_t> g_ps2FmvActive;   // defined in ps2_gs_gpu.cpp
+                    extern std::atomic<uint32_t> g_ps2MovieActive; // [movsync]
+                    const uint32_t fmv = g_ps2FmvActive.load(std::memory_order_relaxed) != 0u ? 1u : 0u;
+                    const uint32_t mov = g_ps2MovieActive.load(std::memory_order_relaxed) != 0u ? 1u : 0u;
+                    if (const uint8_t *rd = m_memory.getRDRAM())
+                    {
+                        uint32_t st = 0u, lvl = 0u;
+                        std::memcpy(&st, rd + (0x301048u & PS2_RAM_MASK), 4);
+                        std::memcpy(&lvl, rd + (0x301050u & PS2_RAM_MASK), 4);
+                        static uint32_t s_st = 0xffffffffu, s_lvl = 0xffffffffu, s_fmv = 2u, s_mov = 2u;
+                        if (st != s_st || lvl != s_lvl || fmv != s_fmv || mov != s_mov)
+                        {
+                            s_st = st; s_lvl = lvl; s_fmv = fmv; s_mov = mov;
+                            std::cerr << "[movprobe] @301048=0x" << std::hex << st
+                                      << " [b0=" << (st & 1u) << " b2=" << ((st >> 2) & 1u)
+                                      << " b3=" << ((st >> 3) & 1u) << "]"
+                                      << std::dec << " level=" << lvl << " fmvActive=" << fmv
+                                      << " movieActive=" << mov
+                                      << " vsync=" << ps2_syscalls::GetCurrentVSyncTick()
+                                      << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                                      << std::dec << std::endl;
+                        }
+                    }
+                }
+            }
             if ((s_hbTick % 600u) == 0u)
             {
                 // BT3 overlay game-state: FUN_00336a90 switches on *(*(0x2ff10c)+0x18).
@@ -4953,10 +4996,52 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
+        // [fmvoverride] Replace the opening movie's presentation with the injected 4K video at
+        // native resolution. Drawn with raylib's default alpha blend; aspect = the source's (4:3)
+        // or full-window when widescreen is active. The GS present blit is skipped while showing it.
+        bool fmvDrew = false;
+        {
+            extern std::atomic<uint32_t> g_ps2MovieActive;   // [movsync]
+            ps2x_fmv::FmvOverrideFrame of{};
+            if (ps2x_fmv::tick(g_ps2MovieActive.load(std::memory_order_relaxed) != 0u, of))
+            {
+                static Texture2D s_fmvTex{};
+                static int s_tw = 0, s_th = 0;
+                static uint64_t s_gen = ~0ull;
+                if (of.w != s_tw || of.h != s_th)
+                {
+                    if (s_fmvTex.id != 0) UnloadTexture(s_fmvTex);
+                    Image im{};
+                    im.data = const_cast<uint8_t *>(of.rgba);
+                    im.width = of.w; im.height = of.h; im.mipmaps = 1;
+                    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    s_fmvTex = LoadTextureFromImage(im);
+                    SetTextureFilter(s_fmvTex, TEXTURE_FILTER_BILINEAR);
+                    s_tw = of.w; s_th = of.h; s_gen = ~0ull;
+                }
+                if (of.gen != s_gen) { UpdateTexture(s_fmvTex, of.rgba); s_gen = of.gen; }
+                float dw = 0.0f, dh = 0.0f;
+                if (PS2SettingsOverlay::isWidescreen() || wsTrigActive())
+                {
+                    dw = screenWidth; dh = screenHeight;
+                }
+                else
+                {
+                    const float s = std::min(screenWidth / (float)of.w, screenHeight / (float)of.h);
+                    dw = (float)of.w * s; dh = (float)of.h * s;
+                }
+                const Rectangle fsrc{0.0f, 0.0f, (float)of.w, (float)of.h};
+                const Rectangle fdst{(screenWidth - dw) * 0.5f, (screenHeight - dh) * 0.5f, dw, dh};
+                const Color ftint{255, 255, 255, (unsigned char)(of.alpha * 255.0f + 0.5f)};
+                DrawTexturePro(s_fmvTex, fsrc, fdst, Vector2{0.0f, 0.0f}, 0.0f, ftint);
+                fmvDrew = true;
+            }
+        }
         // Blend-free present: the GPU FBO's alpha channel now carries GS dest-alpha (the
         // game's per-pixel masks, legitimately 0 over most of the frame) — alpha-blending
         // the final blit would punch the frame transparent to the clear color.
         const auto _tBlit = std::chrono::steady_clock::now();
+        if (!fmvDrew) {
         rlSetBlendFactorsSeparate(0x0001 /*GL_ONE*/, 0x0000 /*GL_ZERO*/, 0x0001, 0x0000, 0x8006 /*GL_FUNC_ADD*/, 0x8006);
         BeginBlendMode(BLEND_CUSTOM_SEPARATE);
         // [rscale] present the scaled scene with LINEAR sampling: at render scale N the
@@ -4982,6 +5067,7 @@ void PS2Runtime::run()
         if (s_pEdge) SetTextureWrap(presentTex, TEXTURE_WRAP_CLAMP);
         DrawTexturePro(presentTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         EndBlendMode();
+        }
         { extern double g_fpBlit; g_fpBlit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tBlit).count(); }
         {   // [presentlog] PS2X_PRESENTLOG=1: print every CHANGE of the present geometry (a 60 Hz alternation shows as a
             // stream of transitions; a static picture shows two lines total).

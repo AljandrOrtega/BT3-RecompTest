@@ -28,18 +28,17 @@ public:
 #endif
         int renderer = kRendererDefault;
         bool glow = true;
-        bool postfx = false;
         bool glowFix = true;   // [glowfix] BT3's bloom/glow chain (Kaioken aura); applies on restart
         bool bilinear = true;
         bool halfTexel = true;
         bool skipPost = true;
         bool skipStaleVram = true;
-        int renderScale = 1; // internal resolution multiplier: 1/2/3/4 (see GsGpuRenderer::renderScale)
+        int renderScale = 1; // built-in internal resolution multiplier derived from the window size: 720p=1x, 1080p=2x, 1440p+=3x
         float deadzone = 0.15f;
         bool fullscreen = false;  // [defaults-sync] do not force fullscreen on first launch (rig + user surprise); one toggle away in the overlay
         bool widescreen = false;
         bool outline = true;
-        bool texPack = true;   // [texreplace] use the PCSX2 replacement pack when one is indexed
+        bool texPack = false;   // [texreplace] use the PCSX2 replacement pack when one is indexed (default OFF)
         bool fps60 = false;   // [fps60] 60 fps mode: fight step 1 + the pacing table (applies between fights)
         int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
@@ -158,6 +157,7 @@ private:
     void drawVideoTab();
     void drawControllersTab();
     void drawLoggingTab();
+    void drawAboutTab();
     void drawGamepadTestArea(const std::array<uint8_t, 32> &btnDown,
                              const std::array<float, 6> &axis);
     void drawBindingsTable();

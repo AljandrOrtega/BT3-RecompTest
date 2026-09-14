@@ -9,8 +9,8 @@ BT3-Recomp-x86_64.tar.gz          # Linux release payload
 BT3-Recomp-x86_64.sha256
 ```
 
-or the equivalent Windows/macOS ZIP. There is no SELFX stub any more and no
-install step is required: unzip the archive, run the launcher.
+or the equivalent Windows/macOS ZIP. There is no SELFX stub any more: unzip the
+archive and run the launcher, which installs the game from your ISO on first run.
 
 ## Deploy tree
 
@@ -22,15 +22,17 @@ Dragon Ball Budokai Tenkaichi 3 Recompiled/
 ├── bt3-runner              # the recompiled game (Windows → bt3-runner.exe)
 ├── install game.sh         # Linux helper: menu entry + desktop icon
 ├── lib/                    # runner's shared-library closure (Linux)
-├── data/
-│   ├── SLUS_216.78         # boot ELF (also the CD image's name)
-│   ├── BIN/  DATA/  IRX/  SYSTEM.CNF   # game data, extracted from the ISO
+├── assets/                 # launcher artwork, fonts (background.png, icon.png, …)
 ├── savedata/
 │   ├── bt3_settings.ini    # user settings ([logging], [video], …)
 │   └── pad_p1.conf / pad_p2.conf       # launcher bindings
-├── assets/                 # launcher artwork, fonts (background.png, icon.png, …)
 └── savedata_slot1/         # BASLUS-21678DBZT3 memory-card slot, kept across runs
 ```
+
+The game data is **not** part of the distribution. On first launch the launcher's
+install wizard extracts `SLUS_216.78` plus `BIN/ DATA/ IRX/ SYSTEM.CNF` from the
+user's own ISO into `<install>/data/`. (Build-time only, `BIN/DBZP.BIN` — the
+game's overlay code — is recompiled into the runner and never shipped.)
 
 The bundle name is `Dragon Ball Budokai Tenkaichi 3 Recompiled` — matching the
 window/taskbar-visible identity and the `.desktop` entry installed on Linux.
@@ -69,7 +71,7 @@ forwards with `sha256sum -c`.
 Inside the unpacked folder, `install game.sh` (copy made from
 `tools/release/install-game.sh.in`) does three things:
 
-1. copies the whole game tree to `~/.local/share/bt3-recomp/`,
+1. copies the launcher, runner, bundled libs and assets to `~/.local/share/bt3-recomp/`,
 2. writes a `~/.local/share/bt3-launcher.sh` wrapper,
 3. installs `~/.local/share/applications/Dragon-Ball-Budokai-Tenkaichi-3.desktop`
    plus `~/.local/share/icons/bt3.png`, so the game shows in the applications
@@ -126,9 +128,9 @@ validation are separate release steps, not performed by this script.
 At first launch, select the USA ISO in the install wizard. Mutable files live in
 `~/Library/Application Support/BT3-Recomp/`:
 
-- `data/`: verified ELF and files extracted from the disc.
+- `data/`: verified ELF and files extracted from the disc (texture packs live in `data/Textures/`).
 - `savedata/`: memory cards, settings and per-player bindings.
-- `textures/`, `mods/`, `logs/`: replacements, mods and diagnostics.
+- `mods/`, `logs/`: mods and diagnostics.
 
 The launcher keeps reading fonts and other bundled assets from Resources. Gamepad
 capture/testing in the launcher is unavailable outside Linux; use the in-game

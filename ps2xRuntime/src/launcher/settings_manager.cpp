@@ -120,7 +120,6 @@ bool SettingsManager::load()
             else if (key == "gpu_renderer" && !m_sawRenderer) setGpuRenderer(b);
             else if (key == "glow") m_glow = b;
             else if (key == "glowfix") m_glowFix = b;
-            else if (key == "postfx") m_postfx = b;
             else if (key == "bilinear") m_bilinear = b;
             else if (key == "halftexel") m_halfTexel = b;
             else if (key == "skippost") m_skipPost = b;
@@ -135,6 +134,7 @@ bool SettingsManager::load()
             else if (key == "window_w") m_windowW = stoi(val, 0);
             else if (key == "window_h") m_windowH = stoi(val, 0);
             else if (key == "force_bilinear") m_forceBilinear = b;
+            else if (key == "texture_pack") m_texPack = b;   // [texreplace]
             else if (key == "hud_layout") m_hudLayout = stoi(val, 0);
             else if (key == "hud_off_l") m_hudOffL = stoi(val, 0);
             else if (key == "hud_off_c") m_hudOffC = stoi(val, 0);
@@ -190,7 +190,6 @@ bool SettingsManager::save()
     upsert("video", "glow", m_glow ? "1" : "0");
     upsert("video", "glowfix", m_glowFix ? "1" : "0");
     upsert("video", "ink_strength", QString::number(m_inkStrength));
-    upsert("video", "postfx", m_postfx ? "1" : "0");
     upsert("video", "bilinear", m_bilinear ? "1" : "0");
     upsert("video", "halftexel", m_halfTexel ? "1" : "0");
     upsert("video", "skippost", m_skipPost ? "1" : "0");
@@ -205,6 +204,7 @@ bool SettingsManager::save()
     upsert("video", "window_w", QString::number(m_windowW));
     upsert("video", "window_h", QString::number(m_windowH));
     upsert("video", "force_bilinear", m_forceBilinear ? "1" : "0");
+    upsert("video", "texture_pack", m_texPack ? "1" : "0");   // [texreplace]
     upsert("video", "hud_layout", QString::number(m_hudLayout));
     upsert("video", "hud_off_l", QString::number(m_hudOffL));
     upsert("video", "hud_off_c", QString::number(m_hudOffC));

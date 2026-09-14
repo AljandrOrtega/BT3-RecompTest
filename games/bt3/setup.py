@@ -5,11 +5,11 @@
 
 Cross-platform (Linux primary; Windows and macOS experimental). The game's code is generated
 locally from YOUR copy of the game — this repository ships no game code or assets.
-Steps: extract/verify the game files, build the recompiler, generate the runner
+Steps: extract/verify the build inputs, build the recompiler, generate the runner
 sources, generate the overlay module, apply patches, build the runner.
 
-  --deploy OUT   after a successful build, copy the playable tree (game data,
-                 settings, assets, fonts, and the runner) into OUT. On Windows the
+  --deploy OUT   after a successful build, copy the portable tree (settings,
+                 assets, fonts, and the runner) into OUT. On Windows the
                  runtime DLLs are copied too. The Linux self-extracting launcher is
                  created by build_and_deploy.sh, which calls this script with
                  --deploy so the built runner ends up in place.
@@ -197,28 +197,18 @@ def copytree_overlay(src: Path, dst: Path) -> None:
 
 
 def deploy_tree(runner: Path, out: Path) -> None:
-    """Assemble the portable playable tree in OUT.
+    """Assemble the portable tree in OUT.
 
-    layout: OUT/data/ (game data extracted from the ISO), OUT/savedata/
-    (bt3_settings.ini; existing user saves are preserved), OUT/assets/ (fonts).
+    layout: OUT/savedata/ (bt3_settings.ini; existing user saves are preserved),
+    OUT/assets/ (fonts). No game data is deployed: the launcher's install wizard
+    extracts SLUS_216.78 + BIN/ DATA/ IRX/ SYSTEM.CNF from the user's own ISO
+    into OUT/data on first run.
 
     Windows additionally copies the runtime DLLs next to the runner. The Linux
     build_and_deploy.sh replaces `runner` with the self-extracting payload ELF.
     """
     print(f"== assembling deploy tree in {out}")
-    work = HERE / "work"
     out.mkdir(parents=True, exist_ok=True)
-
-    # game data: BIN/ DATA/ IRX/ SYSTEM.CNF + the boot ELF
-    data_dst = out / "data"
-    for name in ("BIN", "DATA", "IRX", "SYSTEM.CNF"):
-        src = work / name
-        if src.exists():
-            copytree_overlay(src, data_dst / name)
-    boot = data_dst / "SLUS_216.78"
-    if work.joinpath("SLUS_216.78").exists():
-        boot.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(work / "SLUS_216.78", boot)
 
     # settings: default bt3_settings.ini only if none deployed yet (user keeps their saves)
     save_dst = out / "savedata"
@@ -280,29 +270,33 @@ def main() -> None:
         WORK.mkdir(parents=True, exist_ok=True)
         elf = WORK / "SLUS_216.78"
 
-    # 1. Obtain the game files. The runtime reads loose files (BIN/DBZP.BIN, IRX/,
-    #    DATA/) from the directory the ELF lives in, so extract the WHOLE ISO tree.
+    # 1. Obtain the BUILD inputs. Source generation needs exactly two files from
+    #    the ISO: the boot ELF (SLUS_216.78 -> recompiled, and mined for VU1
+    #    microcode) and the gameplay overlay (BIN/DBZP.BIN -> recompiled into the
+    #    runner). The rest of the disc (DATA/, IRX/, the AFS containers) is never
+    #    read while building and is not extracted.
     if not args.skip_setup and src.suffix.lower() == ".iso":
         kind, exe = find_extractor()
-        print(f"== extracting ISO contents (~4 GB) with {exe}")
+        members = ["SLUS_216.78", "BIN/DBZP.BIN"]
+        print(f"== extracting {', '.join(members)} from the ISO with {exe}")
         if kind == "tar":
-            run([exe, "-xf", src, "-C", WORK])
+            run([exe, "-xf", src, "-C", WORK, *members])
         else:
-            run([exe, "x", "-y", f"-o{WORK}", src], stdout=subprocess.DEVNULL)
+            run([exe, "x", "-y", f"-o{WORK}", src, *members], stdout=subprocess.DEVNULL)
         if not elf.is_file():
             die("SLUS_216.78 not found in ISO (is this the USA release?)")
+        if not (WORK / "BIN" / "DBZP.BIN").is_file():
+            die("BIN/DBZP.BIN not found in ISO (is this the USA release?)")
         make_writable(WORK)
     elif not args.skip_setup:
-        # An earlier ISO extraction leaves the whole tree read-only (ISO9660), so
-        # copying a bare ELF over a previous run's copy fails on the open. Make
-        # the tree writable first -- the game itself opens BIN/DBZP.BIN
-        # read-write, so this is needed for anything the user dropped in too.
+        # A bare ELF build: the caller supplies SLUS_216.78 directly. BIN/DBZP.BIN
+        # (the overlay source) still has to be present in WORK.
         if work.exists():
             make_writable(work)
         shutil.copyfile(src, elf)
         make_writable(work)
-        print("NOTE: you passed a bare ELF. The game also needs the ISO's BIN/, IRX/")
-        print(f"      and DATA/ directories next to it in {WORK}.")
+        print("NOTE: you passed a bare ELF. The build also needs the ISO's")
+        print(f"      BIN/DBZP.BIN next to it in {WORK}.")
 
     if args.skip_setup:
         print("--skip-setup: reusing existing games/bt3/work/ and generated sources")

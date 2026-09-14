@@ -13,9 +13,9 @@
 #   Launcher            Qt launcher
 #   bt3-runner      the game runner
 #   lib/                bundled shared libs (incl. lib/qt6/plugins)
-#   data/               game data (BIN/ DATA/ IRX/ SYSTEM.CNF + SLUS_216.78)
 #   assets/             sky theme + fonts
 #   savedata/BASLUS-21678DBZT3/   placeholder created by the wizard later
+# Game data is NOT shipped: the launcher installs it from the user's ISO.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -33,11 +33,9 @@ TARBALL="$OUT_DIR/BT3-Recomp-x86_64.tar.gz"
 TMP_TREE="$OUT_DIR/$TREE_NAME"
 rm -rf "$TMP_TREE"; mkdir -p "$TMP_TREE"
 cp -a "$STAGE"/Launcher "$STAGE"/bt3-runner "$TMP_TREE"/
-[[ -f "$STAGE/fps60_sites.txt" ]] && cp -a "$STAGE/fps60_sites.txt" "$TMP_TREE"/   # [fps60] rules ride with the runner
 cp -a "$STAGE"/lib "$STAGE"/assets "$TMP_TREE"/
-[[ -d "$STAGE/data" ]] && cp -a "$STAGE"/data "$TMP_TREE"/
-[[ -d "$STAGE/textures" ]] && cp -a "$STAGE"/textures "$TMP_TREE"/
 mkdir -p "$TMP_TREE/savedata/BASLUS-21678DBZT3"
+[[ -f "$STAGE/savedata/fps60_sites.txt" ]] && cp -a "$STAGE/savedata/fps60_sites.txt" "$TMP_TREE/savedata/"   # [fps60] pacing table
 
 cp "$ROOT/tools/release/install-game.sh.in" "$TMP_TREE/install game.sh"
 chmod +x "$TMP_TREE/install game.sh"

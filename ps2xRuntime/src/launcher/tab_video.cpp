@@ -2,6 +2,8 @@
 
 #include "settings_manager.h"
 
+#include "runtime/ps2_render_scale.h"
+
 #include <QCheckBox>
 #include <QComboBox>
 #include <QHBoxLayout>
@@ -91,8 +93,9 @@ namespace
     }
 
     // Window-size presets shared with the in-game overlay.
-    constexpr int kWinW[] = {1024, 1280, 1360, 1366, 1440, 1600, 1920, 2560, 3440};
-    constexpr int kWinH[] = {768, 720, 768, 768, 900, 900, 1080, 1440, 1440};
+    constexpr int kWinW[] = {1024, 1280, 1360, 1366, 1440, 1600, 1920, 2560, 3440, 3840};
+    constexpr int kWinH[] = {768, 720, 768, 768, 900, 900, 1080, 1440, 1440, 2160};
+    constexpr int kWinCount = 10;
 } // namespace
 
 VideoTab::VideoTab(QWidget *parent)
@@ -133,18 +136,8 @@ VideoTab::VideoTab(QWidget *parent)
     root->addWidget(m_dofRow);
     m_dofRow->setVisible(s.dofBlur());
     root->addWidget(hintRow(QStringLiteral("Lower = blur reaches nearer to the camera. 200k matches the console look.")));
-    root->addWidget(toggleRow(QStringLiteral("Post-FX"), &m_postfx, s.postfx()));
     root->addWidget(toggleRow(QStringLiteral("Glow (Kaioken aura)"), &m_glow, s.glow(),
                               QStringLiteral("Character/attack bloom. Applies on restart.")));
-
-    // QUALITY
-    root->addWidget(sectionLabel(QStringLiteral("QUALITY")));
-    QStringList resItems;
-    for (int i = 1; i <= 4; ++i)
-        resItems << (i == 1 ? QStringLiteral("Native (1x)") : QString::number(i) + QStringLiteral("x"));
-    root->addWidget(comboRow(QStringLiteral("Internal Resolution"), &m_res, resItems,
-                             s.renderScale() - 1));
-    root->addWidget(hintRow(QStringLiteral("Applies on restart.")));
 
     // FILTERING
     root->addWidget(sectionLabel(QStringLiteral("FILTERING")));
@@ -178,14 +171,20 @@ VideoTab::VideoTab(QWidget *parent)
     root->addWidget(m_hudCustom);
     m_hudCustom->setVisible(s.widescreen() && s.hudLayout() == 2);
 
+    // The internal render scale is built-in: it follows the chosen window size
+    // (720p=1x, 1080p=2x, 1440p+=3x). Re-derive here so a stale INI value from the
+    // old 1x/2x/3x/4x dropdowns cannot outlive its resolution.
+    if (s.windowH() > 0)
+        s.setRenderScale(ps2xRenderScaleForHeight(s.windowH()));
+
     QStringList winItems = {
         QStringLiteral("1024 x 768 (4:3)"), QStringLiteral("1280 x 720"),
         QStringLiteral("1360 x 768"), QStringLiteral("1366 x 768"),
         QStringLiteral("1440 x 900"), QStringLiteral("1600 x 900"),
         QStringLiteral("1920 x 1080"), QStringLiteral("2560 x 1440"),
-        QStringLiteral("3440 x 1440 (ultrawide)")};
+        QStringLiteral("3440 x 1440 (ultrawide)"), QStringLiteral("3840 x 2160 (4K)")};
     int curWin = -1;
-    for (int i = 0; i < 9; ++i)
+    for (int i = 0; i < kWinCount; ++i)
         if (kWinW[i] == s.windowW() && kWinH[i] == s.windowH())
         {
             curWin = i;
@@ -228,11 +227,7 @@ VideoTab::VideoTab(QWidget *parent)
         m_dofVal->setText(QString::number(v) + QStringLiteral(" k"));
         SettingsManager::instance().setDofZFar(v * 1000);
     });
-    connect(m_postfx, &QCheckBox::toggled, this, [](bool v) { SettingsManager::instance().setPostfx(v); });
     connect(m_glow, &QCheckBox::toggled, this, [](bool v) { SettingsManager::instance().setGlow(v); });
-    connect(m_res, &QComboBox::currentIndexChanged, this, [](int i) {
-        SettingsManager::instance().setRenderScale(i + 1);
-    });
     connect(m_bilinear, &QCheckBox::toggled, this, [](bool v) { SettingsManager::instance().setBilinear(v); });
     connect(m_forceBilinear, &QCheckBox::toggled, this, [](bool v) { SettingsManager::instance().setForceBilinear(v); });
     connect(m_fullscreen, &QCheckBox::toggled, this, [](bool v) { SettingsManager::instance().setFullscreen(v); });
@@ -254,7 +249,9 @@ VideoTab::VideoTab(QWidget *parent)
             SettingsManager::instance().hudOffL(), SettingsManager::instance().hudOffC(), v);
     });
     connect(m_winSize, &QComboBox::currentIndexChanged, this, [](int i) {
-        SettingsManager::instance().setWindowSize(kWinW[i], kWinH[i]);
+        SettingsManager &s = SettingsManager::instance();
+        s.setWindowSize(kWinW[i], kWinH[i]);
+        s.setRenderScale(ps2xRenderScaleForHeight(kWinH[i]));
     });
 }
 

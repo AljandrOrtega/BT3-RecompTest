@@ -33,9 +33,7 @@ private:
     QWidget *m_dofRow = nullptr;
     QSlider *m_dofReach = nullptr;
     QLabel *m_dofVal = nullptr;
-    QCheckBox *m_postfx = nullptr;
     QCheckBox *m_glow = nullptr;
-    QComboBox *m_res = nullptr;
     QCheckBox *m_bilinear = nullptr;
     QCheckBox *m_forceBilinear = nullptr;
     QCheckBox *m_fullscreen = nullptr;

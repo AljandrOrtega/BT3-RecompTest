@@ -12,14 +12,9 @@ echo "== installing to $DEST"
 mkdir -p "$DEST"
 
 cp -a "$SRC"/Launcher "$SRC"/bt3-runner "$SRC"/lib "$SRC"/assets "$DEST"/
-[[ -f "$SRC/fps60_sites.txt" ]] && cp -a "$SRC/fps60_sites.txt" "$DEST"/   # [fps60] rules ride with the runner
 
-# already-extracted game data (when present in the portable)
-for extra in data textures; do
-    if [[ -d "$SRC/$extra" ]]; then
-        cp -a "$SRC/$extra" "$DEST/"
-    fi
-done
+# no game data here: the launcher's install wizard extracts it from the user's
+# own ISO into $DEST/data on first run. Existing $DEST/data is left untouched.
 
 # savedata: keep an existing install's saves/settings
 if [[ -d "$SRC/savedata" ]]; then
@@ -28,6 +23,12 @@ if [[ -d "$SRC/savedata" ]]; then
     else
         echo "  keeping existing $DEST/savedata"
     fi
+fi
+# [fps60] the pacing table lives in the save folder and is not user data: refresh
+# it even on reinstall, when an existing savedata/ is otherwise kept.
+if [[ -f "$SRC/savedata/fps60_sites.txt" ]]; then
+    mkdir -p "$DEST/savedata"
+    cp -a "$SRC/savedata/fps60_sites.txt" "$DEST/savedata/"
 fi
 
 # launcher wrapper

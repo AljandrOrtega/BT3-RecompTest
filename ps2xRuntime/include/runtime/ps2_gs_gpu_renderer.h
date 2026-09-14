@@ -31,7 +31,6 @@ public:
     // defaults and overrides keep working; setters flip them at runtime.
     static void setEnabled(bool v);
     static bool glowEnabled();      static void setGlow(bool v);
-    static bool postfxEnabled();    static void setPostfx(bool v);
     static bool glowFixEnabled();   static void setGlowFix(bool v);
     // [inkstrength] cel-outline darkener strength, in percent of Cs (100 = the old
     // half-strength line, 199 = the hardware-exact 255/128 -- see PS2X_ADGS).

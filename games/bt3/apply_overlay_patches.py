@@ -39,11 +39,11 @@ PATCHES = [
         # $t0. $t0 is hardcoded to 4 at 0x335568, which hides the "Network Battle" plate
         # (a ghost menu with no backend — modding-docs/lessons.md, Lecciones 13-14).
         #
-        # This is ON by default (user chose to test it live): $t0 becomes unreachable
-        # (0xFF) so the beql at label_335578 never matches -> no entry is skipped -> the
-        # "Network Battle" ghost plate renders. Equivalent to the verified PCSX2 cheat
-        # `00335568 000000FF`. Can be turned off per-run with
-        # PS2X_REVEAL_HIDDEN_MENU_ENTRY=0 (or n/N).
+        # Default OFF: the entry stays hidden (stock behaviour). Set
+        # PS2X_REVEAL_HIDDEN_MENU_ENTRY=1 to reveal it: $t0 becomes unreachable (0xFF) so
+        # the beql at label_335578 never matches -> no entry is skipped -> the "Network
+        # Battle" ghost plate renders. Equivalent to the verified PCSX2 cheat
+        # `00335568 000000FF`.
         "file": "overlay_functions.cpp",
         "marker": "[bt3 patch: reveal-hidden-entry]",
         "anchor": (
@@ -54,15 +54,15 @@ PATCHES = [
         "replacement": (
 "    // 0x335568: 0x24080004  addiu       $t0, $zero, 0x4\n"
             "    // [bt3 patch: reveal-hidden-entry] Original skip-index=4 hides the \"Network Battle\"\n"
-            "    // main-menu entry (loop below skips $s1==$t0). Default ON per user request:\n"
-            "    // $t0 becomes unreachable (0xFF), so the beql at label_335578 never matches and\n"
-            "    // the ghost \"Network Battle\" plate renders (equiv. to the verified PCSX2 cheat\n"
-            "    // 00335568 000000FF, just at the source level, reversible with the env var below).\n"
+            "    // main-menu entry (loop below skips $s1==$t0). Default OFF: the entry stays hidden\n"
+            "    // (stock). Set PS2X_REVEAL_HIDDEN_MENU_ENTRY=1 to reveal it: $t0 becomes\n"
+            "    // unreachable (0xFF), so the beql at label_335578 never matches and the ghost\n"
+            "    // \"Network Battle\" plate renders (equiv. to the PCSX2 cheat 00335568 000000FF).\n"
             "    ctx->pc = 0x335568u;\n"
             "    {\n"
             "        static const bool s_revealHidden = [](){\n"
             '            const char *v = std::getenv("PS2X_REVEAL_HIDDEN_MENU_ENTRY");\n'
-            "            return !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'));\n"
+            "            return v && !(v[0] == '0' || v[0] == 'n' || v[0] == 'N');\n"
             "        }();\n"
             "        static bool s_loggedOnce = false;\n"
             "        if (s_revealHidden && !s_loggedOnce) {\n"

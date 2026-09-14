@@ -141,23 +141,21 @@ namespace
     {
         namespace fs = std::filesystem;
         std::error_code ec;
-        // Default to ./textures, CREATED IF ABSENT so it is discoverable without documentation --
-        // a user should be able to see the folder, drop a pack in and flip the switch. Settings
-        // (bt3_settings.ini) already resolve CWD-relative, so this sits beside them.
-        // PS2X_TEXREPLACE overrides for anyone keeping packs elsewhere.
+        // [texloc] The pack lives where the game data was installed: <exeDir>/data/Textures
+        // (the deploy's data/ dir, next to the extracted ISO tree). Created if absent so it is
+        // discoverable without documentation. PS2X_TEXREPLACE overrides for packs kept elsewhere.
+        // NOTE: this runs at startup BEFORE loadELF, so anchor on the executable dir (ps2xExeDirC
+        // honors PS2X_EXEDIR, i.e. the deploy root), not on the boot ELF's directory.
         const char *env = std::getenv("PS2X_TEXREPLACE");
-        std::string root = (env && env[0]) ? std::string(env) : std::string("textures");
-        {   // [mergefix] the launcher/deploy runs with a CWD that has no textures/: fall back to the exe's folder so the
-            // Texture Replacement switch is not greyed out for a deploy install
-            std::error_code ec0;
-            if (!(env && env[0]) && !fs::is_directory(root, ec0))
-            {
-                const char *xd = ps2xExeDirC();
-                if (xd && xd[0]) { const std::string alt = (fs::path(xd) / "textures").string(); if (fs::is_directory(alt, ec0)) root = alt; }
-            }
-        }
-        if (!(env && env[0]))
+        std::string root;
+        if (env && env[0])
         {
+            root = env;
+        }
+        else
+        {
+            const char *xd = ps2xExeDirC();
+            root = ((xd && xd[0]) ? fs::path(xd) : fs::path(".")) / "data" / "Textures";
             fs::create_directories(root, ec);   // harmless if it already exists
             ec.clear();
         }
@@ -187,7 +185,7 @@ namespace
         if (n)
             std::fprintf(stderr, "[texreplace] indexed %zu replacements from %s (%zu unparsed)\n", n, dir, skipped);
         else
-            std::fprintf(stderr, "[texreplace] no replacements in ./%s -- drop a PCSX2 texture pack "
+            std::fprintf(stderr, "[texreplace] no replacements in %s -- drop a PCSX2 texture pack "
                                  "in there (any nesting; the folder is searched recursively) and "
                                  "enable Texture Replacement in the overlay\n", dir);
     }

@@ -11,7 +11,7 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("bt3-launcher"));
 
-    for (const char *dir : {"data", "savedata", "logs", "textures", "mods"})
+    for (const char *dir : {"data", "savedata", "logs", "data/Textures", "mods"})
         QDir().mkpath(apppaths::userRoot() + "/" + QString::fromLatin1(dir));
 
     QApplication::setStyle(QStringLiteral("Fusion"));

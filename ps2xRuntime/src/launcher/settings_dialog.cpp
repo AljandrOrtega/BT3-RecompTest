@@ -2,6 +2,7 @@
 
 #include "dbz_theme.h"
 #include "settings_manager.h"
+#include "tab_about.h"
 #include "tab_audio.h"
 #include "tab_bindings.h"
 #include "tab_controllers.h"
@@ -65,6 +66,7 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     m_tabs->addTab(m_bindings, QStringLiteral("Bindings"));
     m_tabs->addTab(new LoggingTab, QStringLiteral("Logging"));
     m_tabs->addTab(new MiscTab, QStringLiteral("Misc"));
+    m_tabs->addTab(new AboutTab, QStringLiteral("About"));
     // Video/Controllers/Logging live-write into SettingsManager; load() the
     // INI once via the singleton constructor call pattern (see main.cpp).
     layout->addWidget(m_tabs, 1);

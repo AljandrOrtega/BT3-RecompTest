@@ -3,6 +3,7 @@
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
+#include "runtime/ps2_render_scale.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/pad_config.h"
 #if defined(__linux__)
@@ -367,7 +368,7 @@ void PS2SettingsOverlay::initialize()
     // overlay is opened for the first time (m_deviceList is otherwise only populated
     // when the overlay opens via resetCaptureState/buildDeviceList).
     buildDeviceList();
-    // Apply all loaded settings (glow, postfx, volume, etc.) at startup.
+    // Apply all loaded settings (glow, volume, etc.) at startup.
     applySettings();
     // Snapshot the persisted settings so shutdown() only rewrites the ini when the
     // session actually changed something (keeps launcher-authored values intact).
@@ -395,7 +396,6 @@ bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
            gpuRenderer == o.gpuRenderer &&
            renderer == o.renderer &&
            glow == o.glow &&
-           postfx == o.postfx &&
            glowFix == o.glowFix &&
            bilinear == o.bilinear &&
            halfTexel == o.halfTexel &&
@@ -527,8 +527,6 @@ void PS2SettingsOverlay::loadSettings()
                     m_settings.inkWidth = std::clamp(std::atoi(val.c_str()), 25, 100);
                 else if (key == "ink_color")
                     m_settings.inkColor = static_cast<unsigned>(std::strtoul(val.c_str(), nullptr, 16)) & 0xFFFFFFu;
-                else if (key == "postfx")
-                    { if (!envUserSet("PS2X_POSTFX")) m_settings.postfx = (val == "1" || val == "true"); }
                 else if (key == "bilinear")
                     { if (!envUserSet("PS2X_BILINEAR")) m_settings.bilinear = (val == "1" || val == "true"); }
                 else if (key == "halftexel")
@@ -646,7 +644,7 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     if (renderer == 2)
     {
         setEnvDefault("PS2X_PGS", "1");
-        // [pgslive] pack mode only when a pack is actually INDEXED (PS2X_TEXREPLACE or ./textures): the Texture
+        // [pgslive] pack mode only when a pack is actually INDEXED (PS2X_TEXREPLACE or data/Textures): the Texture
         // Replacement switch is greyed out without one, and pack mode costs a second packet walk per frame (a laptop
         // 4060 log showed 17-26 ms/swap of backend CPU at 4x with the switch on and NO pack). With a pack the switch
         // still flips live in either direction. PS2X_PGS_PACK=0 in the env forces the exclusive path.
@@ -668,7 +666,7 @@ void PS2SettingsOverlay::preloadSettings()
         : (std::filesystem::path(s_configDir) / kConfigFileName).string();
     std::ifstream file(iniPath);
     int rendererPre = Settings::kRendererDefault;   // [renderer] exported below even when no ini exists yet
-    bool texPackPre = true;
+    bool texPackPre = false;
     bool forceBilinearPre = true;
     if (!file.is_open())
     {
@@ -754,7 +752,6 @@ void PS2SettingsOverlay::saveSettings() const
     file << "ink_strength=" << m_settings.inkStrength << "\n";
     file << "ink_width=" << m_settings.inkWidth << "\n";
     { char hex[16]; std::snprintf(hex, sizeof hex, "%06x", m_settings.inkColor); file << "ink_color=" << hex << "\n"; }
-    file << "postfx=" << (m_settings.postfx ? "1" : "0") << "\n";
     file << "bilinear=" << (m_settings.bilinear ? "1" : "0") << "\n";
     file << "halftexel=" << (m_settings.halfTexel ? "1" : "0") << "\n";
     file << "skippost=" << (m_settings.skipPost ? "1" : "0") << "\n";
@@ -830,7 +827,6 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.glow = GsGpuRenderer::glowEnabled();
     m_settings.glowFix = GsGpuRenderer::glowFixEnabled();
     m_settings.inkStrength = GsGpuRenderer::inkStrengthPct();
-    m_settings.postfx = GsGpuRenderer::postfxEnabled();
     m_settings.bilinear = GsGpuRenderer::bilinearEnabled();
     m_settings.halfTexel = GsGpuRenderer::halfTexelEnabled();
     m_settings.skipPost = GsGpuRenderer::skipPostEnabled();
@@ -853,7 +849,6 @@ void PS2SettingsOverlay::applySettings()
     m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
     GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
     GsGpuRenderer::setGlow(m_settings.glow);
-    GsGpuRenderer::setPostfx(m_settings.postfx);
     // [glowfix] applied at STARTUP only: two of its four parts (the fbp224/fbp336 size caps)
     // are decided when the FBO is allocated, so flipping it mid-run would leave a half-applied
     // state -- and a partial glow fix is a REGRESSION (it washes the frame out).
@@ -1108,9 +1103,8 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
         PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
         PS2AudioBackend::setSfxVolume(m_settings.sfxVolume);
         m_settings.gpuRenderer = (m_settings.renderer != Settings::kRendererSoftware);   // [renderer]
-    GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
+        GsGpuRenderer::setEnabled(m_settings.gpuRenderer);
         GsGpuRenderer::setGlow(m_settings.glow);
-        GsGpuRenderer::setPostfx(m_settings.postfx);
         m_dirty = false;
     }
 
@@ -1231,6 +1225,12 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                 {
                     m_activeTab = 3;
                     drawLoggingTab();
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("  About"))
+                {
+                    m_activeTab = 4;
+                    drawAboutTab();
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -1435,8 +1435,6 @@ void PS2SettingsOverlay::drawVideoTab()
     // (Glow / Skip Post / Half-Texel / Skip Stale VRAM toggles removed: replay A/B
     //  measured them at 0.000 frame diff in fights -- their draw classes are
     //  superseded by the current serving pipeline. Env vars still work for devs.)
-    if (toggleSwitch("Post-FX", &m_settings.postfx))
-        m_dirty = true;
     {   // [glowfix] BT3's bloom/glow chain -- the Kaioken aura and every attack glow.
         const bool was = m_settings.glowFix;
         if (toggleSwitch("Glow (Kaioken aura)", &m_settings.glowFix))
@@ -1446,27 +1444,6 @@ void PS2SettingsOverlay::drawVideoTab()
         else if (was) ImGui::TextDisabled("Character/attack bloom. Off = the pre-fix look.");
     }
 
-    // (Render Scale UI removed in this integration: the scaling machinery's per-draw
-    // cost regressed the fight loop; the setting is still persisted for a future port.)
-    // Filtering
-    sectionHeader("QUALITY");
-    {   // internal render scale: scene buffers render at N x native (1x = PS2-native)
-        static const char *kScales[] = {"Native (1x)", "2x", "3x", "4x"};
-        int rsIdx = m_settings.renderScale - 1;
-        if (rsIdx < 0) rsIdx = 0; if (rsIdx > 3) rsIdx = 3;
-        ImGui::TextUnformatted("Internal Resolution");
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-        if (ImGui::Combo("##renderscale", &rsIdx, kScales, 4))
-        {
-            m_settings.renderScale = rsIdx + 1;   // persisted to INI; OpenGL applies on next launch, paraLLEl-GS live
-            ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
-            m_dirty = true;
-        }
-        if (m_settings.renderer == 2)
-            ImGui::TextDisabled("paraLLEl-GS: 1x / 2x / 3x / 4x = 1 / 4 / 8 / 16 samples per pixel, applies live.");
-        else if (m_settings.renderScale != GsGpuRenderer::renderScale())
-            ImGui::TextDisabled("(applies on restart)");
-    }
     sectionHeader("FILTERING");
     if (toggleSwitch("Bilinear Filter", &m_settings.bilinear))
         m_dirty = true;
@@ -1485,6 +1462,11 @@ void PS2SettingsOverlay::drawVideoTab()
     if (toggleSwitch("Fullscreen", &m_settings.fullscreen))
     {
         ps2xSetFullscreen(m_settings.fullscreen, m_settings.windowW, m_settings.windowH);
+        // [builtin-res] the internal render scale follows the resolution: 720p=1x,
+        // 1080p=2x, 1440p+=3x. Derive it from the current screen in fullscreen.
+        const int h = GetScreenHeight();
+        m_settings.renderScale = ps2xRenderScaleForHeight(h);
+        if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
         m_dirty = true;
     }
     if (toggleSwitch("Widescreen (true FOV)", &m_settings.widescreen))
@@ -1522,11 +1504,12 @@ void PS2SettingsOverlay::drawVideoTab()
     {
         static const int kRes[][2] = {{1024, 768}, {1280, 720}, {1360, 768},
                                       {1366, 768}, {1440, 900}, {1600, 900},
-                                      {1920, 1080}, {2560, 1440}, {3440, 1440}};
+                                      {1920, 1080}, {2560, 1440}, {3440, 1440}, {3840, 2160}};
         static const char *kResNames[] = {"1024 x 768 (4:3)", "1280 x 720", "1360 x 768",
                                           "1366 x 768", "1440 x 900", "1600 x 900",
-                                          "1920 x 1080", "2560 x 1440", "3440 x 1440 (ultrawide)"};
-        constexpr int kResCount = 9;
+                                          "1920 x 1080", "2560 x 1440", "3440 x 1440 (ultrawide)",
+                                          "3840 x 2160 (4K)"};
+        constexpr int kResCount = 10;
         int cur = -1;
         const int w = GetScreenWidth(), h = GetScreenHeight();
         for (int i = 0; i < kResCount; ++i)
@@ -1544,6 +1527,10 @@ void PS2SettingsOverlay::drawVideoTab()
                     SetWindowSize(kRes[i][0], kRes[i][1]);
                     m_settings.windowW = kRes[i][0];
                     m_settings.windowH = kRes[i][1];
+                    // [builtin-res] the internal render scale is built into the resolution:
+                    // 720p=1x, 1080p=2x, 1440p+=3x. paraLLEl-GS replays live at the new SSAA.
+                    m_settings.renderScale = ps2xRenderScaleForHeight(kRes[i][1]);
+                    if (!envUserSet("PS2X_PGS_SSAA")) ps2x_pgs::setRenderScale(m_settings.renderScale);   // [pgslive]
                     m_dirty = true;
                 }
             }
@@ -2061,6 +2048,43 @@ void PS2SettingsOverlay::drawLoggingTab()
     ImGui::TextDisabled("The dump file is appended with a timestamp on every write.");
 }
 
+void PS2SettingsOverlay::drawAboutTab()
+{
+    ImGui::Spacing();
+
+    sectionHeader("ABOUT");
+    ImGui::TextWrapped("Dragon Ball Z: Budokai Tenkaichi 3 - Recompiled");
+    ImGui::TextWrapped(
+        "A statically recompiled, native PC port built on PS2Recomp. The game's MIPS code "
+        "is translated to C++ at build time from your own disc image; no game content is "
+        "distributed with this project.");
+    ImGui::Spacing();
+
+    sectionHeader("CREDITS");
+    ImGui::TextWrapped("z3xox - owner / lead developer");
+    ImGui::TextDisabled("  recompiler, runtime (EE/GS/VU1/scheduler), renderer, game overrides, generators");
+    ImGui::TextWrapped("RexxColder - supporter / colaborador");
+    ImGui::TextDisabled("  optimizacion (perf/async), launcher + install wizard, input & gamepads, "
+                        "build/release, deploy, game-data (AFS/AFL), docs");
+    ImGui::TextWrapped("valenvivaldi - colaborador");
+    ImGui::TextDisabled("  port macOS arm64, packaging, audio");
+    ImGui::Spacing();
+
+    sectionHeader("THIRD-PARTY");
+    if (ImGui::BeginChild("##about_third", ImVec2(-1, 0), ImGuiChildFlags_Borders))
+    {
+        ImGui::TextWrapped("ran-j/PS2Recomp - static recompiler (upstream, GPL-3.0)");
+        ImGui::TextWrapped("ViveTheModder - NTSC-U AFS file lists (Apache-2.0)");
+        ImGui::TextWrapped("Arntzen Software - paraLLEl-GS (LGPL-3.0-or-later)");
+        ImGui::Spacing();
+    }
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("GPL-3.0. Not affiliated with Spike or Bandai Namco.");
+    ImGui::TextDisabled("github.com/z3xox/BT3-Recomp");
+}
+
 void PS2SettingsOverlay::dumpSettingsToFile()
 {
     const std::string dumpPath = s_configDir.empty()
@@ -2091,7 +2115,6 @@ void PS2SettingsOverlay::dumpSettingsToFile()
         file << "[Video]\n";
         file << "  gpu_renderer = " << (m_settings.gpuRenderer ? "1" : "0") << "\n";
         file << "  glow         = " << (m_settings.glow ? "1" : "0") << "\n";
-        file << "  postfx       = " << (m_settings.postfx ? "1" : "0") << "\n";
         file << "  bilinear     = " << (m_settings.bilinear ? "1" : "0") << "\n";
         file << "  halftexel    = " << (m_settings.halfTexel ? "1" : "0") << "\n";
         file << "  skip_post    = " << (m_settings.skipPost ? "1" : "0") << "\n";
@@ -2141,7 +2164,6 @@ void PS2SettingsOverlay::dumpSettingsToFile()
         file << "[Runtime]\n";
         file << "  gpu_renderer_enabled = " << (GsGpuRenderer::enabled() ? "1" : "0") << "\n";
         file << "  glow_enabled         = " << (GsGpuRenderer::glowEnabled() ? "1" : "0") << "\n";
-        file << "  postfx_enabled       = " << (GsGpuRenderer::postfxEnabled() ? "1" : "0") << "\n";
         file << "  bilinear_enabled     = " << (GsGpuRenderer::bilinearEnabled() ? "1" : "0") << "\n";
         file << "  halftexel_enabled    = " << (GsGpuRenderer::halfTexelEnabled() ? "1" : "0") << "\n";
         file << "  skip_post_enabled    = " << (GsGpuRenderer::skipPostEnabled() ? "1" : "0") << "\n";

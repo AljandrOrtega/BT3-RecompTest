@@ -416,6 +416,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
     src/lib/ps2_texreplace.cpp   # [texreplace] PCSX2-compatible texture identity
+    src/lib/ps2_fmv_override.cpp # [fmvoverride] inject a user 4K video as the opening FMV
     src/lib/ps2_iop.cpp
     src/lib/ps2_iop_audio.cpp
     src/lib/ps2_iop_dbcman.cpp
@@ -685,16 +686,16 @@ if(NOT PS2X_IS_VITA)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()
 
-# [texreplace] Stage the repo's textures/ and mods/ next to the executable. The runtime resolves
-# them CWD-relative (as bt3_settings.ini already does) and the game runs from the build output, so
-# without this the folders would exist in the repo but not where a user would actually look.
-# copy_directory MERGES, so rebuilding never disturbs a pack someone has dropped in.
+# [texreplace] Stage the repo's textures/ (as data/Textures, where the runtime looks) and mods/
+# next to the executable. The game runs from the build output, so without this the folders would
+# exist in the repo but not where a user would actually look. copy_directory MERGES, so rebuilding
+# never disturbs a pack someone has dropped in.
 add_custom_command(TARGET ps2EntryRunner POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/../textures" "$<TARGET_FILE_DIR:ps2EntryRunner>/textures"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../textures" "$<TARGET_FILE_DIR:ps2EntryRunner>/data/Textures"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/../mods"     "$<TARGET_FILE_DIR:ps2EntryRunner>/mods"
-    COMMENT "Staging textures/ and mods/ next to ps2EntryRunner"
+    COMMENT "Staging data/Textures and mods/ next to ps2EntryRunner"
 )
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)

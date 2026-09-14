@@ -39,7 +39,6 @@ public:
     bool gpuRenderer() const { return m_renderer != kRendererSoftware; }
     bool glow() const { return m_glow; }
     bool glowFix() const { return m_glowFix; }
-    bool postfx() const { return m_postfx; }
     bool bilinear() const { return m_bilinear; }
     bool halfTexel() const { return m_halfTexel; }
     bool skipPost() const { return m_skipPost; }
@@ -55,6 +54,7 @@ public:
     int windowW() const { return m_windowW; }
     int windowH() const { return m_windowH; }
     bool forceBilinear() const { return m_forceBilinear; }
+    bool texPack() const { return m_texPack; }   // [texreplace] shared with the in-game overlay
     int hudLayout() const { return m_hudLayout; }
     int hudOffL() const { return m_hudOffL; }
     int hudOffC() const { return m_hudOffC; }
@@ -64,7 +64,6 @@ public:
     void setGpuRenderer(bool v) { m_renderer = (v != false) ? kRendererParallelGS : kRendererSoftware; }
     void setGlow(bool v) { m_glow = v; }
     void setGlowFix(bool v) { m_glowFix = v; }
-    void setPostfx(bool v) { m_postfx = v; }
     void setBilinear(bool v) { m_bilinear = v; }
     void setHalfTexel(bool v) { m_halfTexel = v; }
     void setSkipPost(bool v) { m_skipPost = v; }
@@ -79,6 +78,7 @@ public:
     void setWidescreen(bool v) { m_widescreen = v; }
     void setWindowSize(int w, int h) { m_windowW = w; m_windowH = h; }
     void setForceBilinear(bool v) { m_forceBilinear = v; }
+    void setTexPack(bool v) { m_texPack = v; }   // [texreplace]
     void setHudLayout(int v) { m_hudLayout = v; }
     void setHudOffsets(int l, int c, int r) { m_hudOffL = l; m_hudOffC = c; m_hudOffR = r; }
 
@@ -114,12 +114,13 @@ private:
     QString m_dir;
     float m_master = 1.0f, m_music = 1.0f, m_sfx = 1.0f;
     int m_renderer = kRendererParallelGS;
-    bool m_glow = true, m_glowFix = true, m_postfx = false;
+    bool m_glow = true, m_glowFix = true;
     bool m_bilinear = true, m_halfTexel = true, m_skipPost = true, m_skipStaleVram = true;
     int m_renderScale = 1;
     bool m_outline = true, m_shadows = true, m_dofBlur = true;
     int m_inkStrength = 199, m_dofZFar = 200000;
     bool m_fullscreen = false, m_widescreen = false, m_forceBilinear = true;
+    bool m_texPack = false;   // [texreplace] default OFF
     int m_windowW = 0, m_windowH = 0;
     int m_hudLayout = 0, m_hudOffL = 0, m_hudOffC = 0, m_hudOffR = 0;
     int m_device = 0;

@@ -1,7 +1,12 @@
 # Texture replacement
 
-Drop a **PCSX2 texture pack** in this folder and enable **Texture Replacement** in the in-game
-overlay (Select+Start, or LShift+Tab → Video).
+The runtime loads packs from **`data/Textures`** (the deploy's `data/` folder, next to the
+extracted ISO tree). Drop a **PCSX2 texture pack** there and enable **Texture Replacement** in the
+in-game overlay (Select+Start, or LShift+Tab → Video).
+
+This repo folder, `textures/`, is only the staging source: at build time CMake copies its
+contents into `<runner dir>/data/Textures`. To keep packs elsewhere at runtime, use
+`PS2X_TEXREPLACE=<dir>`.
 
 ## It is PCSX2-compatible on purpose
 
@@ -15,8 +20,8 @@ the palette. Verified against real PCSX2 dumps of this game — filenames come o
 
 ## Layout
 
-Anything inside this folder is found, **at any depth**. You can unpack an archive here without
-flattening it, and a pack that ships as `textures/SLUS-xxxxx/replacements/*.png` works as-is.
+Anything inside the pack folder is found, **at any depth**. You can unpack an archive there without
+flattening it, and a pack that ships as `SLUS-xxxxx/replacements/*.png` works as-is.
 PCSX2 searches its own replacements folder recursively too.
 
 Higher-resolution replacements need no special handling: the renderer samples with normalised
@@ -29,4 +34,4 @@ texture coordinates, so a 4x or 8x texture drops straight in.
   every fight, so expect some upgraded and some untouched.
 - Replacements cost VRAM: a 4x texture is 16x the memory of the original, 8x is 64x. Large packs
   on a GPU with little memory to spare are the case to watch.
-- `PS2X_TEXREPLACE=<dir>` overrides this folder if you keep packs elsewhere.
+- `PS2X_TEXREPLACE=<dir>` overrides the default `data/Textures` folder if you keep packs elsewhere.
