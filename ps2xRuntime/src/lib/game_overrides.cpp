@@ -4455,6 +4455,19 @@ namespace
     // So the seamless 0x26 -> 0x27 is simply "make it return non-zero", with the two side effects
     // the real function performs before returning (0x356234: stateObj+0x620/+0x624 = the duel
     // object's 0x110/0x114). No synthetic button presses, no walking menus.
+    // Team Battle and DP Battle do NOT use character select 0x27. The duel dispatcher picks the
+    // screen from the battle type on the way out of the versus menu (0x352da8..0x352db4):
+    //     lw $a0, 0x624($v0)      ; battle type
+    //     daddu $v1, $s5, $zero   ; $s5 = 0x28   (set at 0x352d28)
+    //     movz $v1, $s3, $a0      ; $s3 = 0x27   (set at 0x352d1c) -- taken only when type == 0
+    //     sw $v1, 0x18($v0)
+    // So Single -> 0x27, Team and DP -> 0x28 (the multi-character roster screen). Everything below
+    // used to compare against a literal 0x27, so for Team/DP the driver never recognised that it
+    // had arrived: it sat in the pulse loop for its full 20 s timeout with the display frozen, and
+    // the step-3 re-assert -- which is what holds 1P VS 2P against the screen's own entry code --
+    // returned on its first line every frame. That is why DP came up as 1P vs COM.
+    static uint32_t bt3NetTargetState() { return ps2NetBattleType() == 0 ? 0x27u : 0x28u; }
+
     std::atomic<bool> g_netJumpWantConfirm{false};
     PS2Runtime::RecompiledFunction g_orig356090 = nullptr;
     void bt3VersusMenuGate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_356090
@@ -4480,6 +4493,10 @@ namespace
             wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
             wr32(rdram, stateObj + 0x620u, rd32(rdram, duelObj + 0x110u));      // what 0x356234 does
             wr32(rdram, stateObj + 0x624u, rd32(rdram, duelObj + 0x114u));
+            // The real commit copies THREE fields, not two (0x35622c..0x35625c). We were dropping
+            // the last one. stateObj+0x630 is read by the duel module at 0x34b780 and 0x353f94,
+            // so leaving it stale is a real difference -- mirror it exactly as the game does.
+            wr32(rdram, stateObj + 0x630u, rd32(rdram, duelObj + 0x118u));
         }
         std::fprintf(stderr, "[netjump] versus-menu gate -> confirm (duelObj=0x%x)\n", duelObj);
         setReturnS32(ctx, 1);   // non-zero: the caller now performs its own 0x26 -> 0x27
@@ -4567,11 +4584,11 @@ namespace
             // character select is up, and stop as soon as the screen changes.
             const uint32_t so = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
             if (!so) return;
-            if (rd32(rdram, so + 0x18u) != 0x27u) return;      // left character select: done
+            if (rd32(rdram, so + 0x18u) != bt3NetTargetState()) return;   // left the screen: done
             if (rd32(rdram, so + 0x620u) != 1u)
             {
                 wr32(rdram, so + 0x620u, 1u);                  // 1P VS 2P
-                wr32(rdram, so + 0x624u, 0u);                  // Single Battle
+                wr32(rdram, so + 0x624u, (uint32_t)ps2NetBattleType());
                 static std::atomic<uint32_t> s_n{0};
                 if (s_n.fetch_add(1u) < 5u)
                     std::fprintf(stderr, "[netjump] re-asserted 1P VS 2P (something reset it)\n");
@@ -4585,12 +4602,12 @@ namespace
         const uint32_t cur = rd32(rdram, stateObj + 0x18u);
         if (s_step == 0)
         {
-            if (cur == 0x27u) { s_step = 3; std::fprintf(stderr, "[netjump] already at character select\n"); return; }
+            if (cur == bt3NetTargetState()) { s_step = 3; std::fprintf(stderr, "[netjump] already at character select\n"); return; }
             if (cur != 0x04u) return;                       // wait until the main menu is up
             if (s_mode >= 2)
             {   // straight to character select
-                if (!bt3MenuGoto(rdram, ctx, runtime, 0x27u)) return;
-                std::fprintf(stderr, "[netjump] 0x04 -> 0x27 direct (character select)\n");
+                if (!bt3MenuGoto(rdram, ctx, runtime, bt3NetTargetState())) return;
+                std::fprintf(stderr, "[netjump] 0x04 -> 0x%02x direct (character select)\n", bt3NetTargetState());
                 s_step = 2; s_waitUntil = now + 90u; return;
             }
             if (!bt3MenuGoto(rdram, ctx, runtime, 0x26u)) return;
@@ -4612,8 +4629,12 @@ namespace
             const uint32_t duelObj = rd32(rdram, 0x3b38e8u) & 0x1FFFFFFFu;
             if (!duelObj) return;                       // module still coming up: wait
             wr32(rdram, duelObj + 0x110u, 1u);          // 1P VS 2P
-            wr32(rdram, duelObj + 0x114u, 0u);          // Single Battle
-            std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> 0 (Single Battle)\n", duelObj);
+            // Take the battle type from the netplay session (the host stamps its choice into
+            // every packet) instead of forcing Single -- this write is what the versus menu would
+            // have made had the player navigated it, and the gate below reads it back out.
+            wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
+            std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u\n",
+                         duelObj, (unsigned)ps2NetBattleType());
             // Advance with a PLAIN WRITE, not bt3MenuGoto: that helper needs the MAIN-MENU object
             // [0x3b0e80], which is freed the moment we leave the main menu, so it returned false
             // every frame here and the sequence span forever re-writing the mode.
@@ -4628,7 +4649,7 @@ namespace
         }
         if (s_step == 2)
         {
-            if (cur != 0x27u)
+            if (cur != bt3NetTargetState())
             {
                 // PULSE the confirm: there are TWO menus to get through (versus mode, then
                 // battle type), and a held button is ONE press -- a second menu needs a release
@@ -4639,7 +4660,8 @@ namespace
                 if (!s_pulseStart) s_pulseStart = now;
                 if (now - s_pulseStart > 600u)      // ~20 s: something is wrong, stop hiding it
                 {
-                    std::fprintf(stderr, "[netjump] stuck at state 0x%02x -- giving up\n", cur);
+                    std::fprintf(stderr, "[netjump] stuck at state 0x%02x (wanted 0x%02x) -- giving up\n",
+                                 cur, bt3NetTargetState());
                     g_netJumpHold.store(0, std::memory_order_relaxed); s_step = 3; return;
                 }
                 if (cur == 0x26u && ((now - s_pulseStart) % 8u) == 0u)
@@ -4660,10 +4682,13 @@ namespace
             // merely highlighted showed no difference and sent me after the per-player "is CPU"
             // heap flags instead.
             wr32(rdram, stateObj + 0x620u, 1u);   // 1P VS 2P
-            wr32(rdram, stateObj + 0x624u, 0u);   // Single Battle
+            wr32(rdram, stateObj + 0x624u, (uint32_t)ps2NetBattleType());
             g_netJumpHold.store(0, std::memory_order_relaxed);   // character select is up: show it
-            std::fprintf(stderr, "[netjump] settled at state 0x%02x | mode=%u type=%u (1P VS 2P, Single Battle)\n",
-                         cur, rd32(rdram, stateObj + 0x620u), rd32(rdram, stateObj + 0x624u));
+            static const char *kType[] = { "Single", "Team", "DP" };
+            const unsigned bt = (unsigned)ps2NetBattleType();
+            std::fprintf(stderr, "[netjump] settled at state 0x%02x | mode=%u type=%u (1P VS 2P, %s Battle)\n",
+                         cur, rd32(rdram, stateObj + 0x620u), rd32(rdram, stateObj + 0x624u),
+                         bt < 3 ? kType[bt] : "?");
             s_step = 3;
         }
     }
