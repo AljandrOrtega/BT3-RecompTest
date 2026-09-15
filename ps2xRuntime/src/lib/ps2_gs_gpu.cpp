@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"   // [vpdrop] follow the netplay player
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
@@ -4088,8 +4089,9 @@ void GS::vertexKick(bool drawing)
     // Full-width draws are never dropped -- that is the HUD and the post-passes, which are
     // shared rather than per-viewport.
     {
-        static const int s_vpKeep = [](){ const char *v = ::getenv("PS2X_VPKEEP");
-                                          return (v && v[0]) ? std::atoi(v) : 0; }();
+        static const int s_vpEnv = [](){ const char *v = ::getenv("PS2X_VPKEEP");
+                                         return (v && v[0]) ? std::atoi(v) : 0; }();
+        const int s_vpKeep = s_vpEnv ? s_vpEnv : (ps2NetActive() ? ps2NetLocalPlayer() : 0);   // follow netplay: host = 1, joiner = 2
         if (s_vpKeep)
         {
             // Scissor X alone is NOT enough to identify a viewport: the glow/outline page
@@ -4102,7 +4104,10 @@ void GS::vertexKick(bool drawing)
             const bool sceneTarget = (gc.frame.fbw >= 8 && sc.y1 >= 400);
             const bool leftVp  = sceneTarget && (sc.x0 == 0 && sc.x1 > 0 && sc.x1 <= 255);
             const bool rightVp = sceneTarget && (sc.x0 >= 256);
-            if ((s_vpKeep == 1 && rightVp) || (s_vpKeep == 2 && leftVp))
+            // [netview] symmetric full-screen views carry a mark in the scissor's TOP row: player 1 y0 = 1, player 2 y0 = 2
+            const bool p1Full  = sceneTarget && (sc.x0 == 0 && sc.x1 == 511 && sc.y0 == 1);
+            const bool p2Full  = sceneTarget && (sc.x0 == 0 && sc.x1 == 511 && sc.y0 == 2);
+            if ((s_vpKeep == 1 && (rightVp || p2Full)) || (s_vpKeep == 2 && (leftVp || p1Full)))
                 goto slideWindow;
         }
     }

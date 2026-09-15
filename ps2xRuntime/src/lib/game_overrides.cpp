@@ -1136,7 +1136,21 @@ namespace
         s.heldBytes = queued;
 
         uint64_t playedBytes = 0u;
-        const auto prog = runtime->audioBackend().streamProgress(s.streamId);
+        const auto prog = runtime->audioBackend().streamProgress(s.streamId);   // (stepped mode: diagnostics only)
+        if (ps2xFrameStepOn())
+        {   // [rollback] Frame-stepped mode NEVER consults the device: whether the host stream has
+            // started, how much it has played and whether the ring looks full to it are real-time
+            // facts that differ between a run and its re-simulation (and between two machines). The
+            // early return below for "device not started yet" withheld the credit in one run and not
+            // the other, so the stream thread issued one SIF DMA more -- the last sound-block
+            // divergence. Credit by vblank ticks only; the device starts on its own once fed.
+            s.wallClock = false; s.ringFullIdle = false;
+            const uint64_t fr = ps2_syscalls::GetCurrentVSyncTick();
+            if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
+            playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / 60u;
+        }
+        else
+        {
         if (prog.known)
         {
             s.wallClock = false;
@@ -1204,6 +1218,7 @@ namespace
                 if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
                 playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / fps;
             }
+        }
         }
         if (playedBytes <= s.returnedBytes)
             return;
@@ -3104,8 +3119,14 @@ namespace
         const int64_t last = g_lastCdTickNs.load(std::memory_order_relaxed);
         return last == 0 || (now - last) > (int64_t)ms * 1000000LL;
     }
+    extern "C" int ps2xSchedTraceOn();
+    extern "C" int ps2xSchedTid();
+    extern "C" int ps2xSchedTraceOn();
+    extern "C" int ps2xSchedTid();
     static void bt3RunCdTickInline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
         g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
         g_lastCdTickFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);   // [detsound]
         R5900Context tctx = *ctx;             // inherit gp/sp
@@ -3796,6 +3817,27 @@ namespace
         if (s_player == 1 || s_player == 2)
         {
             const uint32_t mode = getRegU32(ctx, 5);
+            // [statesync] SYMMETRIC (default under netplay; PS2X_NETVIEW_SYM=0 restores the old way): BOTH
+            // players' views become full screen on BOTH machines, so the fight's guest state is identical
+            // on the two sides (verified: 3 bytes differ instead of 12 KB, all in the sound block). The
+            // local player's view is then chosen at the renderer, which tells the two identical views
+            // apart by a mark the guest carries into its own SCISSOR: the view object's +0x208 is the
+            // scissor's y0 (FUN_001027c8/FUN_00112548 pack it as y0 << 32), so player 1's view starts at
+            // y = 1 and player 2's at y = 2. The HUD keeps y0 = 0 and is never dropped. One or two
+            // pixel rows at the top of the view, in the overscan, are the whole visual cost.
+            static const bool s_sym = [](){ const char *v = ::getenv("PS2X_NETVIEW_SYM"); return !(v && v[0] == '0'); }();
+            if (s_sym && (mode == 1u || mode == 2u))
+            {
+                const uint32_t view = getRegU32(ctx, 4);
+                static std::atomic<uint32_t> s_said{0};
+                if (s_said.fetch_add(1u) < 2u)
+                    std::fprintf(stderr, "[netview] player %d: viewport mode %u -> 0 (full screen, marked y0=%u)\n", s_player, mode, mode);
+                ctx->r[5] = _mm_set_epi64x(0, 0);
+                if (g_orig23e770) g_orig23e770(rdram, ctx, runtime);
+                auto put32 = [&](uint32_t addr, uint32_t v) { if (uint8_t *q = getMemPtr(rdram, addr & 0x1FFFFFFFu)) std::memcpy(q, &v, sizeof v); };
+                put32(view + 0x208u, mode);   // scissor y0 = 1 (P1) / 2 (P2)
+                return;
+            }
             // Leave the OTHER player's call untouched: it keeps its half-width viewport, and
             // PS2X_VPKEEP drops its draws at the rasteriser. Skipping this call instead would
             // leave that view object unconfigured and it would render from stale bounds.

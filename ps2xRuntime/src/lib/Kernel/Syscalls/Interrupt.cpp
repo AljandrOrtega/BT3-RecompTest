@@ -10,6 +10,11 @@
 extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp
 extern "C" bool ps2xFrameStepOn();   // [rollback] ps2_runtime.cpp
 extern "C" uint64_t *ps2xParkSlot(int idx);   // [statesync] ps2_runtime.cpp: the parked fiber's runtime-owned wait target
+extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the frame hook's counter (deterministic, advances in a re-sim)
+extern "C" int ps2xSchedTraceOn();               // ps2_runtime.cpp: PS2X_SCHEDTRACE window
+static uint64_t g_cdPumpLastFrame = ~0ull;      // [cdgate] the CD pump's per-frame gate (snapshotted with the vsync state)
+static int g_cdPumpsThisFrame = 0;
+static uint32_t g_cdPumpTicksSincePump = 0;
 namespace ps2_syscalls
 {
     namespace interrupt_state
@@ -419,25 +424,42 @@ namespace ps2_syscalls
         // guest that is not swapping (early boot) still gets ticks.
         static const bool s_gate = [](){ const char *v = std::getenv("PS2X_BT3_CDGATE"); return !(v && v[0] == '0'); }();
         extern std::atomic<uint64_t> g_gsGuestSwapCount;
-        static uint64_t s_lastSwap = ~0ull; static int s_pumpsThisFrame = 0;
         static auto s_lastPumpT = std::chrono::steady_clock::now();
         if (s_gate)
         {
-            const uint64_t cur = g_gsGuestSwapCount.load(std::memory_order_relaxed);
-            const auto now = std::chrono::steady_clock::now();
-            if (cur != s_lastSwap) { s_lastSwap = cur; s_pumpsThisFrame = 0; }
-            if (s_pumpsThisFrame >= 4 && now - s_lastPumpT < std::chrono::milliseconds(250)) return;
-            s_lastPumpT = now;
+            // [rollback] Frame-stepped mode counts GAME FRAMES and VBLANK TICKS instead of published swaps
+            // and milliseconds: a re-simulation renders nothing (the swap count froze) and the 250 ms
+            // fallback then paced the disc pump by the wall clock -- a different number of CD ticks per
+            // frame in every re-run and on every machine, which is where the sound thread's timing
+            // (its loop count at 0x2c9f70, the PCM it decoded) stopped matching. The counters are part of
+            // the vsync snapshot (ps2xVsyncStateGet/Set), so a restored run pumps as the original did.
+            if (ps2xFrameStepOn())
+            {
+                const uint64_t cur = g_bt3FrameCount.load(std::memory_order_relaxed);
+                if (cur != g_cdPumpLastFrame) { g_cdPumpLastFrame = cur; g_cdPumpsThisFrame = 0; }
+                ++g_cdPumpTicksSincePump;
+                if (g_cdPumpsThisFrame >= 4 && g_cdPumpTicksSincePump < 15u) return;   // ~250 ms at 60 Hz
+                g_cdPumpTicksSincePump = 0;
+            }
+            else
+            {
+                const uint64_t cur = g_gsGuestSwapCount.load(std::memory_order_relaxed);
+                const auto now = std::chrono::steady_clock::now();
+                if (cur != g_cdPumpLastFrame) { g_cdPumpLastFrame = cur; g_cdPumpsThisFrame = 0; }
+                if (g_cdPumpsThisFrame >= 4 && now - s_lastPumpT < std::chrono::milliseconds(250)) return;
+                s_lastPumpT = now;
+            }
         }
         if (s_gp != 0u)
         {
             // Pump a few times per vblank: each disc read walks a few tick
             // states. Keep it modest to avoid over-churning the queue.
+            if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] f=%llu CDPUMP x4 (pumps=%d ticksSince=%u)\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), g_cdPumpsThisFrame, g_cdPumpTicksSincePump);
             for (int i = 0; i < 4; ++i)
             {
                 pumpGuestFunction(rdram, runtime, 0x0028a3b0u, s_gp);
             }
-            s_pumpsThisFrame += 4;
+            g_cdPumpsThisFrame += 4;
         }
     }
 
@@ -618,18 +640,20 @@ namespace ps2_syscalls
         (void)WaitForNextVSyncTick(rdram, runtime);
     }
 
-    // [rollback] the vsync tick counter and flag registration, for the snapshot
-    extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr)
+    // [rollback] the vsync tick counter, flag registration and the CD pump's gate counters, for the snapshot
+    extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr, uint64_t *cdFrame, uint32_t *cdPumps, uint32_t *cdTicks)
     {
         std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
         *tick = g_vsync_tick_counter.load(std::memory_order_relaxed);
         *flagAddr = g_vsync_registration.flagAddr; *tickAddr = g_vsync_registration.tickAddr;
+        *cdFrame = g_cdPumpLastFrame; *cdPumps = (uint32_t)g_cdPumpsThisFrame; *cdTicks = g_cdPumpTicksSincePump;
     }
-    extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr)
+    extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr, uint64_t cdFrame, uint32_t cdPumps, uint32_t cdTicks)
     {
         std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
         g_vsync_tick_counter.store(tick, std::memory_order_relaxed);
         g_vsync_registration.flagAddr = flagAddr; g_vsync_registration.tickAddr = tickAddr;
+        g_cdPumpLastFrame = cdFrame; g_cdPumpsThisFrame = (int)cdPumps; g_cdPumpTicksSincePump = cdTicks;
     }
 
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -4,6 +4,8 @@
 #include <deque>
 #include "runtime/ps2_netplay.h" // [rollback] the netplay controller
 #include "runtime/ps2_statesync.h"   // [statesync] portable snapshot forms
+extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the frame hook's counter
+extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defined with the scheduler)
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #include <link.h>
@@ -176,6 +178,12 @@ void ps2WatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_
     {
         const uint32_t v = static_cast<uint32_t>(valueLo);
         if (v == 0u || (v >= 0x100008u && v < 0x2bf69cu)) return;
+    }
+    {   // PS2X_AWATCH_FROM=<frame>: report only from that game frame on (the report budget is small; a counter
+        // written every frame since boot would spend it long before the frames under study)
+        static const uint64_t s_from = [](){ const char *v = std::getenv("PS2X_AWATCH_FROM"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
+        extern std::atomic<uint64_t> g_bt3FrameCount;
+        if (s_from && g_bt3FrameCount.load(std::memory_order_relaxed) < s_from) return;
     }
     extern std::atomic<uint32_t> g_watchReportN; // resettable: texwatch re-arms mid-run
     const uint32_t n = g_watchReportN.fetch_add(1);
@@ -2398,6 +2406,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 R5900Context tctx = *ctx;
                 tctx.r[31] = _mm_setzero_si128();
                 tctx.pc = tickPc;
+                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] TICKPUMP tid=%d pc=0x%x nf=%llu\n", g_schedTid, tickPc, (unsigned long long)g_cadNestedFairness);
+                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] TICKPUMP tid=%d pc=0x%x nf=%llu\n", g_schedTid, tickPc, (unsigned long long)g_cadNestedFairness);
                 uint32_t steps = 0u;
                 while (tctx.pc != 0u && steps++ < 2000000u)
                 {
@@ -3046,6 +3056,12 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
 {
+    if (ps2xSchedTraceOn())
+        std::fprintf(stderr, "[schedtrace] sys tid=%d num=%u nf=%llu pc=0x%x\n", g_schedTid, encodedSyscallId ? encodedSyscallId : (uint32_t)_mm_cvtsi128_si32(ctx->r[3]),
+                     (unsigned long long)g_cadNestedFairness, ctx->pc);
+    if (ps2xSchedTraceOn())
+        std::fprintf(stderr, "[schedtrace] sys tid=%d num=%u nf=%llu pc=0x%x\n", g_schedTid, encodedSyscallId ? encodedSyscallId : (uint32_t)_mm_cvtsi128_si32(ctx->r[3]),
+                     (unsigned long long)g_cadNestedFairness, ctx->pc);
     if (ctx->in_delay_slot)
     {
         throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
@@ -4238,6 +4254,18 @@ bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
         // changed), so a yield or a block always gives one blocked fiber the chance to notice its
         // wakeup, and probes never chain into a busy pass on their own.
         bool failedProbe = false;
+        {   // PS2X_SCHEDTRACE=<from>[:<to>] game frames: every switch (real / probe), for A-vs-B comparisons
+            static const uint64_t s_trFrom = [](){ const char *v = std::getenv("PS2X_SCHEDTRACE"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
+            static const uint64_t s_trTo = [](){ const char *v = std::getenv("PS2X_SCHEDTRACE"); const char *c = v ? std::strchr(v, ':') : nullptr; return c ? std::strtoull(c + 1, nullptr, 10) : (s_trFrom ? s_trFrom + 10 : 0ull); }();
+            const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (s_trFrom && fr >= s_trFrom && fr <= s_trTo)
+            {
+                std::lock_guard<std::mutex> lk(m_schedMutex);
+                const SchedThread &st = *m_schedThreads[next];
+                std::fprintf(stderr, "[schedtrace] f=%llu tid=%d %s -> blocked=%d cur=%d wp=%d\n", (unsigned long long)fr, next, probe ? "probe" : "run",
+                             (int)st.blocked, m_schedCurrent, g_fiberTls[next].waitPoint);
+            }
+        }
         if (probe)
         {
             std::lock_guard<std::mutex> lk(m_schedMutex);
@@ -4266,6 +4294,15 @@ extern "C" uint64_t *ps2xParkSlot(int idx)
     return &schedExtraFor(g_schedTid).park[i];
 }
 
+extern "C" int ps2xSchedTid() { return g_schedIsGuest ? g_schedTid : -1; }
+extern "C" int ps2xSchedTraceOn()
+{   // PS2X_SCHEDTRACE=<from>[:<to>]: the game-frame window the scheduler / tick / kernel traces print in
+    static const uint64_t s_from = [](){ const char *v = std::getenv("PS2X_SCHEDTRACE"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
+    static const uint64_t s_to = [](){ const char *v = std::getenv("PS2X_SCHEDTRACE"); const char *c = v ? std::strchr(v, ':') : nullptr; return c ? std::strtoull(c + 1, nullptr, 10) : (s_from ? s_from + 10 : 0ull); }();
+    if (!s_from) return 0;
+    const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    return fr >= s_from && fr <= s_to;
+}
 void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry)
 {
     m_schedFiber = ps2xFiberAdoptCurrent();
@@ -4309,9 +4346,12 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
                 }
                 nextVblank += period;
                 ps2xVirtualClockAdvance(16666667ull);
+                const uint64_t nfBefore = g_cadNestedFairness, tkBefore = g_cadTickCounter;
                 { const auto t0 = clock::now();
                   ps2xInterruptTick(m_memory.getRDRAM(), this);
                   g_rbTickNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0).count(); ++g_rbTicks; }
+                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] f=%llu TICK cur=%d nf %llu -> %llu tick %llu -> %llu\n", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), m_schedCurrent,
+                                                     (unsigned long long)nfBefore, (unsigned long long)g_cadNestedFairness, (unsigned long long)tkBefore, (unsigned long long)g_cadTickCounter);
                 continue;
             }
             { const auto t0 = clock::now(); ps2xRollbackAtBoundary(*this); ++g_rbBoundaries;
@@ -4405,7 +4445,9 @@ void PS2Runtime::schedYield(int tid)
             if (!anyBlocked) return;
             {   // only when something could have woken a blocked fiber (see g_schedSignalGen), or every 64 yields
                 const uint64_t gen = g_schedSignalGen.load(std::memory_order_relaxed);
-                if (gen == g_schedSeenGen && (++g_schedSinceProbe & 63u) != 0u) return;
+                const bool skip = gen == g_schedSeenGen && (++g_schedSinceProbe & 63u) != 0u;
+                if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] yield tid=%d gen=%llu seen=%llu since=%u nf=%llu tick=%llu -> %s\n", tid, (unsigned long long)gen, (unsigned long long)g_schedSeenGen, g_schedSinceProbe, (unsigned long long)g_cadNestedFairness, (unsigned long long)g_cadTickCounter, skip ? "continue" : "probe");
+                if (skip) return;
                 g_schedSeenGen = gen; g_schedSinceProbe = 0;
             }
             probeOnly = true;
@@ -4818,6 +4860,11 @@ struct Ps2xRollback
         }
         s->current = rt.m_schedCurrent; s->orderCounter = rt.m_schedOrderCounter;
         s->probeCursor = g_schedProbeCursor; s->probeArmed = g_schedProbeArmed;
+        {   // PS2X_SYNCTEST_CHAIN=1: the park chains at this capture too (parkSignature prints them)
+            static const bool s_chain = [](){ const char *v = std::getenv("PS2X_SYNCTEST_CHAIN"); return v && v[0] && v[0] != '0'; }();
+            if (s_chain) for (auto &kv : rt.m_schedThreads) if (kv.second && kv.second->present && !kv.second->finished && kv.second->fiber)
+            { int d = 0; std::string op; (void)parkSignature(kv.first, *kv.second, &d, &op); }
+        }
         s->tls = g_fiberTls; s->gate = g_gate; s->cpu = rt.m_cpuContext;
         s->kernel = ps2xKernelStateCapture();
         s->dev = ps2xMemDeviceCapture(&rt.m_memory);
@@ -5333,8 +5380,9 @@ struct Ps2xRollback
         if (!ring.empty() && (frame % ps2NetCheckEvery()) == 0u && ring.front().frame + keep <= frame)
         {
             if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
-            {
-                ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0u, 0u));
+            {   // minus the sound-stream window: the sound service thread's wake count there is the one
+                // known host-timing residual (in-process too); gameplay state is not in that block
+                ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0x2c0000u, 0x300000u));
                 if (s_dumpDir && s_dumpDir[0] && !s_dumped) { s_hashedRam.assign(ram, ram + 32u * 1024u * 1024u); s_hashedFrame = ring.front().frame; }
             }
         }

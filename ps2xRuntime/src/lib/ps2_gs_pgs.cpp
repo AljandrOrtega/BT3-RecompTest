@@ -777,17 +777,24 @@ static void wsHudRegLocked(State &s, uint32_t reg, uint64_t v, uint8_t *data, si
         {   // full-height, half-width == a splitscreen viewport. The local player's is already
             // 0..511 under PS2X_NETVIEW, so it never matches here.
             const uint32_t sx0 = uint32_t(v & 0x7FFu), sx1 = uint32_t((v >> 16) & 0x7FFu);
-            const uint32_t sy1 = uint32_t((v >> 48) & 0x7FFu);
+            const uint32_t sy0 = uint32_t((v >> 32) & 0x7FFu), sy1 = uint32_t((v >> 48) & 0x7FFu);
+            {   // [vpcensus] the distinct full-height scissors this path sees (first 16): which values the fight views carry
+                static std::vector<uint64_t> s_seen;
+                if (sy1 >= 400u && s_seen.size() < 16u && std::find(s_seen.begin(), s_seen.end(), v) == s_seen.end())
+                { s_seen.push_back(v); std::fprintf(stderr, "[vpcensus] scissor_%u x %u..%u y %u..%u\n", reg - 0x40 + 1, sx0, sx1, sy0, sy1); }
+            }
             const bool leftVp  = (sy1 >= 400u && sx0 == 0u && sx1 > 0u && sx1 <= 255u);
             const bool rightVp = (sy1 >= 400u && sx0 >= 256u);
-            if ((keep == 1 && rightVp) || (keep == 2 && leftVp))
+            const bool p1Full  = (sy1 >= 400u && sx0 == 0u && sx1 == 511u && sy0 == 1u);   // [netview] symmetric full-screen views: marked in y0
+            const bool p2Full  = (sy1 >= 400u && sx0 == 0u && sx1 == 511u && sy0 == 2u);
+            if ((keep == 1 && (rightVp || p2Full)) || (keep == 2 && (leftVp || p1Full)))
             {
                 const uint64_t empty = (v & ~(0x7FFull | (0x7FFull << 16))) | 0x7FFull;   // x0 = 2047 > x1 = 0
                 std::memcpy(data + off, &empty, sizeof empty);
                 h.ctx[reg - 0x40].scissor = empty;
                 static std::atomic<uint32_t> s_said{0};
-                if (s_said.fetch_add(1u) == 0u)
-                    std::fprintf(stderr, "[vpdrop] keeping player %d: blanking the other viewport (x %u..%u)\n", keep, sx0, sx1);
+                if (s_said.fetch_add(1u) < 4u)
+                    std::fprintf(stderr, "[vpdrop] keeping player %d: blanking the other viewport (x %u..%u, y %u..%u)\n", keep, sx0, sx1, sy0, sy1);
                 break;
             }
         }

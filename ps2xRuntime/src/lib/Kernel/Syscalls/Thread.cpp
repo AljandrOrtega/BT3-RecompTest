@@ -321,6 +321,7 @@ namespace ps2_syscalls
         return true;
     }
     extern "C" uint64_t *ps2xSchedStepCount(int tid);   // [statesync] ps2_runtime.cpp: the worker loop's yield quantum counter, runtime-owned
+    extern "C" int ps2xSchedTraceOn();                   // ps2_runtime.cpp: PS2X_SCHEDTRACE window
     extern "C" uint32_t *ps2xSchedU32(int tid, int which);   // [statesync] 0 = same-pc counter, 1 = last pc (they gate the spin sleeps)
     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -821,6 +822,7 @@ namespace ps2_syscalls
 
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] SuspendThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
@@ -874,6 +876,7 @@ namespace ps2_syscalls
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] ResumeThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
@@ -1089,6 +1092,7 @@ namespace ps2_syscalls
 
     void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] WakeupThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
@@ -1167,6 +1171,7 @@ namespace ps2_syscalls
 
     void iWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] iWakeupThread tid=%d by=%d\n", (int)getRegU32(ctx, 4), g_currentThreadId);
         ps2xSchedSignal();   // [fibers] wake site
         WakeupThread(rdram, ctx, runtime);
     }
@@ -1445,6 +1450,7 @@ namespace
     struct KEvf    { int id; uint32_t attr, option, initBits, bits; int waiters; bool deleted; };
     struct KernelSnap { std::vector<KThread> th; std::vector<KSema> se; std::vector<KEvf> ev;
                         int nextThread = 2, nextSema = 1, nextEvf = 1; uint64_t vsyncTick = 0; uint32_t vsFlag = 0, vsTick = 0;
+                        uint64_t cdFrame = 0; uint32_t cdPumps = 0, cdTicks = 0;   // [cdgate] the CD pump's gate counters
                         // SIF RPC bookkeeping (State.h) and the SIF stub's own state (SIF.cpp)
                         std::unordered_map<uint32_t, RpcServerState> rpcServers; std::unordered_map<uint32_t, RpcClientState> rpcClients;
                         uint64_t rpcSeq = 0; bool rpcInit = false; uint32_t rpcNextId = 1, rpcPacket = 0, rpcServer = 0, rpcQueue = 0;
@@ -1459,8 +1465,8 @@ extern "C" void *ps2xMcStateCapture();
 extern "C" bool ps2xMcStateRestore(void *);
 extern "C" bool ps2xMcStateSerialize(const void *, std::vector<uint8_t> &);
 extern "C" void *ps2xMcStateDeserialize(const uint8_t *, size_t, size_t *);
-extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr);
-extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr);
+extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr, uint64_t *cdFrame, uint32_t *cdPumps, uint32_t *cdTicks);
+extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr, uint64_t cdFrame, uint32_t cdPumps, uint32_t cdTicks);
 extern "C" void *ps2xSifStateCapture();
 extern "C" bool ps2xSifStateRestore(void *);
 extern "C" void *ps2xKernelStateCapture()
@@ -1507,7 +1513,16 @@ extern "C" void *ps2xKernelStateCapture()
         }
         s->nextEvf = g_nextEventFlagId;
     }
-    ps2xVsyncStateGet(&s->vsyncTick, &s->vsFlag, &s->vsTick);
+    ps2xVsyncStateGet(&s->vsyncTick, &s->vsFlag, &s->vsTick, &s->cdFrame, &s->cdPumps, &s->cdTicks);
+    {   // PS2X_KSNAPLOG=1: what the snapshot holds per thread (status / wait / wakeups / suspends)
+        static const bool s_log = [](){ const char *v = std::getenv("PS2X_KSNAPLOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_log)
+        {
+            std::fprintf(stderr, "[ksnap] capture:");
+            for (const KThread &t : s->th) std::fprintf(stderr, " tid%d(st=%d wt=%d wid=%d wk=%d sus=%d pc=0x%x)", t.tid, t.status, t.waitType, t.waitId, t.wakeupCount, t.suspendCount, t.currentPc);
+            std::fprintf(stderr, "\n");
+        }
+    }
     return s;
 }
 extern "C" bool ps2xKernelStateRestore(void *h)
@@ -1563,7 +1578,7 @@ extern "C" bool ps2xKernelStateRestore(void *h)
         }
         g_nextEventFlagId = s->nextEvf;
     }
-    ps2xVsyncStateSet(s->vsyncTick, s->vsFlag, s->vsTick);
+    ps2xVsyncStateSet(s->vsyncTick, s->vsFlag, s->vsTick, s->cdFrame, s->cdPumps, s->cdTicks);
     {
         std::lock_guard<std::mutex> lk(g_rpc_mutex);
         g_rpc_servers = s->rpcServers; g_rpc_clients = s->rpcClients; g_sif_rpc_debug_next_seq = s->rpcSeq;
@@ -1572,6 +1587,15 @@ extern "C" bool ps2xKernelStateRestore(void *h)
     }
     if (s->sif && !ps2xSifStateRestore(s->sif)) return false;
     if (s->mc && !ps2xMcStateRestore(s->mc)) return false;
+    {
+        static const bool s_log = [](){ const char *v = std::getenv("PS2X_KSNAPLOG"); return v && v[0] && v[0] != '0'; }();
+        if (s_log)
+        {
+            std::fprintf(stderr, "[ksnap] restore:");
+            for (const KThread &t : s->th) std::fprintf(stderr, " tid%d(st=%d wt=%d wid=%d wk=%d sus=%d)", t.tid, t.status, t.waitType, t.waitId, t.wakeupCount, t.suspendCount);
+            std::fprintf(stderr, "\n");
+        }
+    }
     return true;
 }
 extern "C" void ps2xKernelStateFree(void *h) { delete static_cast<KernelSnap *>(h); }
@@ -1585,6 +1609,7 @@ extern "C" bool ps2xKernelStateSerialize(const void *h, std::vector<uint8_t> &ou
     w.podVec(s->th); w.podVec(s->se); w.podVec(s->ev);
     w.pod(s->nextThread); w.pod(s->nextSema); w.pod(s->nextEvf);
     w.u64(s->vsyncTick); w.u32(s->vsFlag); w.u32(s->vsTick);
+    w.u64(s->cdFrame); w.u32(s->cdPumps); w.u32(s->cdTicks);
     w.podUMap(s->rpcServers); w.podUMap(s->rpcClients);
     w.u64(s->rpcSeq); w.u8(s->rpcInit); w.u32(s->rpcNextId); w.u32(s->rpcPacket); w.u32(s->rpcServer); w.u32(s->rpcQueue);
     w.u8(s->sif != nullptr);
@@ -1601,6 +1626,7 @@ extern "C" void *ps2xKernelStateDeserialize(const uint8_t *data, size_t n, size_
     r.podVec(s->th); r.podVec(s->se); r.podVec(s->ev);
     s->nextThread = r.pod<int>(); s->nextSema = r.pod<int>(); s->nextEvf = r.pod<int>();
     s->vsyncTick = r.u64(); s->vsFlag = r.u32(); s->vsTick = r.u32();
+    s->cdFrame = r.u64(); s->cdPumps = r.u32(); s->cdTicks = r.u32();
     r.podUMap(s->rpcServers); r.podUMap(s->rpcClients);
     s->rpcSeq = r.u64(); s->rpcInit = r.u8() != 0; s->rpcNextId = r.u32(); s->rpcPacket = r.u32(); s->rpcServer = r.u32(); s->rpcQueue = r.u32();
     const bool hasSif = r.u8() != 0;
