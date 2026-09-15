@@ -1018,7 +1018,7 @@ PS2Runtime::PS2Runtime()
                 m_fibersEnabled = false;
             }
             if (m_fibersEnabled)
-                std::fprintf(stderr, "[fibers] enabled (scaffolding: guest threads still run as host threads)\n");
+                std::fprintf(stderr, "[fibers] enabled: guest threads run as fibers on the game thread\n");
         }
         if (m_schedEnabled)
             std::cerr << "[sched] deterministic cooperative guest scheduler ENABLED" << std::endl;
@@ -3761,6 +3761,7 @@ void PS2Runtime::leaveGuestExecution()
     }
 
     --it->second;
+    if (it->second == 0u) g_guestMutexHolderTid.store(-1);   // [fibers] stale holder made "[mutex] curHolder=me" look like a self-wait
     m_guestExecutionMutex.unlock();
     if (it->second == 0u)
     {
@@ -3777,6 +3778,7 @@ uint32_t PS2Runtime::releaseGuestExecution()
     }
 
     const uint32_t depth = it->second;
+    g_guestMutexHolderTid.store(-1);
     for (uint32_t i = 0; i < depth; ++i)
     {
         m_guestExecutionMutex.unlock();
@@ -3943,11 +3945,20 @@ namespace
         int  schedTid = 1;
         bool isGuest = false;
         uint32_t lastPc = 0, lastRa = 0;
+        int  kernelTid = 1;   // the kernel's g_currentThreadId (State.h): SleepThread/GetThreadId/ensureCurrentThreadInfo key on it
     };
+    // [fibers] Probing state (see schedFiberLoop). File-static for the same header reason.
+    int  g_schedProbeCursor = -1;    // last probed tid: round-robin position over the blocked fibers
+    bool g_schedProbeArmed = false;  // one probe is due before the next runnable pick
     // Keyed by tid, and deliberately NOT in SchedThread: keeping it here avoids touching
     // ps2_runtime.h, which every generated runner source includes (a ~10 minute rebuild).
     std::map<int, GuestTls> g_fiberTls;
 }
+// [fibers] Kernel/Syscalls/Thread.cpp: the kernel's thread_local identity, swapped per fiber. It is
+// the fifth identity variable -- the first run swapped only the four runtime ones, so once tid 6
+// had started every fiber's SleepThread/GetThreadId resolved to tid 6's ThreadInfo.
+int  ps2xKernelCurrentTid();
+void ps2xKernelSetCurrentTid(int tid);
 
 // [fibers] The fiber this host thread is currently executing. All guest fibers share one host
 // thread, so a single thread_local tracks whichever is live; schedFiberPark switches back from it.
@@ -4011,50 +4022,114 @@ bool PS2Runtime::schedFiberSpawn(int tid, int prio, std::function<void()> body)
 
 void PS2Runtime::schedFiberLoop()
 {
+    // [fibers] PROBING. Under threads a parked guest thread wakes ITSELF: the condition_variable
+    // notify runs its host thread, which re-checks the predicate and calls schedAcquire -- the only
+    // thing that clears SchedThread::blocked. A parked fiber cannot do that: it runs only when the
+    // scheduler switches to it, and the scheduler switched only to runnable (!blocked) fibers. So a
+    // wakeup delivered to a blocked fiber was never observed (fib3.log: WakeupThread -> tid 4 and
+    // 5, wk=1, both stayed PB; every tid ended PB with current=-1).
+    //
+    // The scheduler therefore PROBES blocked fibers: it switches to one WITHOUT giving it the
+    // token, so it re-evaluates its predicate under its own lock. If the predicate holds the fiber
+    // calls schedAcquire (blocked=false) and waits for the token exactly like a woken host thread;
+    // if not it parks again and nothing changed. One probe is made per scheduling decision (every
+    // yield or block hands the CPU back here), round-robin over the blocked fibers, so they are
+    // all polled regularly even while several fibers are runnable. When nobody is runnable the
+    // loop keeps probing and naps 200 us after each fruitless pass, because only host threads
+    // (vblank, RPC, CD, kick workers) can change anything then.
+    auto pickProbeLocked = [this](int after) -> int
+    {   // round-robin over PRESENT+BLOCKED fibers after `after` (same ordering rule as schedPickNextLocked)
+        uint64_t afterOrder = 0; bool haveAfter = false;
+        auto ait = m_schedThreads.find(after);
+        if (ait != m_schedThreads.end() && ait->second) { afterOrder = ait->second->order; haveAfter = true; }
+        int best = -1, wrap = -1; uint64_t bestOrder = 0, wrapOrder = 0;
+        for (auto &kv : m_schedThreads)
+        {
+            const SchedThread &s = *kv.second;
+            if (!s.present || !s.blocked || s.finished || !s.fiber) continue;
+            if (haveAfter && s.order > afterOrder) { if (best < 0 || s.order < bestOrder) { best = kv.first; bestOrder = s.order; } }
+            else { if (wrap < 0 || s.order < wrapOrder) { wrap = kv.first; wrapOrder = s.order; } }
+        }
+        return (best >= 0) ? best : wrap;
+    };
+
+    uint32_t idleProbes = 0;   // probes made while nobody was runnable (reset by any real schedule)
     while (!isStopRequested())
     {
         Ps2xFiber *f = nullptr;
+        int next = -1;
+        bool probe = false;
         bool anyLeft = false;
+        uint32_t blockedCount = 0;
         {
             std::lock_guard<std::mutex> lk(m_schedMutex);
             for (const auto &kv : m_schedThreads)
-                if (kv.second && !kv.second->finished) { anyLeft = true; break; }
-            int next = -1;
-            if (m_schedCurrent >= 0 && schedFiberRunnableLocked(m_schedCurrent)) next = m_schedCurrent;
-            else
             {
-                const int pick = schedPickNextLocked(m_schedCurrent);
-                if (pick >= 0 && schedFiberRunnableLocked(pick)) next = pick;
+                if (!kv.second || kv.second->finished) continue;
+                anyLeft = true;
+                if (kv.second->present && kv.second->blocked && kv.second->fiber) ++blockedCount;
             }
-            if (next >= 0) { m_schedCurrent = next; f = m_schedThreads[next]->fiber; }
+            if (g_schedProbeArmed)
+            {
+                g_schedProbeArmed = false;
+                const int p = pickProbeLocked(g_schedProbeCursor);
+                if (p >= 0) { next = p; probe = true; g_schedProbeCursor = p; }
+            }
+            if (next < 0)
+            {
+                if (m_schedCurrent >= 0 && schedFiberRunnableLocked(m_schedCurrent)) next = m_schedCurrent;
+                else
+                {
+                    const int pick = schedPickNextLocked(m_schedCurrent);
+                    if (pick >= 0 && schedFiberRunnableLocked(pick)) next = pick;
+                }
+                if (next >= 0) m_schedCurrent = next;   // a real schedule carries the token; a probe never does
+            }
+            if (next >= 0) f = m_schedThreads[next]->fiber;
         }
         if (!anyLeft) return;            // every guest fiber has finished
         if (!f)
         {
-            // Nobody runnable: all guest fibers are parked on host workers (kick/stage2/GS).
-            // Those threads are independent and will make progress, so give them the CPU rather
-            // than spinning -- this is the one place the fiber scheduler must not busy-wait.
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            // Nobody runnable: every present fiber is parked, so only host threads can change
+            // anything. Keep probing, and nap once per fruitless pass over the blocked fibers --
+            // this is the one place the fiber scheduler must not busy-wait.
+            if (blockedCount == 0 || (idleProbes % blockedCount) == 0)
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            ++idleProbes;
+            g_schedProbeArmed = true;
             continue;
         }
+        if (!probe) idleProbes = 0;
         // Swap this fiber's identity in before handing it the CPU, and back out when it parks.
         // Only the fiber we switched to can have run, so saving its slot on return is sufficient.
         {
-            GuestTls &t = g_fiberTls[m_schedCurrent];
+            GuestTls &t = g_fiberTls[next];
             g_guestExecutionDepths = t.depths;
             g_schedTid = t.schedTid; g_schedIsGuest = t.isGuest;
             g_schedLastPc = t.lastPc; g_schedLastRa = t.lastRa;
+            ps2xKernelSetCurrentTid(t.kernelTid);
         }
-        const int ran = m_schedCurrent;
         g_curFiber = f;
         ps2xFiberSwitch(m_schedFiber, f);
         g_curFiber = m_schedFiber;   // back in the scheduler
         {
-            GuestTls &t = g_fiberTls[ran];
+            GuestTls &t = g_fiberTls[next];
             t.depths = g_guestExecutionDepths;
             t.schedTid = g_schedTid; t.isGuest = g_schedIsGuest;
             t.lastPc = g_schedLastPc; t.lastRa = g_schedLastRa;
+            t.kernelTid = ps2xKernelCurrentTid();
         }
+        // Arm one probe after anything but a FAILED probe (the fiber is still parked and nothing
+        // changed), so a yield or a block always gives one blocked fiber the chance to notice its
+        // wakeup, and probes never chain into a busy pass on their own.
+        bool failedProbe = false;
+        if (probe)
+        {
+            std::lock_guard<std::mutex> lk(m_schedMutex);
+            auto it = m_schedThreads.find(next);
+            failedProbe = (it != m_schedThreads.end() && it->second && it->second->blocked);
+        }
+        if (!failedProbe) g_schedProbeArmed = true;
     }
 }
 
@@ -4122,14 +4197,33 @@ bool PS2Runtime::guestWait(std::condition_variable &cv, std::unique_lock<std::mu
 void PS2Runtime::schedYield(int tid)
 {
     if (!m_schedEnabled) return;
+    bool probeOnly = false;
     {
         std::unique_lock<std::mutex> lk(m_schedMutex);
         if (m_schedCurrent != tid) return;
         int nxt = schedPickNextLocked(tid);
-        if (nxt < 0 || nxt == tid) return; // nobody else runnable -> keep going
-        if (schedDbgOn()) std::cerr << "[sched] tid " << tid << " YIELD -> " << nxt << std::endl;
-        m_schedCurrent = nxt;
-        m_schedThreads[nxt]->cv.notify_all();
+        if (nxt < 0 || nxt == tid)
+        {
+            if (!m_fibersEnabled) return; // nobody else runnable -> keep going
+            // [fibers] Nobody else is runnable, but a blocked fiber may have been woken by a host
+            // thread and not noticed yet -- it only notices when probed (see schedFiberLoop).
+            // Keep the token and hand the CPU to the scheduler for one probe; it comes straight
+            // back if nothing changed. Without this a spinning thread starves every wakeup.
+            bool anyBlocked = false;
+            for (auto &kv : m_schedThreads)
+            {
+                const SchedThread &s = *kv.second;
+                if (kv.first != tid && s.present && s.blocked && s.fiber && !s.finished) { anyBlocked = true; break; }
+            }
+            if (!anyBlocked) return;
+            probeOnly = true;
+        }
+        else
+        {
+            if (schedDbgOn()) std::cerr << "[sched] tid " << tid << " YIELD -> " << nxt << std::endl;
+            m_schedCurrent = nxt;
+            m_schedThreads[nxt]->cv.notify_all();
+        }
     }
     // CRITICAL: schedYield is called from inside a recompiled function, so this
     // thread holds the guest-execution lock. Release it while parked so the next
@@ -4138,6 +4232,7 @@ void PS2Runtime::schedYield(int tid)
     const uint32_t depth = releaseGuestExecution();
     if (m_fibersEnabled)
     {
+        if (probeOnly) schedFiberPark();
         std::unique_lock<std::mutex> lk(m_schedMutex);
         while (!(m_schedCurrent == tid || isStopRequested()))
         { lk.unlock(); schedFiberPark(); lk.lock(); }

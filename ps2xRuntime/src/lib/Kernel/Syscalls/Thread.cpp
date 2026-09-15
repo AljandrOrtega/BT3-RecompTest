@@ -1377,3 +1377,10 @@ extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *sem
     }
     return true;
 }
+
+// [fibers] The kernel's per-thread identity, exposed so PS2Runtime::schedFiberLoop can swap it per
+// fiber. g_currentThreadId is thread_local, and under PS2X_FIBERS every guest thread shares one
+// host thread: without the swap the last StartThread's tid became everyone's identity, and
+// SleepThread/GetThreadId/ensureCurrentThreadInfo (which key on it) all acted on the wrong thread.
+int  ps2xKernelCurrentTid() { return g_currentThreadId; }
+void ps2xKernelSetCurrentTid(int tid) { g_currentThreadId = tid; }
