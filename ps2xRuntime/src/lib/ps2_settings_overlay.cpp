@@ -1996,16 +1996,9 @@ void PS2SettingsOverlay::drawNetplayTab()
     static int  s_rollback = ps2NetRollbackSetting();   // [rollback] env default, 0 = lockstep
     static bool s_sync = ps2NetSyncSetting();            // [statesync]
     const bool syncLive = s_sync && s_rollback > 0;
-    if (syncLive)
-    {
-        ImGui::BeginDisabled(); bool off = false; ImGui::Checkbox("Go to character select once connected", &off); ImGui::EndDisabled();
-        ImGui::TextDisabled("Not with state sync: navigate the menus on the host, the joiner follows.");
-    }
-    else
-    {
-        ImGui::Checkbox("Go to character select once connected", &s_jump);
-        ImGui::TextDisabled("Both sides jump together; the menus are hidden while it happens.");
-    }
+    ImGui::Checkbox("Go to character select once connected", &s_jump);
+    if (syncLive) ImGui::TextDisabled("The HOST's choice applies to both. Both sides jump, then the host's state is synced into the joiner.");
+    else          ImGui::TextDisabled("The HOST's choice applies to both; the menus are hidden while it happens.");
     ImGui::Separator();
     ImGui::SliderInt("Rollback window (frames)", &s_rollback, 0, 30);
     ImGui::TextDisabled("0 = lockstep (every frame waits for the peer's input). 4-8 = rollback: a missing input is");
@@ -2043,7 +2036,7 @@ void PS2SettingsOverlay::drawNetplayTab()
 
     if (ImGui::Button("Host (you are Player 1)"))
     {
-        ps2NetSetAutoJump(s_jump && !syncLive); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle);
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle);
         ps2NetSetTimeLimit(s_time); ps2NetSetDpLimit(s_dp);
         ps2NetSetRollback(s_rollback); ps2NetSetSync(s_sync);
         ps2NetHost(s_port, 1);
@@ -2051,7 +2044,7 @@ void PS2SettingsOverlay::drawNetplayTab()
     ImGui::SameLine();
     if (ImGui::Button("Join (you are Player 2)"))
     {
-        ps2NetSetAutoJump(s_jump && !syncLive); ps2NetSetDelay(s_delay);   // the host's game mode wins
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);   // the host's game mode wins
         ps2NetSetRollback(s_rollback); ps2NetSetSync(s_sync);
         char hp[96]; std::snprintf(hp, sizeof hp, "%s:%d", s_peer, s_port);
         ps2NetJoin(hp, 2);

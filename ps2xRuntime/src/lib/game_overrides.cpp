@@ -440,6 +440,16 @@ namespace
     // module polls it -- it completes on a press, and no amount of variable writing substitutes
     // for that loading. One press at a state we chose and can verify, not menu navigation.
     std::atomic<int> g_netJumpPressCross{0};
+    // [statesync] 0 = no jump this session, 1 = jumping, 2 = settled / gave up. The state sync waits for
+    // 2 on both sides: the host publishes AFTER its jump (so the joiner adopts character select), the
+    // joiner adopts only once its own jump has it in the same screen (comparable call chains).
+    std::atomic<int> g_netJumpState{0};
+    std::atomic<uint32_t> g_netJumpSession{0};   // the netplay session the state belongs to
+    extern "C" int ps2xNetJumpState() { return g_netJumpState.load(std::memory_order_relaxed); }
+    // True once THIS session's jump has settled (or given up). A session the jump has not looked at yet
+    // (it runs from the frame hook, after the boundary that first sees the peer) counts as not settled.
+    extern "C" int ps2xNetJumpSettledFor(uint32_t session)
+    { return g_netJumpSession.load(std::memory_order_relaxed) == session && g_netJumpState.load(std::memory_order_relaxed) == 2; }
 
     void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
     {
@@ -525,13 +535,18 @@ namespace
         {
             const uint32_t frame = static_cast<uint32_t>(g_bt3FrameCount.load(std::memory_order_relaxed));
             const int pl = static_cast<int>(socket & 3u) + 1;          // socket 0/1 -> player 1/2
+            // [netjump] The jump's confirm press is a P1 press (the versus menu listens to player 1 only).
+            // In lockstep the host's P1 press crosses the wire, so injecting on the LOCAL player was right;
+            // while a state sync is pending nothing crosses and each side drives its own menus, so it must
+            // be injected on socket 0 whoever we are.
+            const bool injectHere = ps2NetSyncPending() ? (pl == 1) : (pl == ps2NetLocalPlayer());
+            if (injectHere && g_netJumpPressCross.load(std::memory_order_relaxed) > 0)
+            {
+                g_netJumpPressCross.fetch_sub(1, std::memory_order_relaxed);
+                b1 = static_cast<uint8_t>(b1 & ~0x40u);   // CROSS (active low), bit 14
+            }
             if (pl == ps2NetLocalPlayer())
             {
-                if (g_netJumpPressCross.load(std::memory_order_relaxed) > 0)
-                {
-                    g_netJumpPressCross.fetch_sub(1, std::memory_order_relaxed);
-                    b1 = static_cast<uint8_t>(b1 & ~0x40u);   // CROSS (active low), bit 14
-                }
                 Ps2xNetInput live{static_cast<uint16_t>(b0 | (uint16_t(b1) << 8)), rx, ry, lx, ly};
                 Ps2xNetInput canned{};
                 if (ps2NetAutoInput(canned)) live = canned;   // [netplay] host-driven auto-start
@@ -5007,13 +5022,6 @@ namespace
         // versus mode, because the duel object that holds it is freed before character select.
         const int s_mode = s_env > 0 ? s_env : (ps2NetAutoJump() ? 1 : 0);
         if (s_mode <= 0 || !rdram || !ps2NetActive() || !ps2NetPeerConnected()) return;
-        if (ps2NetSyncOn())
-        {   // [statesync] the jump pokes guest state on ONE machine (menuGoto runs func_10D878 out of band);
-            // with a shared state that is a desync by construction. Navigate on the host; the joiner follows.
-            static bool s_said = false;
-            if (!s_said) { s_said = true; std::fprintf(stderr, "[netjump] disabled: state sync is on -- navigate the menus on the host\n"); }
-            return;
-        }
         // Reset per connection, so disconnecting and reconnecting jumps again instead of
         // remembering that it already ran once this process.
         static uint32_t s_session = 0;
@@ -5025,7 +5033,8 @@ namespace
         // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
         static uint64_t s_pulseStart = 0;
         if (s_session != ps2NetSession())
-        { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0;
+        { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0; g_netJumpState.store(1, std::memory_order_relaxed);
+          g_netJumpSession.store(s_session, std::memory_order_relaxed);
           g_netJumpWantConfirm.store(false, std::memory_order_relaxed);
           g_netJumpHold.store(0, std::memory_order_relaxed); }
         if (s_step >= 3)
@@ -5056,7 +5065,7 @@ namespace
         const uint32_t cur = rd32(rdram, stateObj + 0x18u);
         if (s_step == 0)
         {
-            if (cur == bt3NetTargetState()) { s_step = 3; std::fprintf(stderr, "[netjump] already at character select\n"); return; }
+            if (cur == bt3NetTargetState()) { s_step = 3; g_netJumpState.store(2, std::memory_order_relaxed); std::fprintf(stderr, "[netjump] already at character select\n"); return; }
             if (cur != 0x04u) return;                       // wait until the main menu is up
             if (s_mode >= 2)
             {   // straight to character select
@@ -5118,7 +5127,7 @@ namespace
                 {
                     std::fprintf(stderr, "[netjump] stuck at state 0x%02x (wanted 0x%02x) -- giving up\n",
                                  cur, bt3NetTargetState());
-                    g_netJumpHold.store(0, std::memory_order_relaxed); s_step = 3; return;
+                    g_netJumpHold.store(0, std::memory_order_relaxed); s_step = 3; g_netJumpState.store(2, std::memory_order_relaxed); return;
                 }
                 if (cur == 0x26u && ((now - s_pulseStart) % 8u) == 0u)
                     g_netJumpPressCross.store(3, std::memory_order_relaxed);
@@ -5149,7 +5158,7 @@ namespace
                          cur, rd32(rdram, stateObj + 0x620u), rd32(rdram, stateObj + 0x624u),
                          rd32(rdram, stateObj + 0x630u), bt < 3 ? kType[bt] : "?",
                          bt == 2 ? ", " : "", (bt == 2 && dp < 3) ? kDp[dp] : "");
-            s_step = 3;
+            s_step = 3; g_netJumpState.store(2, std::memory_order_relaxed);
         }
     }
 

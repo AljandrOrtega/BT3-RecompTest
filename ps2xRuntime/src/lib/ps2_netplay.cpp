@@ -141,6 +141,10 @@ struct Net
 };
 
 Net g;
+// [netjump] the HOST's choice, like the game mode: it rides in bit 7 of the timeLimit field
+// (indices use 3 bits) so a joiner that left its own box unticked still jumps with the host.
+std::atomic<bool> g_autoJump{false};
+static uint8_t wireTimeLimit() { return static_cast<uint8_t>((g.timeLimit.load(std::memory_order_relaxed) & 0x7f) | (g.localPlayer == 1 && g_autoJump.load(std::memory_order_relaxed) ? 0x80 : 0)); }
 
 const Ps2xNetInput kNeutral{0xFFFFu, 0x80u, 0x80u, 0x80u, 0x80u};
 
@@ -181,7 +185,7 @@ void sendOurs(uint32_t frame)
     p.magic = kMagic; p.version = kVersion;
     p.player = static_cast<uint8_t>(g.localPlayer);
     p.battleType = static_cast<uint8_t>(g.battleType.load(std::memory_order_relaxed));
-    p.timeLimit  = static_cast<uint8_t>(g.timeLimit.load(std::memory_order_relaxed));
+    p.timeLimit  = wireTimeLimit();
     p.dpLimit    = static_cast<uint8_t>(g.dpLimit.load(std::memory_order_relaxed));
     p.checkFrame = g.checkFrame; p.checksum = g.checkValue;
     const uint32_t base = frame > (kRedundancy - 1u) ? frame - (kRedundancy - 1u) : 0u;
@@ -226,9 +230,9 @@ static void applyInputs(const NetPkt &p)
     {
         g.peerHash[p.checkFrame] = p.checksum;
         const auto it = g.ourHash.find(p.checkFrame);   // ours already set: compare here too (the other order is in ps2NetSetChecksum)
-        if (it != g.ourHash.end() && it->second != p.checksum && g.desyncFrame == 0u)
+        if (it != g.ourHash.end() && it->second != p.checksum)
         {
-            g.desyncFrame = p.checkFrame;
+            if (g.desyncFrame == 0u) g.desyncFrame = p.checkFrame;
             if (g.desyncs.fetch_add(1, std::memory_order_relaxed) == 0)
                 std::fprintf(stderr, "[netplay] *** DESYNC at frame %u: ours %016llx peer %016llx ***\n",
                              p.checkFrame, (unsigned long long)it->second, (unsigned long long)p.checksum);
@@ -243,7 +247,7 @@ static void sendSyncCtl(uint8_t kind, uint32_t frame, uint64_t bytes, const char
     NetPkt p{}; p.magic = kMagic; p.version = kVersion; p.player = static_cast<uint8_t>(g.localPlayer);
     p.kind = kind; p.baseFrame = frame; p.checksum = bytes; p.count = 0u;
     p.battleType = static_cast<uint8_t>(g.battleType.load(std::memory_order_relaxed));
-    p.timeLimit  = static_cast<uint8_t>(g.timeLimit.load(std::memory_order_relaxed));
+    p.timeLimit  = wireTimeLimit();
     p.dpLimit    = static_cast<uint8_t>(g.dpLimit.load(std::memory_order_relaxed));
     size_t bytesOut = sizeof(NetPkt) - sizeof(Ps2xNetInput) * kMaxInputs;
     if (path && path[0])
@@ -293,7 +297,8 @@ void pump()
         if (p.player == 1u && g.localPlayer != 1)      // the host decides the match setup
         {
             g.battleType.store(p.battleType, std::memory_order_relaxed);
-            g.timeLimit.store(p.timeLimit, std::memory_order_relaxed);
+            g.timeLimit.store(p.timeLimit & 0x7f, std::memory_order_relaxed);
+            g_autoJump.store((p.timeLimit & 0x80) != 0, std::memory_order_relaxed);   // [netjump] host's choice
             g.dpLimit.store(p.dpLimit, std::memory_order_relaxed);
         }
         if (!g.peerKnown)
@@ -389,6 +394,7 @@ static bool netStart(const char *conn, int listenPort, int player)
     if (g.sock == INVALID_SOCKET) { std::fprintf(stderr, "[netplay] socket() failed\n"); return false; }
     if (listenPort)
     {
+        int one = 1; setsockopt(g.sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&one), sizeof one);   // re-host right after a crash / a lingering socket
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY;
         a.sin_port = htons(static_cast<uint16_t>(listenPort));
         if (::bind(g.sock, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0)
@@ -446,7 +452,6 @@ void ps2NetDisconnect(const char *why)
 // [netjump] Whether a successful connection should take both sides to character select.
 // Owned by the overlay's Netplay tab (the env var stays as an override for headless runs), so
 // the jump is a property of CONNECTING rather than of standing on the main menu.
-static std::atomic<bool> g_autoJump{false};
 void ps2NetSetAutoJump(bool on) { g_autoJump.store(on, std::memory_order_relaxed); }
 void ps2NetSetDelay(int frames)  { if (frames >= 0 && frames <= 20) g.delay = (uint32_t)frames; }
 void ps2NetSetBattleType(int t)  { if (t >= 0 && t <= 2) g.battleType.store(t, std::memory_order_relaxed); }
@@ -531,7 +536,7 @@ static void sendHello()
     p.magic = kMagic; p.version = kVersion;
     p.player = static_cast<uint8_t>(g.localPlayer);
     p.battleType = static_cast<uint8_t>(g.battleType.load(std::memory_order_relaxed));
-    p.timeLimit  = static_cast<uint8_t>(g.timeLimit.load(std::memory_order_relaxed));
+    p.timeLimit  = wireTimeLimit();
     p.dpLimit    = static_cast<uint8_t>(g.dpLimit.load(std::memory_order_relaxed));
     p.count = 0u; p.baseFrame = 0u;
     const size_t bytes = sizeof(NetPkt) - sizeof(Ps2xNetInput) * kMaxInputs;

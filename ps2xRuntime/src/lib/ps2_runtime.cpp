@@ -4716,6 +4716,7 @@ extern std::atomic<uint64_t> g_bt3FrameCount;
 extern "C" R5900Context *ps2xWorkerContext(int tid);                         // [statesync] Kernel/Syscalls/Thread.cpp
 extern "C" int ps2xWorkerContextTids(int *out, int cap);
 extern "C" bool ps2xKernelThreadWait(int tid, int *status, int *waitType, int *waitId);
+extern "C" int ps2xNetJumpSettledFor(uint32_t session);                       // [netjump] game_overrides.cpp: this session's jump has settled
 
 // [statesync] The executable's GNU build id: a synced state is only meaningful between identical
 // binaries (host call chains, struct layouts, and the recompiled code itself must match).
@@ -5154,6 +5155,13 @@ struct Ps2xRollback
     static bool syncStep(PS2Runtime &rt)
     {
         using clock = std::chrono::steady_clock;
+        if (ps2NetAutoJump() && !ps2xNetJumpSettledFor(ps2NetSession()))
+        {   // [netjump] both sides jump to character select first; the host publishes from there and the
+            // joiner adopts from there (same screen = comparable call chains)
+            static bool s_said = false;
+            if (!s_said) { s_said = true; std::fprintf(stderr, "[statesync] waiting for the character-select jump to settle before the sync\n"); }
+            return false;
+        }
         if (ps2NetSyncIsHost())
         {
             // Not from inside the boot: the logo / movie-skip phase reaches the frame kick through call
@@ -5164,6 +5172,30 @@ struct Ps2xRollback
                 static bool s_said = false;
                 if (!s_said) { s_said = true; std::fprintf(stderr, "[statesync] host: peer connected during boot; publishing once past frame 300\n"); }
                 return false;
+            }
+            // Only a CLEAN boundary is worth publishing: every worker parked in a kernel wait (THS_WAIT /
+            // WAITSUSPEND / SUSPEND / DORMANT), none inside an opaque hook. A worker that was merely
+            // runnable when tid 1 hit the gate sits in a fairness yield deep inside whatever it was doing
+            // -- a park the joiner can only reproduce by luck (a 25-deep sound-thread chain kept a host
+            // frozen for good). Skip such boundaries; after 600 of them publish anyway and say so.
+            {
+                static uint32_t s_unclean = 0;
+                std::string busy;
+                for (const SigEnt &e : mySignatures(rt))
+                {
+                    if (e.tid == 1) continue;
+                    const bool waiting = e.kst == 0x04 || e.kst == 0x08 || e.kst == 0x0c || e.kst == 0x10;
+                    if (e.opaque) busy += " tid " + std::to_string(e.tid) + " inside " + e.opaqueName + ";";
+                    else if (!waiting) busy += " tid " + std::to_string(e.tid) + " runnable (depth " + std::to_string(e.depth) + ");";
+                }
+                if (!busy.empty() && ++s_unclean <= 600u)
+                {
+                    if (s_unclean <= 2u || (s_unclean % 120u) == 0u)
+                        std::fprintf(stderr, "[statesync] host: boundary %llu not clean (%u so far):%s\n", (unsigned long long)g_gate.waitFrame, s_unclean, busy.c_str());
+                    return false;
+                }
+                if (!busy.empty()) std::fprintf(stderr, "[statesync] host: no clean boundary in %u frames, publishing anyway:%s\n", s_unclean, busy.c_str());
+                s_unclean = 0;
             }
             std::vector<uint8_t> blob;
             const auto t0 = clock::now();
@@ -5227,11 +5259,7 @@ struct Ps2xRollback
         const uint64_t frame = g_gate.waitFrame;   // read after the sync step: an adopted state moves it
         uint8_t *rdram = g_gate.rdram;
         auto dropEntry = [](RingEntry &e) { ps2xSimSnapFree(e.sim); delete e.fib; };
-        // [desyncdump] with PS2X_NET_DUMPDIR the ring keeps 12 extra frames (the peer's hash for a frame
-        // arrives a few frames after ours), so the divergent frame's RAM is still there to dump -- no
-        // per-frame copies, which cost enough to change the rollback pattern under test.
-        static const bool s_dumpOn = [](){ const char *v = std::getenv("PS2X_NET_DUMPDIR"); return v && v[0]; }();
-        const uint32_t keep = W + (s_dumpOn ? 12u : 0u);
+        const uint32_t keep = W;
         auto captureInto = [&](uint64_t f)
         {
             PS2Runtime::GuestExecutionScope lock(&rt);
@@ -5297,27 +5325,30 @@ struct Ps2xRollback
         // Desync detection on CONFIRMED state only: the ring's oldest entry (frame - W) has every input
         // it depends on known (the stall rule) and was refreshed by any rollback that reached it, so its
         // RAM hash is comparable across the two machines. Every 60 frames (a 32 MB hash is ~10 ms).
+        // [desyncdump] PS2X_NET_DUMPDIR=<dir>: keep a copy of the RAM the last checksum was taken from (one 32 MB
+        // copy per checksum, cheap) and write it when the peer's hash for that frame differs, so the two sides'
+        // dumps can be diffed offline (scratchpad/ramdiff.py).
+        static const char *s_dumpDir = std::getenv("PS2X_NET_DUMPDIR");
+        static std::vector<uint8_t> s_hashedRam; static uint64_t s_hashedFrame = 0; static bool s_dumped = false;
         if (!ring.empty() && (frame % ps2NetCheckEvery()) == 0u && ring.front().frame + keep <= frame)
         {
             if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
+            {
                 ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0u, 0u));
+                if (s_dumpDir && s_dumpDir[0] && !s_dumped) { s_hashedRam.assign(ram, ram + 32u * 1024u * 1024u); s_hashedFrame = ring.front().frame; }
+            }
         }
-        // [desyncdump] PS2X_NET_DUMPDIR=<dir>: when the confirmed hashes first differ, write that frame's RAM
-        // from the (deepened) ring so the two sides' dumps can be diffed offline.
-        static const char *s_dumpDir = std::getenv("PS2X_NET_DUMPDIR");
-        static bool s_dumped = false;
         if (s_dumpDir && s_dumpDir[0] && !s_dumped)
         {
             if (const uint32_t df = ps2NetDesyncFrame())
             {
                 s_dumped = true;
-                const RingEntry *e = nullptr; for (const auto &x : ring) if (x.frame == df) { e = &x; break; }
-                const uint8_t *ram = e ? ps2xSimSnapRam(e->sim) : nullptr;
                 char path[512]; std::snprintf(path, sizeof path, "%s/desync_%u_p%d.bin", s_dumpDir, df, ps2NetLocalPlayer());
-                std::FILE *f = ram ? std::fopen(path, "wb") : nullptr;
-                if (f) { std::fwrite(ram, 1, 32u * 1024u * 1024u, f); std::fclose(f); }
-                std::fprintf(stderr, "[desyncdump] frame %u: %s (ring %llu..%llu)\n", df, f ? path : (e ? "cannot write" : "no longer in the ring"),
-                             ring.empty() ? 0ull : (unsigned long long)ring.front().frame, ring.empty() ? 0ull : (unsigned long long)ring.back().frame);
+                const bool have = df == s_hashedFrame && s_hashedRam.size() == 32u * 1024u * 1024u;
+                std::FILE *f = have ? std::fopen(path, "wb") : nullptr;
+                if (f) { std::fwrite(s_hashedRam.data(), 1, s_hashedRam.size(), f); std::fclose(f); }
+                std::fprintf(stderr, "[desyncdump] frame %u: %s\n", df, f ? path : (have ? "cannot write" : "not the last hashed frame"));
+                s_hashedRam.clear(); s_hashedRam.shrink_to_fit();
             }
         }
     }
