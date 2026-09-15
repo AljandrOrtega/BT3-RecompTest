@@ -1,5 +1,6 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_guestprof.h"
+#include "runtime/ps2_fiber.h"   // [fibers]
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
@@ -1004,6 +1005,21 @@ PS2Runtime::PS2Runtime()
     {
         const char *v = std::getenv("PS2X_SCHED");
         m_schedEnabled = (v && v[0] && v[0] != '0');
+        // [fibers] Only meaningful with the cooperative scheduler: fibers replace HOW a guest
+        // thread waits for the token, not the round-robin policy that decides who gets it.
+        {
+            const char *fv = std::getenv("PS2X_FIBERS");
+            m_fibersEnabled = m_schedEnabled && fv && fv[0] && fv[0] != '0';
+            if (fv && fv[0] && fv[0] != '0' && !m_schedEnabled)
+                std::fprintf(stderr, "[fibers] PS2X_FIBERS ignored: it requires PS2X_SCHED=1\n");
+            if (m_fibersEnabled && !ps2xFiberSupported())
+            {
+                std::fprintf(stderr, "[fibers] no fiber backend on this platform -- staying on threads\n");
+                m_fibersEnabled = false;
+            }
+            if (m_fibersEnabled)
+                std::fprintf(stderr, "[fibers] enabled (scaffolding: guest threads still run as host threads)\n");
+        }
         if (m_schedEnabled)
             std::cerr << "[sched] deterministic cooperative guest scheduler ENABLED" << std::endl;
     }
@@ -3893,6 +3909,55 @@ void PS2Runtime::schedAcquire(int tid, int prio)
         }
     }
     if (schedDbgOn()) std::cerr << "[sched] tid " << tid << " ACQUIRED" << std::endl;
+}
+
+// [fibers] The single place a guest thread may block. Under threads this is the condition_variable
+// wait the call sites used to do inline. Under fibers it must NOT block the host thread -- every
+// guest fiber shares it, including the one the token was just handed to -- so it parks in the
+// scheduler and re-checks the predicate each time it is scheduled.
+// [fibers] The fiber this host thread is currently executing. Null until guest threads are moved
+// onto fibers, which is why schedFiberPark still has a thread-path fallback.
+static thread_local Ps2xFiber *g_curFiber = nullptr;
+
+void PS2Runtime::schedFiberPark()
+{
+    if (m_schedFiber && g_curFiber && g_curFiber != m_schedFiber)
+    {
+        ps2xFiberSwitch(g_curFiber, m_schedFiber);
+        return;
+    }
+    // Scaffolding: no guest fiber is running yet, so there is nothing to switch to. Yield the
+    // host thread rather than spinning, which keeps PS2X_FIBERS=1 harmless instead of hanging.
+    std::this_thread::yield();
+}
+
+bool PS2Runtime::guestWait(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
+                           const std::function<bool()> &pred, int waitPoint,
+                           std::chrono::milliseconds slice)
+{
+    if (pred()) return true;
+    if (!m_fibersEnabled)
+    {
+        while (!pred())
+        {
+            if (isStopRequested()) return false;
+            Ps2xWaitScope w(waitPoint);
+            cv.wait_for(lk, slice, [&] { return pred() || isStopRequested(); });
+        }
+        return true;
+    }
+
+    // Fiber path. The lock must be dropped around the switch: another guest fiber runs on this
+    // very thread and will want it, and holding it across a switch is a self-deadlock rather than
+    // ordinary contention.
+    while (!pred())
+    {
+        if (isStopRequested()) return false;
+        lk.unlock();
+        schedFiberPark();
+        lk.lock();
+    }
+    return true;
 }
 
 void PS2Runtime::schedYield(int tid)

@@ -982,15 +982,17 @@ namespace ps2_syscalls
             info->waitId = 0;
             info->forceRelease = false;
 
-            waitWithGuestExecutionReleasedUntilUnlocked(
+            // [fibers] SleepThread is woken by ANOTHER GUEST THREAD, so under PS2X_FIBERS the waker
+            // is a fiber on this very host thread -- a condition_variable wait here would park the
+            // only thread that could ever deliver the wakeup. waitGuestUntil parks in the scheduler
+            // instead. The predicate only reads state, so re-checking it is free of side effects.
+            waitGuestUntil(
                 runtime,
                 lock,
+                info->cv,
                 [&]()
-                {
-                    Ps2xWaitScope wsleep(WP_THREAD_SLEEP);
-                    info->cv.wait(lock, [&]()
-                                  { return info->wakeupCount > 0 || info->forceRelease.load() || info->terminated.load(); });
-                },
+                { return info->wakeupCount > 0 || info->forceRelease.load() || info->terminated.load(); },
+                WP_THREAD_SLEEP,
                 [&]()
                 {
                     terminated = info->terminated.load();

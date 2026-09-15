@@ -327,19 +327,21 @@ namespace ps2_syscalls
             }
 
             sema->waiters++;
-            waitWithGuestExecutionReleasedUntilUnlocked(
+            // [fibers] A semaphore is signalled by another GUEST thread, so the same reasoning as
+            // SleepThread applies: under PS2X_FIBERS the signaller shares this host thread. The
+            // predicate only TESTS count > 0 -- the decrement happens in finishFn below -- so it is
+            // safe to re-evaluate on every schedule, which the fiber path does.
+            waitGuestUntil(
                 runtime,
                 lock,
+                sema->cv,
                 [&]()
                 {
-                    Ps2xWaitScope wsema(WP_SEMA);
-                    sema->cv.wait(lock, [&]()
-                                  {
-                                      const bool forced = info ? info->forceRelease.load() : false;
-                                      const bool isTerminated = info ? info->terminated.load() : false;
-                                      return sema->count > 0 || sema->deleted || forced || isTerminated;
-                                  });
+                    const bool forced = info ? info->forceRelease.load() : false;
+                    const bool isTerminated = info ? info->terminated.load() : false;
+                    return sema->count > 0 || sema->deleted || forced || isTerminated;
                 },
+                WP_SEMA,
                 [&]()
                 {
                     sema->waiters--;
