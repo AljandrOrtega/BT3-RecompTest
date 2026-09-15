@@ -673,6 +673,7 @@ void ps2NetFrame(uint32_t frame)
 
 // ---- [statesync] ------------------------------------------------------------------------
 bool ps2NetSyncPending() { return g.active && g.connected && g.syncOn && !g.synced; }
+bool ps2NetSyncOn()      { return g.active && g.syncOn; }
 bool ps2NetSyncIsHost()  { return g.listening; }
 void ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path)
 {

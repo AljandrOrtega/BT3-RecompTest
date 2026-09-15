@@ -5231,7 +5231,14 @@ struct Ps2xRollback
         {
             captureInto(frame);                  // corrected state for this frame
             if (frame >= resimTarget) { resimTarget = 0; g_rollbackUnpaced = false; ps2xRenderSkipSet(false); }
-            else return;                         // keep re-simulating
+            else
+            {   // keep re-simulating -- but RENDER the last re-simulated frame: the game pipelines some of
+                // its drawing one frame ahead (skinning / decal buffers, uploads), and a frame that was
+                // skipped leaves those one frame stale on the first frame shown after the rollback (P2's
+                // hands parting from the body once per rollback).
+                if (frame + 1u >= resimTarget) ps2xRenderSkipSet(false);
+                return;
+            }
         }
         bool stall = false;
         uint32_t rbTo = ps2NetRollbackPoll((uint32_t)frame, &stall);
@@ -5267,7 +5274,8 @@ struct Ps2xRollback
                 if (okS && okF)
                 {
                     g_gate.openFrame = g_gate.waitFrame - 1u;   // the boot loop opens it for the restored frame
-                    resimTarget = frame; g_rollbackUnpaced = true; ps2xRenderSkipSet(true);
+                    static const bool s_skip = [](){ const char *v = std::getenv("PS2X_ROLLBACK_RENDERSKIP"); return !(v && v[0] == '0'); }();
+                    resimTarget = frame; g_rollbackUnpaced = true; ps2xRenderSkipSet(s_skip && frame > rbTo + 1u);   // PS2X_ROLLBACK_RENDERSKIP=0: render every re-simulated frame
                     return;
                 }
             }

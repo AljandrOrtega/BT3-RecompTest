@@ -43,6 +43,7 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall);
 // its frame-boundary state (a file for now: PS2X_NET_SYNCFILE, visible to both), the joiner adopts it at
 // a structurally comparable boundary and acknowledges; inputs are exchanged from that frame on.
 bool     ps2NetSyncPending();                                   // connected, sync on, state not yet adopted
+bool     ps2NetSyncOn();                                        // sync enabled for this session (netjump must stay out: it writes state on one side)
 bool     ps2NetSyncIsHost();
 void     ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path);   // host: announce the blob
 bool     ps2NetSyncWaitDone(uint32_t timeoutMs);                 // host: pump until the joiner's DONE; sets the frame base

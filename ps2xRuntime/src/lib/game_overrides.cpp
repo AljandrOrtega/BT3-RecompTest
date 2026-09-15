@@ -5007,6 +5007,13 @@ namespace
         // versus mode, because the duel object that holds it is freed before character select.
         const int s_mode = s_env > 0 ? s_env : (ps2NetAutoJump() ? 1 : 0);
         if (s_mode <= 0 || !rdram || !ps2NetActive() || !ps2NetPeerConnected()) return;
+        if (ps2NetSyncOn())
+        {   // [statesync] the jump pokes guest state on ONE machine (menuGoto runs func_10D878 out of band);
+            // with a shared state that is a desync by construction. Navigate on the host; the joiner follows.
+            static bool s_said = false;
+            if (!s_said) { s_said = true; std::fprintf(stderr, "[netjump] disabled: state sync is on -- navigate the menus on the host\n"); }
+            return;
+        }
         // Reset per connection, so disconnecting and reconnecting jumps again instead of
         // remembering that it already ran once this process.
         static uint32_t s_session = 0;
