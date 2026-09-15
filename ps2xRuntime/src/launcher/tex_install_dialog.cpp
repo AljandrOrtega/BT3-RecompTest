@@ -5,6 +5,7 @@
 #include "tex_pack.h"
 
 #include <QCloseEvent>
+#include <QDesktopServices>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -19,6 +20,7 @@
 #include <QPushButton>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace
@@ -228,7 +230,27 @@ void TexInstallDialog::onDownloadFinished()
 
     if (err != QNetworkReply::NoError)
     {
-        fail(QStringLiteral("Download failed: %1").arg(errStr));
+        // The file host (pixeldrain) only allows direct API downloads
+        // ("hotlinking") for paid accounts and answers HTTP 403 otherwise, so a
+        // plain "Download failed" dead-ends the user. Offer the browser page
+        // instead: download there, then install with "Browse…".
+        m_browse->setEnabled(true);
+        m_download->setEnabled(true);
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Warning);
+        box.setWindowTitle(QStringLiteral("Install texture pack"));
+        box.setText(QStringLiteral("Direct download is not available."));
+        box.setInformativeText(QStringLiteral(
+            "The file host does not allow direct downloads for this launcher. "
+            "Open the download page in your browser, save %1, then use \"Browse…\" "
+            "to install the file.\n\nDetails: %2")
+            .arg(QString::fromLatin1(texpack::kFileName), errStr));
+        QPushButton *openBtn = box.addButton(QStringLiteral("Open download page"), QMessageBox::AcceptRole);
+        box.addButton(QStringLiteral("Close"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == openBtn)
+            QDesktopServices::openUrl(QUrl(QString::fromLatin1(texpack::kPageUrl)));
+        setStatus(QStringLiteral("Direct download unavailable — open the page in your browser, then use Browse…"));
         return;
     }
 
