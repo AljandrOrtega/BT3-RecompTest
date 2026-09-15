@@ -249,6 +249,15 @@ namespace
 // controller's vblank pacing replaces the pacing the busy report provided (jobs copy their data at
 // enqueue, so buffer reuse after "done" is safe, as [syncrelax] already relies on).
 extern "C" bool ps2xFrameStepOn();
+// [rollback] RENDER SKIP for re-simulation: a rolled-back frame is never displayed, so its GIF and
+// VIF1 work (VU1 programs, display lists, GS packets) is dropped at the DMA level while every
+// completion side effect the guest can observe (CHCR.STR, D_STAT, the DMAC interrupt) still
+// happens. VIF0 is NOT skipped: it feeds VU0, which the game's logic uses. Whether any RAM the
+// game reads depends on the skipped rendering (VRAM readbacks) is exactly what the self-test's
+// hash answers when this is on during the re-run.
+std::atomic<bool> g_ps2xRenderSkip{false};
+extern "C" void ps2xRenderSkipSet(bool on) { g_ps2xRenderSkip.store(on, std::memory_order_relaxed); }
+extern "C" bool ps2xRenderSkipOn() { return g_ps2xRenderSkip.load(std::memory_order_relaxed); }
 namespace
 {
     inline uint64_t steadyClockNs()
@@ -2636,6 +2645,7 @@ void PS2Memory::processPendingTransfers()
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
+        if (g_ps2xRenderSkip.load(std::memory_order_relaxed)) continue;   // [rollback] re-simulation: never seen
         if (asyncKickEnabled())
         {
             // Hand the transfer to the kick worker. chainData is already a self-contained
@@ -2837,6 +2847,7 @@ void PS2Memory::processPendingTransfers()
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
     {
+        if (g_ps2xRenderSkip.load(std::memory_order_relaxed)) continue;   // [rollback] re-simulation: never seen
         if (asyncKickEnabled())
         {
             if (!p.chainData.empty())

@@ -4211,6 +4211,7 @@ extern "C" void ps2xVirtualClockEnable();                                  // [r
 extern "C" void ps2xVirtualClockAdvance(uint64_t ns);
 extern "C" bool ps2xVirtualClockOn();
 extern "C" uint64_t ps2xVirtualClockGet();
+extern "C" void ps2xRenderSkipSet(bool on);   // [rollback] ps2_memory.cpp: drop GIF/VIF1 work during a re-run
 void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry)
 {
     m_schedFiber = ps2xFiberAdoptCurrent();
@@ -4758,6 +4759,8 @@ struct Ps2xRollback
             g_gate.openFrame = g_gate.waitFrame - 1u;
             s_phase = RunB; s_tB = std::chrono::steady_clock::now();
             g_rollbackUnpaced = true;   // re-simulation: vblanks as fast as the guest consumes them
+            { static const bool s_skip = [](){ const char *v = std::getenv("PS2X_ROLLBACK_RENDERSKIP"); return !(v && v[0] == '0'); }();
+              ps2xRenderSkipSet(s_skip); }   // PS2X_ROLLBACK_RENDERSKIP=0 keeps rendering in the re-run (A/B)
             return;
         }
         if (s_phase == RunB)
@@ -4798,6 +4801,7 @@ struct Ps2xRollback
             s_ramA.clear(); s_ramA.shrink_to_fit();
             ps2xSimSnapFree(s_sim); s_sim = nullptr; delete s_fib; s_fib = nullptr;
             g_rollbackUnpaced = false;
+            ps2xRenderSkipSet(false);
             s_phase = Idle; s_next = frame + s_period; ++s_n;
         }
     }
