@@ -64,7 +64,11 @@ struct NetPkt
     uint32_t     baseFrame;     // frame of inputs[0]
     uint8_t      battleType;    // host's choice: 0 Single, 1 Team, 2 DP  (host is authoritative)
     uint8_t      timeLimit;     // host's choice: the Battle Settings time-limit index (3 = default)
-    uint8_t      pad0[2];
+    // DP Battle's point budget: 0 = 10 DP, 1 = 15 DP, 2 = 20 DP. Only meaningful when
+    // battleType is 2. Carved out of pad0, so the wire format and version are unchanged and a
+    // peer that predates this field sends 0 -- which is a valid budget, not garbage.
+    uint8_t      dpLimit;
+    uint8_t      pad0[1];
     uint32_t     checkFrame;    // frame the checksum belongs to (0 = none)
     uint64_t     checksum;      // gameplay-state hash, for desync detection
     Ps2xNetInput inputs[kMaxInputs];
@@ -108,7 +112,8 @@ struct Net
     // different fights and desync at once. The HOST is authoritative: it stamps its choice into
     // every packet and the joiner adopts it.
     std::atomic<int> battleType{0};
-    std::atomic<int> timeLimit{3};   // 3 is the game's default                             // bumped per connect, so netjump can reset
+    std::atomic<int> timeLimit{3};   // 3 is the game's default
+    std::atomic<int> dpLimit{0};     // 0 = 10 DP                             // bumped per connect, so netjump can reset
 };
 
 Net g;
@@ -153,6 +158,7 @@ void sendOurs(uint32_t frame)
     p.player = static_cast<uint8_t>(g.localPlayer);
     p.battleType = static_cast<uint8_t>(g.battleType.load(std::memory_order_relaxed));
     p.timeLimit  = static_cast<uint8_t>(g.timeLimit.load(std::memory_order_relaxed));
+    p.dpLimit    = static_cast<uint8_t>(g.dpLimit.load(std::memory_order_relaxed));
     p.checkFrame = g.checkFrame; p.checksum = g.checkValue;
     const uint32_t base = frame > (kRedundancy - 1u) ? frame - (kRedundancy - 1u) : 0u;
     p.baseFrame = base;
@@ -192,6 +198,7 @@ void pump()
         {
             g.battleType.store(p.battleType, std::memory_order_relaxed);
             g.timeLimit.store(p.timeLimit, std::memory_order_relaxed);
+            g.dpLimit.store(p.dpLimit, std::memory_order_relaxed);
         }
         if (!g.peerKnown)
         {   // listener learns the peer address from the first valid packet
@@ -299,6 +306,8 @@ void ps2NetSetAutoJump(bool on) { g_autoJump.store(on, std::memory_order_relaxed
 void ps2NetSetDelay(int frames)  { if (frames >= 0 && frames <= 20) g.delay = (uint32_t)frames; }
 void ps2NetSetBattleType(int t)  { if (t >= 0 && t <= 2) g.battleType.store(t, std::memory_order_relaxed); }
 int  ps2NetBattleType()          { return g.battleType.load(std::memory_order_relaxed); }
+void ps2NetSetDpLimit(int t)     { if (t >= 0 && t <= 2) g.dpLimit.store(t, std::memory_order_relaxed); }
+int  ps2NetDpLimit()             { return g.dpLimit.load(std::memory_order_relaxed); }
 // Battle Settings time limit: 0 = 60 s, 1 = 90 s, 2 = 180 s, 3 = 240 s (default), 4 = no limit
 void ps2NetSetTimeLimit(int t)   { if (t >= 0 && t <= 4) g.timeLimit.store(t, std::memory_order_relaxed); }
 int  ps2NetTimeLimit()           { return g.timeLimit.load(std::memory_order_relaxed); }
@@ -378,6 +387,7 @@ static void sendHello()
     p.player = static_cast<uint8_t>(g.localPlayer);
     p.battleType = static_cast<uint8_t>(g.battleType.load(std::memory_order_relaxed));
     p.timeLimit  = static_cast<uint8_t>(g.timeLimit.load(std::memory_order_relaxed));
+    p.dpLimit    = static_cast<uint8_t>(g.dpLimit.load(std::memory_order_relaxed));
     p.count = 0u; p.baseFrame = 0u;
     const size_t bytes = sizeof(NetPkt) - sizeof(Ps2xNetInput) * kMaxInputs;
     ::sendto(g.sock, reinterpret_cast<const char *>(&p), static_cast<int>(bytes), 0,

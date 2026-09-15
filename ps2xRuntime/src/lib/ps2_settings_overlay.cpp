@@ -2052,8 +2052,12 @@ void PS2SettingsOverlay::drawNetplayTab()
           const int bt = ps2NetBattleType();
           const char *tn[] = {"60 s","90 s","180 s","240 s","no limit"};
           const int tl = ps2NetTimeLimit();
-          ImGui::Text("Game mode: %s   |   time limit: %s",
-                      (bt >= 0 && bt < 3) ? bn[bt] : "?", (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
+          const char *dn[] = {"10 DP","15 DP","20 DP"};
+          const int dp = ps2NetDpLimit();
+          ImGui::Text("Game mode: %s%s%s   |   time limit: %s",
+                      (bt >= 0 && bt < 3) ? bn[bt] : "?",
+                      bt == 2 ? " / " : "", (bt == 2 && dp >= 0 && dp < 3) ? dn[dp] : "",
+                      (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
         if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
         ImGui::Separator();
         if (ImGui::Button("Disconnect"))
@@ -2069,6 +2073,7 @@ void PS2SettingsOverlay::drawNetplayTab()
     static int  s_delay = 2;
     static int  s_battle = 0;
     static int  s_time = 3;
+    static int  s_dp = 0;          // DP Battle budget: 0 = 10 DP, 1 = 15, 2 = 20
     static bool s_jump = true;
     ImGui::Checkbox("Go to character select once connected", &s_jump);
     ImGui::TextDisabled("Both sides jump together; the menus are hidden while it happens.");
@@ -2079,6 +2084,14 @@ void PS2SettingsOverlay::drawNetplayTab()
     ImGui::InputInt("Port", &s_port);
     const char *kBattle[] = { "Single Battle", "Team Battle", "DP Battle" };
     ImGui::Combo("Game mode", &s_battle, kBattle, 3);
+    // DP Battle's point budget is a SEPARATE row of the versus menu (duelObj+0x118, committed to
+    // stateObj+0x630 = RetroAchievements' 0x6af7b0). Selecting DP without it left the screen
+    // playing like Team Battle: the right type with no budget behind it.
+    if (s_battle == 2)
+    {
+        const char *kDp[] = { "10 DP", "15 DP", "20 DP" };
+        ImGui::Combo("DP limit", &s_dp, kDp, 3);
+    }
     // Battle Settings time-limit indices, confirmed in game:
     //   0 = 60 s, 1 = 90 s, 2 = 180 s, 3 = 240 s (default), 4 = no limit
     const char *kTime[] = { "60 seconds", "90 seconds", "180 seconds", "240 seconds (default)", "No limit" };
@@ -2091,7 +2104,8 @@ void PS2SettingsOverlay::drawNetplayTab()
 
     if (ImGui::Button("Host (you are Player 1)"))
     {
-        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle); ps2NetSetTimeLimit(s_time);
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle);
+        ps2NetSetTimeLimit(s_time); ps2NetSetDpLimit(s_dp);
         ps2NetHost(s_port, 1);
     }
     ImGui::SameLine();

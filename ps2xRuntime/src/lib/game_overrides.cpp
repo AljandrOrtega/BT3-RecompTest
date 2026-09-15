@@ -4488,6 +4488,12 @@ namespace
             // SAME match -- they each run this hook independently, so disagreeing here would set
             // up two different fights.
             wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
+            // +0x118 is DP Battle's point budget (0 = 10 DP, 1 = 15, 2 = 20), the row of the
+            // versus menu we never visit. Measured with [matchwatch]: picking 20 DP moved it to 2
+            // and confirm committed it to stateObj+0x630, which is RetroAchievements' 0x6af7b0.
+            // Leaving it at the default is why DP came up playing like Team -- the screen had a
+            // DP type with no budget behind it.
+            wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
             // +0x13c is the Battle Settings time limit, found by dumping RAM at four settings and
             // keeping the only pointer-reachable value that tracked 3 -> 2 -> 1 -> 0 in order.
             wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
@@ -4589,6 +4595,7 @@ namespace
             {
                 wr32(rdram, so + 0x620u, 1u);                  // 1P VS 2P
                 wr32(rdram, so + 0x624u, (uint32_t)ps2NetBattleType());
+                wr32(rdram, so + 0x630u, (uint32_t)ps2NetDpLimit());
                 static std::atomic<uint32_t> s_n{0};
                 if (s_n.fetch_add(1u) < 5u)
                     std::fprintf(stderr, "[netjump] re-asserted 1P VS 2P (something reset it)\n");
@@ -4633,8 +4640,9 @@ namespace
             // every packet) instead of forcing Single -- this write is what the versus menu would
             // have made had the player navigated it, and the gate below reads it back out.
             wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
-            std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u\n",
-                         duelObj, (unsigned)ps2NetBattleType());
+            wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
+            std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u, dp -> %u\n",
+                         duelObj, (unsigned)ps2NetBattleType(), (unsigned)ps2NetDpLimit());
             // Advance with a PLAIN WRITE, not bt3MenuGoto: that helper needs the MAIN-MENU object
             // [0x3b0e80], which is freed the moment we leave the main menu, so it returned false
             // every frame here and the sequence span forever re-writing the mode.
@@ -4683,12 +4691,16 @@ namespace
             // heap flags instead.
             wr32(rdram, stateObj + 0x620u, 1u);   // 1P VS 2P
             wr32(rdram, stateObj + 0x624u, (uint32_t)ps2NetBattleType());
+            wr32(rdram, stateObj + 0x630u, (uint32_t)ps2NetDpLimit());
             g_netJumpHold.store(0, std::memory_order_relaxed);   // character select is up: show it
             static const char *kType[] = { "Single", "Team", "DP" };
             const unsigned bt = (unsigned)ps2NetBattleType();
-            std::fprintf(stderr, "[netjump] settled at state 0x%02x | mode=%u type=%u (1P VS 2P, %s Battle)\n",
+            static const char *kDp[] = { "10 DP", "15 DP", "20 DP" };
+            const unsigned dp = (unsigned)ps2NetDpLimit();
+            std::fprintf(stderr, "[netjump] settled at state 0x%02x | mode=%u type=%u dp=%u (1P VS 2P, %s Battle%s%s)\n",
                          cur, rd32(rdram, stateObj + 0x620u), rd32(rdram, stateObj + 0x624u),
-                         bt < 3 ? kType[bt] : "?");
+                         rd32(rdram, stateObj + 0x630u), bt < 3 ? kType[bt] : "?",
+                         bt == 2 ? ", " : "", (bt == 2 && dp < 3) ? kDp[dp] : "");
             s_step = 3;
         }
     }
