@@ -1825,26 +1825,34 @@ namespace
             return;
         // [rollback] stepped mode: a fixed budget of samples per vsync tick, whatever the device holds
         const bool stepped = ps2xFrameStepOn();
-        uint64_t budget = 0;
+        uint64_t budget = 0;   // samples this call may mix (stepped mode)
         if (stepped)
         {
+            // The budget is kept in 1/60-sample units (g_seTickCarry) so nothing is ever lost: one
+            // vblank is 367.5 samples and a chunk is 512, so at 60 fps a budget that was thrown away
+            // whenever it fell short of a chunk never mixed anything (the logo chime, every menu
+            // sound), and at 30 fps it mixed one chunk per two ticks and dropped the rest (effects
+            // at ~70 % rate: crackly voices). Unspent whole samples go back into the carry below.
             const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
             if (g_seTickBase == 0 || tick < g_seTickBase) g_seTickBase = tick;
             const uint64_t ticks = tick - g_seTickBase;
             g_seTickBase = tick;
-            budget = g_seTickCarry + ticks * kSeMixRate / 60u;
-            g_seTickCarry = ticks * kSeMixRate % 60u;   // keep the sub-sample remainder (in 1/60 units)
+            const uint64_t acc60 = g_seTickCarry + ticks * kSeMixRate;
+            budget = acc60 / 60u; g_seTickCarry = acc60 % 60u;
         }
         for (int guard = 0; guard < 64; ++guard)
         {
             {
                 std::lock_guard<std::mutex> lk(g_seVoiceM);
                 if (g_seVoices.empty())
+                {
+                    if (stepped) g_seTickCarry = 0u;   // nothing to play: do not bank time for a later burst
                     return;
+                }
             }
             if (stepped)
             {
-                if (budget < kSeChunk) return;
+                if (budget < kSeChunk) { g_seTickCarry += budget * 60u; return; }   // keep the remainder for the next call
                 budget -= kSeChunk;
             }
             else
