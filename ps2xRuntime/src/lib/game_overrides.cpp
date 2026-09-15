@@ -4348,7 +4348,64 @@ namespace
     // those threads are parked in their own nesting, so this is sound only while the cooperative
     // scheduler (PS2X_SCHED=1) keeps them out of the way. Widen it once v1 is proven.
     struct SaveHdr { char magic[8]; uint32_t version, ramSize, spSize, ctxSize; uint64_t frame, rand64;
-                     uint32_t randCalls, iopSize, vu0Size, vu1Size, vramSize, pad; };
+                     uint32_t randCalls, iopSize, vu0Size, vu1Size, vramSize;
+                     uint32_t vu0CodeSize, vu1CodeSize, vuStateSize, sinkCount, gsRegCount; };
+    // GS PRIVILEGED registers (PMODE / DISPFB1,2 / DISPLAY1,2 / ...). I first left these out as
+    // "picture only, cannot cause a desync" -- true about desync, wrong about being optional: they
+    // are what SELECT the framebuffer being shown, so a restored instance displayed whatever its
+    // own boot had left configured and came up BLACK. The guest does not re-emit them, because it
+    // resumes mid-execution long after it set the display up.
+    // GSRegisters is 19 uint64s (there is a static_assert on that) but holds `csr` as an atomic,
+    // so it is packed field by field rather than copied.
+    struct GsRegSer { uint64_t v[19]; };
+    static void gsRegPack(const GSRegisters &g, GsRegSer &o)
+    {
+        o.v[0]=g.pmode;   o.v[1]=g.smode1;  o.v[2]=g.smode2;   o.v[3]=g.srfsh;
+        o.v[4]=g.synch1;  o.v[5]=g.synch2;  o.v[6]=g.syncv;
+        o.v[7]=g.dispfb1; o.v[8]=g.display1; o.v[9]=g.dispfb2; o.v[10]=g.display2;
+        o.v[11]=g.extbuf; o.v[12]=g.extdata; o.v[13]=g.extwrite; o.v[14]=g.bgcolor;
+        o.v[15]=g.csr.load(std::memory_order_relaxed);
+        o.v[16]=g.imr;    o.v[17]=g.busdir; o.v[18]=g.siglblid;
+    }
+    static void gsRegUnpack(const GsRegSer &o, GSRegisters &g)
+    {
+        g.pmode=o.v[0];   g.smode1=o.v[1];  g.smode2=o.v[2];   g.srfsh=o.v[3];
+        g.synch1=o.v[4];  g.synch2=o.v[5];  g.syncv=o.v[6];
+        g.dispfb1=o.v[7]; g.display1=o.v[8]; g.dispfb2=o.v[9]; g.display2=o.v[10];
+        g.extbuf=o.v[11]; g.extdata=o.v[12]; g.extwrite=o.v[13]; g.bgcolor=o.v[14];
+        // csr (o.v[15]) is deliberately NOT restored: the vsync worker toggles its FIELD bit and
+        // the GIF sets SIGNAL/FINISH from other threads, so a stale value would either clobber the
+        // live field parity or re-raise an interrupt flag that has already been serviced. It is
+        // saved for diagnostics only.
+        g.imr=o.v[16];    g.busdir=o.v[17]; g.siglblid=o.v[18];
+    }
+    // Peek just the frame number a snapshot was taken at, without reading the 38 MB body.
+    static uint64_t bt3PeekStateFrame(const char *path)
+    {
+        std::FILE *f = std::fopen(path, "rb");
+        if (!f) return 0u;
+        SaveHdr h{};
+        const bool ok = std::fread(&h, sizeof h, 1, f) == 1 && std::memcmp(h.magic, "BT3STATE", 8) == 0;
+        std::fclose(f);
+        return ok ? h.frame : 0u;
+    }
+    // v3 adds the state that lives on the HOST side of the emulation rather than in guest memory,
+    // which is what v2 still inherited from the loading instance's own boot:
+    //   * VU0/VU1 MICRO memory -- the uploaded microprograms. Guest RAM holds the source, but the
+    //     copy VU1 actually executes is in ps2xRuntime's own buffer.
+    //   * The VU interpreters' registers (vf/vi/ACC/Q and the Q pipeline). m_vu0/m_vu1 are
+    //     PS2Runtime members, so these persist between kicks and are genuinely live state.
+    //   * The IOP sound sinks' stream bookkeeping -- measured as the ONLY bytes that differ
+    //     between two instances at frame 1 ([[bt3-determinism]]).
+    // NOT yet covered: GS register state (VRAM is saved, so this is picture-only), and the other
+    // guest threads' host stacks -- sound only while PS2X_SCHED=1 parks them.
+    //
+    // The sinks cannot be memcpy'd: IopSink holds steady_clock::time_points, whose epoch is
+    // per-process, so a snapshot moved to another machine (or reloaded in a later run) would carry
+    // a meaningless origin. Serialise the byte counters and RE-ANCHOR the clocks to "now" on load,
+    // which is what the pacing code would do for a stream that has just started.
+    struct SinkSer { uint32_t key, streamId; uint64_t returnedBytes, heldBytes, wallBaseBytes,
+                     frameBase, frameBaseBytes; uint8_t wallClock, ringFullIdle, frameClock, pad; };
     static bool bt3SaveState(const char *path, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::FILE *f = std::fopen(path, "wb");
@@ -4359,10 +4416,28 @@ namespace
         // and diverged one frame after the load, because the loading instance kept its OWN sound
         // (IOP), VU and VRAM state from its own boot and those write back into EE RAM.
         PS2Memory &mem = runtime->memory();
-        h.version = 2u; h.ramSize = PS2_RAM_SIZE; h.spSize = sp ? PS2_SCRATCHPAD_SIZE : 0u;
+        // Collect the sinks BEFORE the header goes out: the count belongs in it, and the lock
+        // should not be held across file writes.
+        std::vector<SinkSer> sinks;
+        {
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            sinks.reserve(g_iopSinks.size());
+            for (const auto &kv : g_iopSinks)
+            {
+                const IopSink &v = kv.second;
+                sinks.push_back(SinkSer{ kv.first, v.streamId, v.returnedBytes, v.heldBytes,
+                                         v.wallBaseBytes, v.frameBase, v.frameBaseBytes,
+                                         (uint8_t)v.wallClock, (uint8_t)v.ringFullIdle,
+                                         (uint8_t)v.frameClock, 0u });
+            }
+        }
+        h.version = 3u; h.ramSize = PS2_RAM_SIZE; h.spSize = sp ? PS2_SCRATCHPAD_SIZE : 0u;
         h.ctxSize = (uint32_t)sizeof(R5900Context);
         h.iopSize = 2u * 1024u * 1024u; h.vu0Size = PS2_VU0_DATA_SIZE;
         h.vu1Size = PS2_VU1_DATA_SIZE;   h.vramSize = (uint32_t)PS2_GS_VRAM_SIZE;
+        h.vu0CodeSize = PS2_VU0_CODE_SIZE; h.vu1CodeSize = PS2_VU1_CODE_SIZE;
+        h.vuStateSize = (uint32_t)sizeof(VU1State); h.sinkCount = (uint32_t)sinks.size();
+        h.gsRegCount = 19u;
         h.frame = g_bt3FrameCount.load(std::memory_order_relaxed);
         h.rand64 = ps2_stubs::ps2RandState(); h.randCalls = ps2_stubs::ps2RandCallCount();
         std::fwrite(&h, sizeof h, 1, f);
@@ -4373,10 +4448,18 @@ namespace
         std::fwrite(mem.getVU0Data(), 1, h.vu0Size,  f);
         std::fwrite(mem.getVU1Data(), 1, h.vu1Size,  f);
         std::fwrite(mem.getGSVRAM(),  1, h.vramSize, f);
+        std::fwrite(mem.getVU0Code(), 1, h.vu0CodeSize, f);
+        std::fwrite(mem.getVU1Code(), 1, h.vu1CodeSize, f);
+        { const VU1State v0 = runtime->vu0().state(); std::fwrite(&v0, sizeof v0, 1, f); }
+        { const VU1State v1 = runtime->vu1().state(); std::fwrite(&v1, sizeof v1, 1, f); }
+        if (!sinks.empty()) std::fwrite(sinks.data(), sizeof(SinkSer), sinks.size(), f);
+        { GsRegSer gr{}; gsRegPack(mem.gs(), gr); std::fwrite(&gr, sizeof gr, 1, f); }
         std::fclose(f);
-        std::fprintf(stderr, "[savestate] saved frame %llu -> %s (%.1f MB: ee+sp+ctx+iop+vu+vram)\n",
+        std::fprintf(stderr, "[savestate] saved frame %llu -> %s (%.1f MB: ee+sp+ctx+iop+vu+vram"
+                     "+vucode+vustate+%u sinks)\n",
                      (unsigned long long)h.frame, path,
-                     (PS2_RAM_SIZE + h.spSize + h.ctxSize + h.iopSize + h.vu0Size + h.vu1Size + h.vramSize) / 1048576.0);
+                     (PS2_RAM_SIZE + h.spSize + h.ctxSize + h.iopSize + h.vu0Size + h.vu1Size
+                      + h.vramSize + h.vu0CodeSize + h.vu1CodeSize) / 1048576.0, h.sinkCount);
         return true;
     }
     static bool bt3LoadState(const char *path, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -4385,7 +4468,7 @@ namespace
         if (!f) { std::fprintf(stderr, "[savestate] cannot read %s\n", path); return false; }
         SaveHdr h{};
         if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "BT3STATE", 8) != 0 ||
-            h.version != 2u || h.ramSize != PS2_RAM_SIZE || h.ctxSize != sizeof(R5900Context))
+            h.version != 3u || h.ramSize != PS2_RAM_SIZE || h.ctxSize != sizeof(R5900Context))
         { std::fprintf(stderr, "[savestate] %s is not a matching snapshot\n", path); std::fclose(f); return false; }
         if (std::fread(rdram, 1, PS2_RAM_SIZE, f) != PS2_RAM_SIZE) { std::fclose(f); return false; }
         if (h.spSize)
@@ -4406,11 +4489,48 @@ namespace
             if (h.vu0Size  == PS2_VU0_DATA_SIZE)    std::fread(mem.getVU0Data(), 1, h.vu0Size,  f);
             if (h.vu1Size  == PS2_VU1_DATA_SIZE)    std::fread(mem.getVU1Data(), 1, h.vu1Size,  f);
             if (h.vramSize == PS2_GS_VRAM_SIZE)     std::fread(mem.getGSVRAM(),  1, h.vramSize, f);
+            if (h.vu0CodeSize == PS2_VU0_CODE_SIZE) std::fread(mem.getVU0Code(), 1, h.vu0CodeSize, f);
+            if (h.vu1CodeSize == PS2_VU1_CODE_SIZE) std::fread(mem.getVU1Code(), 1, h.vu1CodeSize, f);
+            if (h.vuStateSize == sizeof(VU1State))
+            {
+                VU1State v{};
+                if (std::fread(&v, sizeof v, 1, f) == 1) runtime->vu0().state() = v;
+                if (std::fread(&v, sizeof v, 1, f) == 1) runtime->vu1().state() = v;
+            }
+            else std::fseek(f, (long)(2u * h.vuStateSize), SEEK_CUR);
+        }
+        if (h.sinkCount)
+        {
+            std::vector<SinkSer> sinks(h.sinkCount);
+            if (std::fread(sinks.data(), sizeof(SinkSer), h.sinkCount, f) == h.sinkCount)
+            {
+                // Re-anchor the clocks: the saved epoch is meaningless in this process, and a
+                // stream resuming from restored byte counts is exactly a stream that has just
+                // started. frameBase is a GUEST frame number, so it transfers as-is.
+                const auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lk(g_iopSinkM);
+                for (const SinkSer &ss : sinks)
+                {
+                    IopSink &d = g_iopSinks[ss.key];
+                    d.streamId = ss.streamId; d.returnedBytes = ss.returnedBytes;
+                    d.heldBytes = ss.heldBytes; d.wallBaseBytes = ss.wallBaseBytes;
+                    d.frameBase = ss.frameBase; d.frameBaseBytes = ss.frameBaseBytes;
+                    d.wallClock = ss.wallClock != 0; d.ringFullIdle = ss.ringFullIdle != 0;
+                    d.frameClock = ss.frameClock != 0;
+                    d.wallBase = now; d.ringFullSince = now;
+                }
+            }
+        }
+        if (h.gsRegCount == 19u)
+        {
+            GsRegSer gr{};
+            if (std::fread(&gr, sizeof gr, 1, f) == 1) gsRegUnpack(gr, runtime->memory().gs());
         }
         std::fclose(f);
         g_bt3FrameCount.store(h.frame, std::memory_order_relaxed);
         ps2_stubs::ps2RandRestore(h.rand64, h.randCalls);
-        std::fprintf(stderr, "[savestate] restored frame %llu from %s\n", (unsigned long long)h.frame, path);
+        std::fprintf(stderr, "[savestate] restored frame %llu from %s (v%u, %u sinks)\n",
+                     (unsigned long long)h.frame, path, h.version, h.sinkCount);
         return true;
     }
 
@@ -4938,7 +5058,21 @@ namespace
             static const char *s_save = std::getenv("PS2X_SAVESTATE");
             static const char *s_load = std::getenv("PS2X_LOADSTATE");
             static bool s_loaded = false, s_saved = false;
-            if (s_load && s_load[0] && !s_loaded) { s_loaded = true; bt3LoadState(s_load, rdram, ctx, runtime); }
+            // Do NOT load at the first hook we happen to reach. The host C++ stack MIRRORS the
+            // guest call chain (see the note on bt3SaveState), so a snapshot taken deep in the
+            // title loop must be restored at a structurally comparable point -- dropping frame 900
+            // into a process still nested in boot leaves the stack describing a call chain that no
+            // longer matches guest memory. Default: wait until THIS instance's own frame counter
+            // reaches the frame the snapshot was taken at, which both instances arrive at by the
+            // same boot path. PS2X_LOADSTATE_AT=<frame> overrides (0 = the old load-immediately).
+            if (s_load && s_load[0] && !s_loaded)
+            {
+                static const long s_at = [](){ const char *v = std::getenv("PS2X_LOADSTATE_AT");
+                                               return (v && v[0]) ? std::atol(v) : -1L; }();
+                static const uint64_t s_want = (s_at >= 0) ? (uint64_t)s_at : bt3PeekStateFrame(s_load);
+                if (g_bt3FrameCount.load(std::memory_order_relaxed) >= s_want)
+                { s_loaded = true; bt3LoadState(s_load, rdram, ctx, runtime); }
+            }
             if (s_save && s_save[0] && !s_saved)
             {
                 const char *c = std::strchr(s_save, ':');
