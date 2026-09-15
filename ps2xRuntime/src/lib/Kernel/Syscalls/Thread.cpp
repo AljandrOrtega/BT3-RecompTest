@@ -1449,10 +1449,16 @@ namespace
                         std::unordered_map<uint32_t, RpcServerState> rpcServers; std::unordered_map<uint32_t, RpcClientState> rpcClients;
                         uint64_t rpcSeq = 0; bool rpcInit = false; uint32_t rpcNextId = 1, rpcPacket = 0, rpcServer = 0, rpcQueue = 0;
                         void *sif = nullptr;
+                        void *mc = nullptr;    // [statesync] Kernel/Stubs/MemoryCard.cpp
                         ~KernelSnap(); };
     extern "C" void ps2xSifStateFree(void *);
-    KernelSnap::~KernelSnap() { if (sif) ps2xSifStateFree(sif); }
+    extern "C" void ps2xMcStateFree(void *);
+    KernelSnap::~KernelSnap() { if (sif) ps2xSifStateFree(sif); if (mc) ps2xMcStateFree(mc); }
 }
+extern "C" void *ps2xMcStateCapture();
+extern "C" bool ps2xMcStateRestore(void *);
+extern "C" bool ps2xMcStateSerialize(const void *, std::vector<uint8_t> &);
+extern "C" void *ps2xMcStateDeserialize(const uint8_t *, size_t, size_t *);
 extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr);
 extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr);
 extern "C" void *ps2xSifStateCapture();
@@ -1467,6 +1473,7 @@ extern "C" void *ps2xKernelStateCapture()
         s->rpcServer = g_rpc_server_index; s->rpcQueue = g_rpc_active_queue;
     }
     s->sif = ps2xSifStateCapture();
+    s->mc = ps2xMcStateCapture();
     {
         std::lock_guard<std::mutex> lk(g_thread_map_mutex);
         for (auto &kv : g_threads)
@@ -1564,6 +1571,7 @@ extern "C" bool ps2xKernelStateRestore(void *h)
         g_rpc_server_index = s->rpcServer; g_rpc_active_queue = s->rpcQueue;
     }
     if (s->sif && !ps2xSifStateRestore(s->sif)) return false;
+    if (s->mc && !ps2xMcStateRestore(s->mc)) return false;
     return true;
 }
 extern "C" void ps2xKernelStateFree(void *h) { delete static_cast<KernelSnap *>(h); }
@@ -1581,6 +1589,8 @@ extern "C" bool ps2xKernelStateSerialize(const void *h, std::vector<uint8_t> &ou
     w.u64(s->rpcSeq); w.u8(s->rpcInit); w.u32(s->rpcNextId); w.u32(s->rpcPacket); w.u32(s->rpcServer); w.u32(s->rpcQueue);
     w.u8(s->sif != nullptr);
     if (s->sif && !ps2xSifStateSerialize(s->sif, out)) return false;
+    w.u8(s->mc != nullptr);
+    if (s->mc && !ps2xMcStateSerialize(s->mc, out)) return false;
     return true;
 }
 extern "C" void *ps2xKernelStateDeserialize(const uint8_t *data, size_t n, size_t *used)
@@ -1602,6 +1612,15 @@ extern "C" void *ps2xKernelStateDeserialize(const uint8_t *data, size_t n, size_
         if (!s->sif) { delete s; return nullptr; }
         r.p += sub;
     }
+    const bool hasMc = r.u8() != 0;
+    if (hasMc && r.ok)
+    {
+        size_t sub = 0;
+        s->mc = ps2xMcStateDeserialize(r.p, r.left(), &sub);
+        if (!s->mc) { delete s; return nullptr; }
+        r.p += sub;
+    }
+    if (!r.ok) { delete s; return nullptr; }
     if (used) *used = (size_t)(r.p - data);
     return s;
 }

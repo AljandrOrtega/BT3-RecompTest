@@ -132,6 +132,8 @@ struct Net
     bool        synced = true;         // false from connect until the state sync completes (when syncOn)
     bool        syncOffered = false, syncDone = false;
     uint32_t    syncFrame = 0; uint64_t syncBytes = 0; char syncPath[96] = {};
+    uint32_t    desyncFrame = 0;       // [desyncdump] first frame whose confirmed hash differed (0 = none yet)
+    uint32_t    checkEvery = 60;       // PS2X_NET_CHECKEVERY: confirmed-state checksum interval in frames
 };
 
 Net g;
@@ -216,7 +218,18 @@ static void applyInputs(const NetPkt &p)
         }
         g.remote[f] = in;
     }
-    if (p.checkFrame) g.peerHash[p.checkFrame] = p.checksum;
+    if (p.checkFrame)
+    {
+        g.peerHash[p.checkFrame] = p.checksum;
+        const auto it = g.ourHash.find(p.checkFrame);   // ours already set: compare here too (the other order is in ps2NetSetChecksum)
+        if (it != g.ourHash.end() && it->second != p.checksum && g.desyncFrame == 0u)
+        {
+            g.desyncFrame = p.checkFrame;
+            if (g.desyncs.fetch_add(1, std::memory_order_relaxed) == 0)
+                std::fprintf(stderr, "[netplay] *** DESYNC at frame %u: ours %016llx peer %016llx ***\n",
+                             p.checkFrame, (unsigned long long)it->second, (unsigned long long)p.checksum);
+        }
+    }
 }
 
 // [statesync] control packets: no inputs, the header fields carry the payload
@@ -342,6 +355,7 @@ static bool netStart(const char *conn, int listenPort, int player)
         g.synced = !g.syncOn;
         if (sy && sy[0] && sy[0] != '0' && !g.rbWindow) std::fprintf(stderr, "[netplay] PS2X_NET_SYNC needs PS2X_NET_ROLLBACK: ignored\n");
         if (g.syncOn) std::fprintf(stderr, "[netplay] state sync at connect (%s)\n", g.listening ? "host publishes" : "joiner adopts");
+        if (const char *ce = std::getenv("PS2X_NET_CHECKEVERY")) { const int v = std::atoi(ce); if (v >= 1 && v <= 3600) g.checkEvery = (uint32_t)v; }
         if (g.fakeLagMs) std::fprintf(stderr, "[netplay] fake receive lag %u ms\n", g.fakeLagMs);
     }
     if (g.active) { std::fprintf(stderr, "[netplay] already connected\n"); return false; }
@@ -546,7 +560,9 @@ void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
     if (g.testInput && ((frame / 15u) & 1u)) use.buttons = static_cast<uint16_t>(use.buttons & ~0x0004u);   // R3 pressed (active low)
     {
         std::lock_guard<std::mutex> lk(g.mtx);
-        g.local[frame + g.delay] = use;     // sampled now, APPLIED delay frames later
+        // First sample wins: a re-simulated frame calls this again with whatever the pad reads NOW, but the
+        // value for frame + delay may already be on the wire -- rewriting it would desync the peer.
+        g.local.emplace(frame + g.delay, use);   // sampled now, APPLIED delay frames later
     }
     sendOurs(frame + g.delay);
     pump();
@@ -614,6 +630,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
     const auto it = g.peerHash.find(frame);
     if (it != g.peerHash.end() && it->second != hash)
     {
+        if (g.desyncFrame == 0u) g.desyncFrame = frame;
         if (g.desyncs.fetch_add(1, std::memory_order_relaxed) == 0)
             std::fprintf(stderr, "[netplay] *** DESYNC at frame %u: ours %016llx peer %016llx ***\n",
                          frame, (unsigned long long)hash, (unsigned long long)it->second);
@@ -696,3 +713,5 @@ void ps2NetSyncApplied(uint32_t frameAbs)
     sendSyncDone(frameAbs);
     std::fprintf(stderr, "[netplay] frame base = %u (state sync)\n", frameAbs);
 }
+uint32_t ps2NetCheckEvery() { return g.checkEvery; }
+uint32_t ps2NetDesyncFrame() { return g.desyncFrame; }

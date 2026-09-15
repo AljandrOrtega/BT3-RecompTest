@@ -4964,7 +4964,10 @@ struct Ps2xRollback
         const auto tl = g_fiberTls.find(tid);
         const int wp = tl != g_fiberTls.end() ? tl->second.waitPoint : -1;
         const uint64_t warg = tl != g_fiberTls.end() ? tl->second.waitArg : 0u;
-        h ^= (uint64_t)(uint32_t)wp; h *= kFnvP; h ^= warg; h *= kFnvP; h ^= st.blockPc; h *= kFnvP; h ^= st.blockRa; h *= kFnvP;
+        // NOT the guest pc/ra of the last block (blockPc/blockRa): those say which guest path reached the
+        // park -- state, which the blob replaces -- not where the host stack will return to. Hashing them
+        // rejected comparable boundaries (the title reaches the frame kick from two guest sites).
+        h ^= (uint64_t)(uint32_t)wp; h *= kFnvP; h ^= warg; h *= kFnvP;
         if (print) std::fprintf(stderr, "  (wp=%d arg=%llx%s%s)\n", wp, (unsigned long long)warg, (opaque && !opaque->empty()) ? " OPAQUE " : "", (opaque && !opaque->empty()) ? opaque->c_str() : "");
         if (depthOut) *depthOut = d;
         return h;
@@ -5273,10 +5276,38 @@ struct Ps2xRollback
         // Desync detection on CONFIRMED state only: the ring's oldest entry (frame - W) has every input
         // it depends on known (the stall rule) and was refreshed by any rollback that reached it, so its
         // RAM hash is comparable across the two machines. Every 60 frames (a 32 MB hash is ~10 ms).
-        if (!ring.empty() && (frame % 60u) == 0u && ring.front().frame + W <= frame)
+        if (!ring.empty() && (frame % ps2NetCheckEvery()) == 0u && ring.front().frame + W <= frame)
         {
             if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
                 ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0u, 0u));
+        }
+        // [desyncdump] PS2X_NET_DUMPDIR=<dir>: keep the last 24 confirmed frames' RAM (the peer's hash for a
+        // frame arrives a few frames after ours was set, by which time the ring has moved on) and, when the
+        // confirmed hashes first differ, write that frame's RAM so the two dumps can be diffed offline.
+        static const char *s_dumpDir = std::getenv("PS2X_NET_DUMPDIR");
+        static bool s_dumped = false;
+        if (s_dumpDir && s_dumpDir[0] && !s_dumped)
+        {
+            static std::deque<std::pair<uint64_t, std::vector<uint8_t>>> hist;
+            if (!ring.empty() && ring.front().frame + W <= frame)
+            {
+                if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
+                {
+                    bool have = false; for (const auto &h : hist) if (h.first == ring.front().frame) { have = true; break; }
+                    if (!have) { hist.emplace_back(ring.front().frame, std::vector<uint8_t>(ram, ram + 32u * 1024u * 1024u)); while (hist.size() > 24u) hist.pop_front(); }
+                }
+            }
+            if (const uint32_t df = ps2NetDesyncFrame())
+            {
+                s_dumped = true;
+                const std::vector<uint8_t> *ram = nullptr; for (const auto &h : hist) if (h.first == df) { ram = &h.second; break; }
+                char path[512]; std::snprintf(path, sizeof path, "%s/desync_%u_p%d.bin", s_dumpDir, df, ps2NetLocalPlayer());
+                std::FILE *f = ram ? std::fopen(path, "wb") : nullptr;
+                if (f) { std::fwrite(ram->data(), 1, ram->size(), f); std::fclose(f); }
+                std::fprintf(stderr, "[desyncdump] frame %u: %s (history %llu..%llu)\n", df, f ? path : (ram ? "cannot write" : "not in the history"),
+                             hist.empty() ? 0ull : (unsigned long long)hist.front().first, hist.empty() ? 0ull : (unsigned long long)hist.back().first);
+                hist.clear();
+            }
         }
     }
 

@@ -466,7 +466,11 @@ namespace
         // PS2 pad packet. buttons active-low (0xff = released); game does
         // (hi<<8|lo) ^ 0xffff.
         uint8_t lx = 0x80u, ly = 0x80u, rx = 0x80u, ry = 0x80u;
-        const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(static_cast<int>(socket & 3u), lx, ly, rx, ry);
+        // [netplay] The LOCAL player's buttons always come from this machine's PRIMARY device (player-1
+        // config): a joiner is player 2, whose socket would otherwise poll the second-gamepad slot and
+        // read nothing while the only controller sits on slot 0.
+        const int liveSlot = (ps2NetActive() && static_cast<int>(socket & 3u) + 1 == ps2NetLocalPlayer()) ? 0 : static_cast<int>(socket & 3u);
+        const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(liveSlot, lx, ly, rx, ry);
         uint8_t b0 = static_cast<uint8_t>(buttons & 0xffu);
         uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
         // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
@@ -2954,9 +2958,11 @@ namespace
     struct Bt3DevDone { std::atomic<uint32_t> dev{0u}; std::atomic<uint32_t> reported{1u};
                         std::atomic<uint32_t> stream{0u}; std::atomic<uint32_t> idleWait{0u};
                         std::atomic<uint32_t> activeReq{0u}; };   // [cdedge2] pending request ([stream+8]) the device was seen busy/done for
+    static Bt3DevDone s_bt3DevSlots[8];
+    Bt3DevDone *bt3DevSlotAt(int i) { return &s_bt3DevSlots[(i < 0 || i >= 8) ? 0 : i]; }   // [statesync]
     inline Bt3DevDone *bt3DevSlot(uint32_t dev)
     {
-        static Bt3DevDone s_slots[8];
+        Bt3DevDone (&s_slots)[8] = s_bt3DevSlots;
         for (Bt3DevDone &c : s_slots)
         {
             const uint32_t h = c.dev.load(std::memory_order_relaxed);
@@ -2970,6 +2976,27 @@ namespace
             }
         }
         return nullptr;
+    }
+
+    // [statesync] The slots are host-side latches that decide which device read-state the game sees
+    // (bt3CdStateEdge, the tick pump): they must travel with a snapshot, or a peer that adopts our RAM
+    // mid-read continues on its own latches and its loader takes a different branch ~30 frames later.
+    struct Bt3DevDoneSer { uint32_t dev, reported, stream, idleWait, activeReq; };
+    static void bt3DevSlotsCapture(Bt3DevDoneSer out[8])
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            Bt3DevDone *c = bt3DevSlotAt(i);
+            out[i] = Bt3DevDoneSer{ c->dev.load(), c->reported.load(), c->stream.load(), c->idleWait.load(), c->activeReq.load() };
+        }
+    }
+    static void bt3DevSlotsRestore(const Bt3DevDoneSer in[8])
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            Bt3DevDone *c = bt3DevSlotAt(i);
+            c->dev.store(in[i].dev); c->reported.store(in[i].reported); c->stream.store(in[i].stream); c->idleWait.store(in[i].idleWait); c->activeReq.store(in[i].activeReq);
+        }
     }
 
     PS2Runtime::RecompiledFunction g_orig270dd0 = nullptr;
@@ -4637,6 +4664,7 @@ namespace
         decltype(g_streamStart) streamStart;
         decltype(g_sndRateLast) rateLast;
         uint64_t seTickBase = 0, seTickCarry = 0;
+        Bt3DevDoneSer devSlots[8] = {};   // [statesync] the CD device-done latches (bt3CdStateEdge)
     };
     static void snapCopy(std::vector<uint8_t> &dst, const uint8_t *src, size_t n) { dst.resize(n); if (n) std::memcpy(dst.data(), src, n); }
     extern "C" void *ps2xSimSnapCapture(PS2Runtime *runtime, uint8_t *rdram)
@@ -4672,6 +4700,7 @@ namespace
         { std::lock_guard<std::mutex> lk(g_streamStartM); s->streamStart = g_streamStart; }
         { std::lock_guard<std::mutex> lk(g_sndRateM); s->rateLast = g_sndRateLast; }
         s->seTickBase = g_seTickBase; s->seTickCarry = g_seTickCarry;
+        bt3DevSlotsCapture(s->devSlots);
         return s;
     }
     extern "C" bool ps2xSimSnapRestore(void *h, PS2Runtime *runtime, uint8_t *rdram)
@@ -4708,6 +4737,7 @@ namespace
         { std::lock_guard<std::mutex> lk(g_streamStartM); g_streamStart = s->streamStart; }
         { std::lock_guard<std::mutex> lk(g_sndRateM); g_sndRateLast = s->rateLast; }
         g_seTickBase = s->seTickBase; g_seTickCarry = s->seTickCarry;
+        bt3DevSlotsRestore(s->devSlots);
         g_bt3FrameCount.store(s->frame, std::memory_order_relaxed);
         ps2_stubs::ps2RandRestore(s->rand64, s->randCalls);
         return true;
@@ -4741,6 +4771,7 @@ namespace
         w.u64(s->streamStart.size()); for (const auto &kv : s->streamStart) { w.u32(kv.first); w.tp(kv.second); }
         w.u64(s->rateLast.size());    for (const auto &kv : s->rateLast)    { w.u32(kv.first); w.tp(kv.second); }
         w.u64(s->seTickBase); w.u64(s->seTickCarry);
+        w.raw(s->devSlots, sizeof s->devSlots);
         w.u32(0x53494d45u);   // 'SIME'
         return true;
     }
@@ -4769,6 +4800,7 @@ namespace
         { const size_t k = r.count(12); for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); s->streamStart[key] = r.tp(); } }
         { const size_t k = r.count(12); for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); s->rateLast[key] = r.tp(); } }
         s->seTickBase = r.u64(); s->seTickCarry = r.u64();
+        r.raw(s->devSlots, sizeof s->devSlots);
         if (r.u32() != 0x53494d45u || !r.ok || s->ram.size() != PS2_RAM_SIZE) { delete s; return nullptr; }
         if (used) *used = (size_t)(r.p - data);
         return s;

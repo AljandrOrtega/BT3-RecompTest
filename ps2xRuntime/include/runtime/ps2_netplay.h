@@ -48,3 +48,5 @@ void     ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path);  
 bool     ps2NetSyncWaitDone(uint32_t timeoutMs);                 // host: pump until the joiner's DONE; sets the frame base
 bool     ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes, char *path, size_t pathCap);   // joiner: an offer arrived
 void     ps2NetSyncApplied(uint32_t frameAbs);                   // joiner: state adopted; sets the base, sends DONE
+uint32_t ps2NetCheckEvery();      // PS2X_NET_CHECKEVERY: confirmed-state checksum interval (default 60)
+uint32_t ps2NetDesyncFrame();     // [desyncdump] the first frame whose confirmed hashes differed, 0 = none
