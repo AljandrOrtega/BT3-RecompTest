@@ -7,6 +7,8 @@
 #include "ps2_log.h"
 #include "Stubs/GS.h"
 
+extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp
+extern "C" bool ps2xFrameStepOn();   // [rollback] ps2_runtime.cpp
 namespace ps2_syscalls
 {
     namespace interrupt_state
@@ -325,6 +327,7 @@ namespace ps2_syscalls
         }
 
         g_vsync_cv.notify_all();
+        ps2xSchedSignal();   // [fibers] the vsync waiters' predicate just moved
         updateGsCsrFieldForVSync(runtime, tickValue);
 
         if (reg.flagAddr != 0u)
@@ -460,7 +463,8 @@ namespace ps2_syscalls
         const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
         ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
         dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        if (!ps2xFrameStepOn())   // [rollback] stepped: every fiber is parked, the order is fixed without a sleep
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
         dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
         // Drive EE timer interrupts (Timer0-3, INTC causes 9-12). Games use
         // these as periodic ticks for service threads (sound, timer-delay loops);

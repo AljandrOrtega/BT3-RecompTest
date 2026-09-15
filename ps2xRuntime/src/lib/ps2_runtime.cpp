@@ -4013,6 +4013,13 @@ namespace
     int  g_schedProbeCursor = -1;    // last probed tid: round-robin position over the blocked fibers
     bool g_schedProbeArmed = false;  // one probe is due before the next runnable pick
     bool g_schedIdleReturn = false;  // [rollback] schedFiberLoopUntil returned because every fiber was parked (not the stop predicate)
+    // [fibers] SIGNAL GENERATION. A parked fiber's predicate can only become true through a kernel
+    // wake (WakeupThread, SignalSema, SetEventFlag, ResumeThread, ReleaseWaitThread, thread exit),
+    // a vblank tick, or the frame gate -- every one of those bumps this counter. schedYield used to
+    // hand the scheduler a probe on EVERY yield with nobody else runnable (4 context switches each,
+    // ~80k yields/s in a fight = most of the re-simulation cost); now it does so only when the
+    // generation moved since the last probe, with a probe every 64 yields as a safety net.
+    std::atomic<uint64_t> g_schedSignalGen{0};
     // Keyed by tid, and deliberately NOT in SchedThread: keeping it here avoids touching
     // ps2_runtime.h, which every generated runner source includes (a ~10 minute rebuild).
     std::map<int, GuestTls> g_fiberTls;
@@ -4206,6 +4213,7 @@ bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
 }
 
 static void ps2xRollbackAtBoundary(PS2Runtime &rt);   // [rollback] defined with Ps2xRollback below
+extern "C" void ps2xSchedSignal();                     // [fibers] defined with ps2xFrameStepOn below
 extern "C" void ps2xInterruptTick(uint8_t *rdram, PS2Runtime *runtime);   // [rollback] Kernel/Syscalls/Interrupt.cpp: one vblank
 extern "C" void ps2xVirtualClockEnable();                                  // [rollback] ps2_memory.cpp: EE timers on the stepped clock
 extern "C" void ps2xVirtualClockAdvance(uint64_t ns);
@@ -4263,6 +4271,7 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
             g_cadBackEdge = 0u; g_cadAdxCtr = 0u; g_cadDp = 0u;
             { std::lock_guard<std::mutex> lk(g_gateM); g_gate.openFrame = g_gate.waitFrame; }
             g_gateCv.notify_all();
+            ps2xSchedSignal();
         }
     }
     else
@@ -4343,6 +4352,12 @@ void PS2Runtime::schedYield(int tid)
                 if (kv.first != tid && s.present && s.blocked && s.fiber && !s.finished) { anyBlocked = true; break; }
             }
             if (!anyBlocked) return;
+            {   // only when something could have woken a blocked fiber (see g_schedSignalGen), or every 64 yields
+                static uint64_t s_seenGen = 0; static uint32_t s_since = 0;
+                const uint64_t gen = g_schedSignalGen.load(std::memory_order_relaxed);
+                if (gen == s_seenGen && (++s_since & 63u) != 0u) return;
+                s_seenGen = gen; s_since = 0;
+            }
             probeOnly = true;
         }
         else
@@ -4603,6 +4618,7 @@ void PS2Runtime::guestWaitEnd(void *handle)
 // lock held; parks the fiber until the controller opens the gate for this frame. Off unless a
 // frame-stepped feature enabled it, and a no-op on the thread path.
 extern "C" bool ps2xFrameStepOn() { return g_gate.on && g_waitHookRuntime && g_waitHookRuntime->fibersEnabled(); }
+extern "C" void ps2xSchedSignal() { g_schedSignalGen.fetch_add(1u, std::memory_order_relaxed); }
 extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx)
 {
     PS2Runtime *rt = g_waitHookRuntime;

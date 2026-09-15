@@ -5,6 +5,7 @@
 
 extern std::atomic<uint32_t> g_bt3StateLive; // [eeround2] gate (ps2_runtime.cpp)
 
+extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp: a blocked fiber may now be runnable
 namespace ps2_syscalls
 {
     static void applySuspendStatusLocked(ThreadInfo &info)
@@ -657,6 +658,7 @@ namespace ps2_syscalls
 
     void ExitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         RUNTIME_LOG("[ExitThread] Game requested thread exit! PC=0x" << std::hex << ctx->pc
                                                                      << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << g_currentThreadId << std::endl);
 
@@ -680,6 +682,7 @@ namespace ps2_syscalls
 
     void ExitDeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = g_currentThreadId;
         RUNTIME_LOG("[ExitDeleteThread] Game requested thread exit & delete! PC=0x" << std::hex << ctx->pc
                                                                                     << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << tid << std::endl);
@@ -708,6 +711,7 @@ namespace ps2_syscalls
 
     void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
@@ -833,6 +837,7 @@ namespace ps2_syscalls
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
@@ -1047,6 +1052,7 @@ namespace ps2_syscalls
 
     void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
         {
@@ -1124,6 +1130,7 @@ namespace ps2_syscalls
 
     void iWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         WakeupThread(rdram, ctx, runtime);
     }
 
@@ -1253,6 +1260,7 @@ namespace ps2_syscalls
 
     void ReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0 || tid == g_currentThreadId)
         {
@@ -1306,6 +1314,7 @@ namespace ps2_syscalls
 
     void iReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         ReleaseWaitThread(rdram, ctx, runtime);
     }
 

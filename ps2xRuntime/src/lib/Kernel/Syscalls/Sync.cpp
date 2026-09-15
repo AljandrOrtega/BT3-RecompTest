@@ -2,6 +2,7 @@
 #include "Common.h"
 #include "Sync.h"
 
+extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp: a blocked fiber may now be runnable
 namespace ps2_syscalls
 {
     static bool looksLikeGuestPointerOrNull(uint32_t value)
@@ -230,6 +231,7 @@ namespace ps2_syscalls
 
     void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
         if (!sema)
@@ -279,6 +281,7 @@ namespace ps2_syscalls
 
     void iSignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         SignalSema(rdram, ctx, runtime);
     }
 
@@ -527,6 +530,7 @@ namespace ps2_syscalls
 
     void SetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         int eid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t bits = getRegU32(ctx, 5);
         auto info = lookupEventFlagInfo(eid);
@@ -571,6 +575,7 @@ namespace ps2_syscalls
 
     void iSetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2xSchedSignal();   // [fibers] wake site
         SetEventFlag(rdram, ctx, runtime);
     }
 
