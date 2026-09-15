@@ -1762,6 +1762,16 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
     uint32_t slot = 0u;
     if (!generatedFunctionTableSlot(address, slot))
     {
+        // [netjump] Overlay functions (base 0x334c00) live in their own dense table. BT3's whole
+        // menu system is overlay code, so hooking any of it -- e.g. func_356090, the versus-menu
+        // loop whose return value decides the 0x26 -> 0x27 transition -- requires this fallback.
+        uint32_t oslot = 0u;
+        if (generatedOverlayTableSlot(address, oslot))
+        {
+            g_ps2OverlayFunctionTable[oslot] = func;
+            return true;
+        }
+
         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
                   << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
                   << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"

@@ -1,6 +1,7 @@
 #include "ps2_runtime.h"   // [fps60] ps2Set60Fps
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
+#include "runtime/ps2_netplay.h"   // [netplay]
 #include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_render_scale.h"
@@ -1143,6 +1144,12 @@ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
                     drawControllersTab();
                     ImGui::EndTabItem();
                 }
+                if (ImGui::BeginTabItem("  Netplay"))
+                {
+                    m_activeTab = 4;
+                    drawNetplayTab();
+                    ImGui::EndTabItem();
+                }
                 if (ImGui::BeginTabItem("  Logging"))
                 {
                     m_activeTab = 3;
@@ -1925,6 +1932,102 @@ void PS2SettingsOverlay::drawBindingsPopup()
 
         ImGui::EndPopup();
     }
+}
+
+// [netplay] Host / Join without a terminal. The peer's address is remembered in the ini --
+// typing an IP on a gamepad is miserable, so recall matters more than a text field.
+// Join does BOTH things the user asked for: it connects AND, on the host, kicks off the canned
+// menu sequence so both sides land on character select together (see ps2NetBeginAutoStart).
+void PS2SettingsOverlay::drawNetplayTab()
+{
+    static char s_peer[64] = "127.0.0.1";
+    static int  s_port = 7777;
+    static bool s_loaded = false;
+    if (!s_loaded)
+    {
+        s_loaded = true;
+        if (const char *e = std::getenv("PS2X_NET_PEER")) { std::snprintf(s_peer, sizeof s_peer, "%s", e); }
+    }
+
+    ImGui::TextUnformatted("Online play (deterministic lockstep)");
+    ImGui::Separator();
+
+    if (ps2NetActive())
+    {
+        ImGui::Text("Status: %s", ps2NetPeerConnected() ? "CONNECTED" : "waiting for peer...");
+        ImGui::Text("You are player %d", ps2NetLocalPlayer());
+        ImGui::Text("Input delay: %u frames (%u ms at 30 fps)", ps2NetDelay(), ps2NetDelay() * 33u);
+        { const char *bn[] = {"Single Battle","Team Battle","DP Battle"};
+          const int bt = ps2NetBattleType();
+          const char *tn[] = {"60 s","90 s","180 s","240 s","no limit"};
+          const int tl = ps2NetTimeLimit();
+          const char *dn[] = {"10 DP","15 DP","20 DP"};
+          const int dp = ps2NetDpLimit();
+          ImGui::Text("Game mode: %s%s%s   |   time limit: %s",
+                      (bt >= 0 && bt < 3) ? bn[bt] : "?",
+                      bt == 2 ? " / " : "", (bt == 2 && dp >= 0 && dp < 3) ? dn[dp] : "",
+                      (tl >= 0 && tl < 5) ? tn[tl] : "?"); }
+        if (ps2NetAutoJump()) ImGui::TextUnformatted("Will jump to character select on connect.");
+        ImGui::Separator();
+        if (ImGui::Button("Disconnect"))
+            ps2NetDisconnect("overlay");
+        ImGui::SameLine();
+        ImGui::TextDisabled("restores local pads and splitscreen");
+        ImGui::Separator();
+        ImGui::TextWrapped("Only buttons cross the wire. Each side renders its own player "
+                           "full-screen.");
+        return;
+    }
+
+    static int  s_delay = 2;
+    static int  s_battle = 0;
+    static int  s_time = 3;
+    static int  s_dp = 0;          // DP Battle budget: 0 = 10 DP, 1 = 15, 2 = 20
+    static bool s_jump = true;
+    ImGui::Checkbox("Go to character select once connected", &s_jump);
+    ImGui::TextDisabled("Both sides jump together; the menus are hidden while it happens.");
+    ImGui::Separator();
+    // Only Join uses the address: hosting binds the port and learns the peer from its first
+    // packet, which is why only one side needs a reachable port.
+    ImGui::InputText("Host address (Join only)", s_peer, sizeof s_peer);
+    ImGui::InputInt("Port", &s_port);
+    const char *kBattle[] = { "Single Battle", "Team Battle", "DP Battle" };
+    ImGui::Combo("Game mode", &s_battle, kBattle, 3);
+    // DP Battle's point budget is a SEPARATE row of the versus menu (duelObj+0x118, committed to
+    // stateObj+0x630 = RetroAchievements' 0x6af7b0). Selecting DP without it left the screen
+    // playing like Team Battle: the right type with no budget behind it.
+    if (s_battle == 2)
+    {
+        const char *kDp[] = { "10 DP", "15 DP", "20 DP" };
+        ImGui::Combo("DP limit", &s_dp, kDp, 3);
+    }
+    // Battle Settings time-limit indices, confirmed in game:
+    //   0 = 60 s, 1 = 90 s, 2 = 180 s, 3 = 240 s (default), 4 = no limit
+    const char *kTime[] = { "60 seconds", "90 seconds", "180 seconds", "240 seconds (default)", "No limit" };
+    ImGui::Combo("Time limit", &s_time, kTime, 5);
+    ImGui::TextDisabled("The HOST's choices apply to both players.");
+    ImGui::SliderInt("Input delay (frames)", &s_delay, 1, 10);
+    ImGui::TextDisabled("BT3 runs at 30 fps, so each frame is 33 ms. Use 1 on the same machine,");
+    ImGui::TextDisabled("2 on a LAN. Raise it only if you see stalls.");
+    if (s_port < 1 || s_port > 65535) s_port = 7777;
+
+    if (ImGui::Button("Host (you are Player 1)"))
+    {
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay); ps2NetSetBattleType(s_battle);
+        ps2NetSetTimeLimit(s_time); ps2NetSetDpLimit(s_dp);
+        ps2NetHost(s_port, 1);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Join (you are Player 2)"))
+    {
+        ps2NetSetAutoJump(s_jump); ps2NetSetDelay(s_delay);   // the host's game mode wins
+        char hp[96]; std::snprintf(hp, sizeof hp, "%s:%d", s_peer, s_port);
+        ps2NetJoin(hp, 2);
+    }
+    ImGui::Separator();
+    ImGui::TextWrapped("HOST: just press Host -- leave the address blank, give the other player "
+                       "your IP and this port. JOIN: type the host's IP above, then press Join. "
+                       "Only the host needs the UDP port reachable.");
 }
 
 void PS2SettingsOverlay::drawLoggingTab()
