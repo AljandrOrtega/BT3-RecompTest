@@ -1,5 +1,6 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_statesync.h"   // [statesync]
+extern "C" bool ps2xAudioFeedOn();   // [rollback] ps2_runtime.cpp: false while re-simulating / fast-forwarding (no device feed)
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -1145,9 +1146,20 @@ namespace
             // the other, so the stream thread issued one SIF DMA more -- the last sound-block
             // divergence. Credit by vblank ticks only; the device starts on its own once fed.
             s.wallClock = false; s.ringFullIdle = false;
+            // Nothing queued = nothing playing: no credit, and the clock re-bases when data next arrives
+            // (a stream that has just started). Measured without this: the clock ran from boot on an
+            // empty sink, so the first BGM was credited 35 s of "played" the moment it started, the game
+            // refilled at full speed and the device sat 4 s behind, trimming forever.
+            if (queued == 0u) { s.frameClock = false; return; }
             const uint64_t fr = ps2_syscalls::GetCurrentVSyncTick();
             if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
-            playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / 60u;
+            // At the rate the stream was DECLARED at (the game's ADX header, as the DMA path told the
+            // backend) -- not the 24 kHz default: the title music is 48 kHz, and crediting it at half
+            // rate fed the device half of what it played (measured: 24 002 vs 48 169 samples/s).
+            const uint32_t rate = (prog.known && prog.sampleRate) ? prog.sampleRate : sndDeclaredRate();
+            playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * (uint64_t)rate * 2ull) / 60u;
+            const uint64_t fedTotal = s.returnedBytes + queued;   // the device cannot have played what was never fed
+            if (playedBytes > fedTotal) playedBytes = fedTotal;
         }
         else
         {
@@ -1869,6 +1881,16 @@ namespace
                 if (v > 32767) v = 32767;
                 if (v < -32768) v = -32768;
                 out[i] = static_cast<int16_t>(v);
+            }
+            // [rollback] Stepped mode mixes by ticks (the deterministic part: voice positions), but the
+            // device is fed by its own queue level, like the wall-clock path: a chunk the device has no
+            // room for is dropped rather than queued behind everything else, so a burst of ticks can
+            // never turn into lasting latency. Nothing is fed during a re-simulation or catch-up.
+            if (stepped)
+            {
+                if (!ps2xAudioFeedOn()) continue;
+                const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
+                if (prog.known && prog.pending >= kSeTargetPending) continue;
             }
             runtime->audioBackend().onStreamPcm(kSeStreamId, out,
                                                 static_cast<uint32_t>(used), kSeMixRate);

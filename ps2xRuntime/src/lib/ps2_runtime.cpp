@@ -5,6 +5,7 @@
 #include "runtime/ps2_netplay.h" // [rollback] the netplay controller
 #include "runtime/ps2_statesync.h"   // [statesync] portable snapshot forms
 extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the frame hook's counter
+extern "C" bool ps2xFrameStepOn();               // frame-stepped mode (defined with the frame gate below)
 extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defined with the scheduler)
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -576,6 +577,17 @@ namespace
     // controller zeroes them at every frame boundary, which makes the cadence a pure function of
     // the frame's work. Function-local statics before; the aliases below keep the call sites.
     thread_local uint64_t g_cadNestedFairness = 0u, g_cadMainNestedYield = 0u, g_cadTickCounter = 0u;
+    // [tickbusy] Guest branches since the last vblank. Frame-stepped mode delivers a vblank when every
+    // fiber is parked (the guest is waiting for one) -- but real hardware ticks 60 Hz whatever the EE is
+    // doing, and a thread that stays busy (the loader during a load, the sound-init spin) froze the
+    // vsync counter, the timers and every tick-paced stream credit for as long as it ran, then everything
+    // caught up in a burst (music fast, then starved). So a vblank is also DUE after this many guest
+    // branches: the busy fiber parks at its next fairness yield and the controller delivers it there --
+    // a deterministic point in the guest's instruction stream, still paced to the wall clock. Normal
+    // frames reach their vsync wait long before the threshold. Snapshotted (a boundary sits mid-count).
+    thread_local uint64_t g_cadBranchesSinceTick = 0u;
+    thread_local bool g_schedTickDue = false;
+    static const uint64_t g_tickBranches = [](){ const char *v = std::getenv("PS2X_TICKBRANCHES"); const uint64_t n = (v && v[0]) ? std::strtoull(v, nullptr, 10) : 500000ull; return n < 4096ull ? 4096ull : n; }();
     thread_local uint32_t g_cadBackEdge = 0u, g_cadAdxCtr = 0u, g_cadDp = 0u;
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
     // Per-host-thread guest tid for the deterministic scheduler (main = 1).
@@ -2815,8 +2827,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         // here periodically to let other guest threads make progress.
         uint64_t &s_nestedFairness = g_cadNestedFairness;   // [rollback] cadence counter (file scope)
         constexpr uint64_t kNestedFairnessInterval = 256u;
+        ++g_cadBranchesSinceTick;   // [tickbusy]
         if ((++s_nestedFairness % kNestedFairnessInterval) == 0u)
         {
+            if (m_fibersEnabled && g_schedIsGuest && !g_schedTickDue && g_cadBranchesSinceTick >= g_tickBranches && ps2xFrameStepOn())
+            {   // [tickbusy] a vblank is due by guest work: park here, the controller delivers it, then we go on
+                g_schedTickDue = true;
+                const uint32_t depth = releaseGuestExecution();
+                schedFiberPark();
+                reacquireGuestExecution(depth);
+            }
             if (schedDbgEnabled() && (s_nestedFairness % (256u*4000u)) == 0u)
                 std::cerr << "[sched-nf] non-main thread reached nested-fairness: schedTid=" << g_schedTid
                           << " isGuest=" << (int)g_schedIsGuest << " schedEn=" << (int)m_schedEnabled << std::endl;
@@ -4253,6 +4273,13 @@ bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
         // Arm one probe after anything but a FAILED probe (the fiber is still parked and nothing
         // changed), so a yield or a block always gives one blocked fiber the chance to notice its
         // wakeup, and probes never chain into a busy pass on their own.
+        if (g_schedTickDue)
+        {   // [tickbusy] the fiber parked because a vblank is due: let the controller deliver it (paced) and come back
+            g_schedTickDue = false;
+            g_schedProbeArmed = true;
+            g_schedIdleReturn = true; ++g_rbIdles;
+            return true;
+        }
         bool failedProbe = false;
         {   // PS2X_SCHEDTRACE=<from>[:<to>] game frames: every switch (real / probe), for A-vs-B comparisons
             static const uint64_t s_trFrom = [](){ const char *v = std::getenv("PS2X_SCHEDTRACE"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
@@ -4295,6 +4322,11 @@ extern "C" uint64_t *ps2xParkSlot(int idx)
 }
 
 extern "C" int ps2xSchedTid() { return g_schedIsGuest ? g_schedTid : -1; }
+// [rollback] The audio DEVICE is fed only from frames that are being simulated for the first time: a
+// re-simulation (after a rollback) and the joiner's catch-up before a state sync run unpaced and
+// their audio was already heard or will be thrown away. The sound engine's own model (voice
+// positions, stream credit) still advances, so the game's view stays deterministic.
+extern "C" bool ps2xAudioFeedOn() { return !g_rollbackUnpaced; }
 extern "C" int ps2xSchedTraceOn()
 {   // PS2X_SCHEDTRACE=<from>[:<to>]: the game-frame window the scheduler / tick / kernel traces print in
     static const uint64_t s_from = [](){ const char *v = std::getenv("PS2X_SCHEDTRACE"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
@@ -4346,6 +4378,17 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
                 }
                 nextVblank += period;
                 ps2xVirtualClockAdvance(16666667ull);
+                g_cadBranchesSinceTick = 0u;   // [tickbusy]
+                {   // [tickrate] PS2X_TICKRATE=1: wall time per 60 delivered vblanks (60 Hz = 1000 ms), and how many came from busy fibers
+                    static const bool s_tr = [](){ const char *v = std::getenv("PS2X_TICKRATE"); return v && v[0] && v[0] != '0'; }();
+                    static uint64_t s_n = 0; static auto s_t0 = clock::now();
+                    if (s_tr && (++s_n % 60u) == 0u)
+                    {
+                        const auto now = clock::now();
+                        std::fprintf(stderr, "[tickrate] 60 ticks in %.0f ms (frame %llu)\n", std::chrono::duration<double, std::milli>(now - s_t0).count(), (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+                        s_t0 = now;
+                    }
+                }
                 const uint64_t nfBefore = g_cadNestedFairness, tkBefore = g_cadTickCounter;
                 { const auto t0 = clock::now();
                   ps2xInterruptTick(m_memory.getRDRAM(), this);
@@ -4839,6 +4882,7 @@ struct Ps2xRollback
         void *dev = nullptr;      // ps2xMemDeviceCapture
         std::map<int, Ps2xSchedExtra> extra;   // [statesync] the runtime-owned park scalars
         uint64_t signalGen = 0, seenGen = 0; uint32_t sinceProbe = 0;
+        uint64_t branchesSinceTick = 0;        // [tickbusy]
         ~FiberSnap() { if (kernel) ps2xKernelStateFree(kernel); if (dev) ps2xMemDeviceFree(dev); }
     };
     static FiberSnap *captureFibers(PS2Runtime &rt)
@@ -4870,6 +4914,7 @@ struct Ps2xRollback
         s->dev = ps2xMemDeviceCapture(&rt.m_memory);
         { std::lock_guard<std::mutex> lk2(g_schedExtraM); s->extra = g_schedExtra; }
         s->signalGen = g_schedSignalGen.load(std::memory_order_relaxed); s->seenGen = g_schedSeenGen; s->sinceProbe = g_schedSinceProbe;
+        s->branchesSinceTick = g_cadBranchesSinceTick;
         return s;
     }
     static bool restoreFibers(PS2Runtime &rt, const FiberSnap &s)
@@ -4895,6 +4940,7 @@ struct Ps2xRollback
         if (s.dev && !ps2xMemDeviceRestore(&rt.m_memory, s.dev)) return false;
         { std::lock_guard<std::mutex> lk2(g_schedExtraM); for (const auto &kv : s.extra) g_schedExtra[kv.first] = kv.second; }   // element-wise: nodes are pointed into
         g_schedSignalGen.store(s.signalGen, std::memory_order_relaxed); g_schedSeenGen = s.seenGen; g_schedSinceProbe = s.sinceProbe;
+        g_cadBranchesSinceTick = s.branchesSinceTick;
         return true;
     }
 
@@ -5077,6 +5123,7 @@ struct Ps2xRollback
             std::lock_guard<std::mutex> lk(rt.m_schedMutex);
             w.pod((int32_t)rt.m_schedCurrent); w.u64(rt.m_schedOrderCounter); w.pod((int32_t)g_schedProbeCursor); w.u8(g_schedProbeArmed);
             w.u64(g_schedSignalGen.load(std::memory_order_relaxed)); w.u64(g_schedSeenGen); w.u32(g_schedSinceProbe);
+            w.u64(g_cadBranchesSinceTick);
             uint32_t n = 0; for (auto &kv : rt.m_schedThreads) if (kv.second) ++n;
             w.u32(n);
             for (auto &kv : rt.m_schedThreads)
@@ -5117,7 +5164,7 @@ struct Ps2xRollback
         R5900Context cpu{}; std::vector<std::pair<int, R5900Context>> workers;
         struct SchEnt { int32_t tid, prio; uint8_t blocked, present, finished; uint64_t order; Ps2xSchedExtra extra; };
         std::vector<SchEnt> sch; int32_t cur = -1; uint64_t orderCounter = 0; int32_t probeCursor = -1; uint8_t probeArmed = 0;
-        uint64_t signalGen = 0, seenGen = 0; uint32_t sinceProbe = 0;
+        uint64_t signalGen = 0, seenGen = 0; uint32_t sinceProbe = 0; uint64_t branchesSinceTick = 0;
         std::vector<SigEnt> sigs;
         bool haveCpu = false, haveSch = false, haveSig = false, done = false;
         while (r.ok && !done && r.left() >= 4)
@@ -5142,6 +5189,7 @@ struct Ps2xRollback
             {
                 cur = sub.pod<int32_t>(); orderCounter = sub.u64(); probeCursor = sub.pod<int32_t>(); probeArmed = sub.u8();
                 signalGen = sub.u64(); seenGen = sub.u64(); sinceProbe = sub.u32();
+                branchesSinceTick = sub.u64();
                 const uint32_t k = sub.u32();
                 for (uint32_t i = 0; i < k && sub.ok; ++i)
                 {
@@ -5193,6 +5241,7 @@ struct Ps2xRollback
             rt.m_schedCurrent = cur; rt.m_schedOrderCounter = orderCounter;
             g_schedProbeCursor = probeCursor; g_schedProbeArmed = probeArmed != 0;
             g_schedSignalGen.store(signalGen, std::memory_order_relaxed); g_schedSeenGen = seenGen; g_schedSinceProbe = sinceProbe;
+            g_cadBranchesSinceTick = branchesSinceTick;
         }
         { std::lock_guard<std::mutex> lk(g_gateM); g_gate.waitFrame = frame; g_gate.openFrame = frame - 1u; }   // closed until the controller opens it
         return true;

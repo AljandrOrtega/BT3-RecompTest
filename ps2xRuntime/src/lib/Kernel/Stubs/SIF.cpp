@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "runtime/ps2_statesync.h"   // [statesync]
+extern "C" bool ps2xAudioFeedOn();   // [rollback] ps2_runtime.cpp: false while re-simulating / fast-forwarding
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
 
@@ -822,7 +823,12 @@ namespace ps2_stubs
                         const uint8_t *p = (xfer.size >= 256)
                                                ? getConstMemPtr(rdram, xfer.src)
                                                : nullptr;
-                        if (p)
+                        if (p && !ps2xAudioFeedOn())
+                        {   // [rollback] a re-simulated (or fast-forwarded) transfer: the device already heard this
+                            runtime->audioBackend().noteStreamGap(
+                                streamId, static_cast<uint32_t>(xfer.size));
+                        }
+                        else if (p)
                         {
                             runtime->audioBackend().onStreamPcm(
                                 streamId,

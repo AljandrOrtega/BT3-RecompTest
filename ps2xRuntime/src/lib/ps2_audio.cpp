@@ -407,6 +407,7 @@ PS2AudioBackend::StreamProgress PS2AudioBackend::streamProgress(uint32_t streamI
         p.consumedSamples = it->second.fed;
     p.gapSamples = it->second.gap;
     p.pending = it->second.ring.size();
+    p.sampleRate = it->second.sampleRate;
     return p;
 }
 
