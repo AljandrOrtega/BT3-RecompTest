@@ -872,6 +872,8 @@ namespace
     struct SinkRing { std::vector<std::pair<uint32_t, uint32_t>> bufs; size_t next = 0; };
     std::mutex g_sinkRingM;
     std::map<uint32_t, SinkRing> g_sinkRings;
+    std::mutex g_sndRateM;                                                            // [rollback] the consumer's per-sink feed
+    std::map<uint32_t, std::chrono::steady_clock::time_point> g_sndRateLast;          //   rate limiter, snapshotted with the rest
     // The two sinks whose audio stream ids are 0 and 1 -- i.e. the L/R halves of the BGM.
     uint32_t g_pairSink[2] = {0u, 0u};
     uint64_t g_pairReturns[2] = {0u, 0u}; // buffers handed to each side, for balance
@@ -1265,8 +1267,9 @@ namespace
             auto it = g_iopSinks.find(sink);
             if (it != g_iopSinks.end() && it->second.streamId != 0xFFFFFFFFu)
             {
-                const auto prog = runtime->audioBackend().streamProgress(it->second.streamId);
-                if (prog.pending > 0u)
+                const bool audible = ps2xFrameStepOn() ? (sndListBytes(rdram, sink, kSinkList1) != 0u)   // [rollback] guest queue, not device
+                                                       : (runtime->audioBackend().streamProgress(it->second.streamId).pending > 0u);
+                if (audible)
                     return; // still audible: this is a retrigger, not a fresh stream
             }
         }
@@ -1731,6 +1734,10 @@ namespace
     };
     std::mutex g_seVoiceM;
     std::vector<SeVoice> g_seVoices;
+    // [rollback] Stepped-mode SE pacing: samples are generated per vsync tick (22050/60 each) instead
+    // of per the device's pending level, so voice positions and completions follow guest progress.
+    // Both are part of the snapshot.
+    uint64_t g_seTickBase = 0, g_seTickCarry = 0;
 
     void seAddVoice(uint32_t serial, std::vector<int16_t> &&pcm)
     {
@@ -1769,6 +1776,18 @@ namespace
     {
         if (!runtime)
             return;
+        // [rollback] stepped mode: a fixed budget of samples per vsync tick, whatever the device holds
+        const bool stepped = ps2xFrameStepOn();
+        uint64_t budget = 0;
+        if (stepped)
+        {
+            const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+            if (g_seTickBase == 0 || tick < g_seTickBase) g_seTickBase = tick;
+            const uint64_t ticks = tick - g_seTickBase;
+            g_seTickBase = tick;
+            budget = g_seTickCarry + ticks * kSeMixRate / 60u;
+            g_seTickCarry = ticks * kSeMixRate % 60u;   // keep the sub-sample remainder (in 1/60 units)
+        }
         for (int guard = 0; guard < 64; ++guard)
         {
             {
@@ -1776,9 +1795,17 @@ namespace
                 if (g_seVoices.empty())
                     return;
             }
-            const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
-            if (prog.pending >= kSeTargetPending)
-                return;
+            if (stepped)
+            {
+                if (budget < kSeChunk) return;
+                budget -= kSeChunk;
+            }
+            else
+            {
+                const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
+                if (prog.pending >= kSeTargetPending)
+                    return;
+            }
             int32_t acc[kSeChunk];
             std::memset(acc, 0, sizeof(acc));
             size_t used = 0;
@@ -2519,7 +2546,7 @@ namespace
 
                     bool due = false;
                     size_t backlog = 0u;
-                    if (runtime && bp)
+                    if (runtime && bp && !ps2xFrameStepOn())   // [rollback] stepped mode: the rate limiter below (virtual clock), never the device
                     {
                         const uint32_t sid = bp >> 14;
                         if (sid == 0u || sid == 1u)
@@ -2551,15 +2578,13 @@ namespace
                     }
                     else
                     {
-                        static std::mutex s_m;
-                        static std::map<uint32_t, std::chrono::steady_clock::time_point> s_last;
                         const auto now = ps2xNowSteady();
-                        std::lock_guard<std::mutex> lk(s_m);
-                        auto it = s_last.find(sink);
-                        if (it == s_last.end() ||
+                        std::lock_guard<std::mutex> lk(g_sndRateM);
+                        auto it = g_sndRateLast.find(sink);
+                        if (it == g_sndRateLast.end() ||
                             std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count() >= s_ms)
                         {
-                            s_last[sink] = now;
+                            g_sndRateLast[sink] = now;
                             due = true;
                         }
                     }
@@ -2710,7 +2735,11 @@ namespace
                 if (it != g_sinkRings.end() && !it->second.bufs.empty())
                     bufPtr = it->second.bufs.front().first;
             }
-            if (bufPtr)
+            if (bufPtr && ps2xFrameStepOn())
+            {   // [rollback] stepped mode: the device's backlog is host-paced; the guest's own queue is not
+                stillPlaying = sink && sndListBytes(rdram, sink, kSinkList1) != 0u;
+            }
+            else if (bufPtr)
             {
                 // One sub-buffer of slack: below that it is effectively done.
                 const size_t backlog = runtime->audioBackend().streamBacklog(bufPtr >> 14);
@@ -4598,6 +4627,15 @@ namespace
         std::vector<SinkSer> sinks;
         GsRegSer gs{};
         std::vector<SeVoice> seVoices;   // HLE sound-effect voices (host side of the SE stream)
+        // [rollback] The sound HLE's own host bookkeeping, copied whole (time points are on the
+        // virtual clock in stepped mode, so they transfer exactly): the sinks with their clocks,
+        // the consumer's ring cursors, the stereo-pair balance, stream-start times, feed limiter.
+        std::map<uint32_t, IopSink> sinksFull;
+        decltype(g_sinkRings) rings;
+        uint32_t pairSink[2] = {0u, 0u}; uint64_t pairReturns[2] = {0u, 0u};
+        decltype(g_streamStart) streamStart;
+        decltype(g_sndRateLast) rateLast;
+        uint64_t seTickBase = 0, seTickCarry = 0;
     };
     static void snapCopy(std::vector<uint8_t> &dst, const uint8_t *src, size_t n) { dst.resize(n); if (n) std::memcpy(dst.data(), src, n); }
     extern "C" void *ps2xSimSnapCapture(PS2Runtime *runtime, uint8_t *rdram)
@@ -4627,6 +4665,12 @@ namespace
         }
         gsRegPack(mem.gs(), s->gs);
         { std::lock_guard<std::mutex> lk(g_seVoiceM); s->seVoices = g_seVoices; }
+        { std::lock_guard<std::mutex> lk(g_iopSinkM); s->sinksFull = g_iopSinks; }
+        { std::lock_guard<std::mutex> lk(g_sinkRingM); s->rings = g_sinkRings; s->pairSink[0] = g_pairSink[0]; s->pairSink[1] = g_pairSink[1];
+          s->pairReturns[0] = g_pairReturns[0]; s->pairReturns[1] = g_pairReturns[1]; }
+        { std::lock_guard<std::mutex> lk(g_streamStartM); s->streamStart = g_streamStart; }
+        { std::lock_guard<std::mutex> lk(g_sndRateM); s->rateLast = g_sndRateLast; }
+        s->seTickBase = g_seTickBase; s->seTickCarry = g_seTickCarry;
         return s;
     }
     extern "C" bool ps2xSimSnapRestore(void *h, PS2Runtime *runtime, uint8_t *rdram)
@@ -4657,6 +4701,12 @@ namespace
         }
         gsRegUnpack(s->gs, mem.gs());
         { std::lock_guard<std::mutex> lk(g_seVoiceM); g_seVoices = s->seVoices; }
+        { std::lock_guard<std::mutex> lk(g_iopSinkM); g_iopSinks = s->sinksFull; }   // exact clocks, no re-anchoring
+        { std::lock_guard<std::mutex> lk(g_sinkRingM); g_sinkRings = s->rings; g_pairSink[0] = s->pairSink[0]; g_pairSink[1] = s->pairSink[1];
+          g_pairReturns[0] = s->pairReturns[0]; g_pairReturns[1] = s->pairReturns[1]; }
+        { std::lock_guard<std::mutex> lk(g_streamStartM); g_streamStart = s->streamStart; }
+        { std::lock_guard<std::mutex> lk(g_sndRateM); g_sndRateLast = s->rateLast; }
+        g_seTickBase = s->seTickBase; g_seTickCarry = s->seTickCarry;
         g_bt3FrameCount.store(s->frame, std::memory_order_relaxed);
         ps2_stubs::ps2RandRestore(s->rand64, s->randCalls);
         return true;

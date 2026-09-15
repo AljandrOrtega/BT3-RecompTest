@@ -4200,6 +4200,8 @@ static void ps2xRollbackAtBoundary(PS2Runtime &rt);   // [rollback] defined with
 extern "C" void ps2xInterruptTick(uint8_t *rdram, PS2Runtime *runtime);   // [rollback] Kernel/Syscalls/Interrupt.cpp: one vblank
 extern "C" void ps2xVirtualClockEnable();                                  // [rollback] ps2_memory.cpp: EE timers on the stepped clock
 extern "C" void ps2xVirtualClockAdvance(uint64_t ns);
+extern "C" bool ps2xVirtualClockOn();
+extern "C" uint64_t ps2xVirtualClockGet();
 void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry)
 {
     m_schedFiber = ps2xFiberAdoptCurrent();
@@ -4768,9 +4770,13 @@ struct Ps2xRollback
                     if (start >= 0 && (int64_t)i - last <= 64) { last = i; continue; }
                     if (start >= 0)
                     {
-                        if (ranges < 40) std::fprintf(stderr, "[rollbackdiff]   0x%06llx..0x%06llx (%lld B)  A=%02x%02x%02x%02x B=%02x%02x%02x%02x\n",
-                            (long long)start, (long long)last, (long long)(last - start + 1),
-                            a[start], a[start+1], a[start+2], a[start+3], b[start], b[start+1], b[start+2], b[start+3]);
+                        if (ranges < 40)
+                        {
+                            char ha[40], hb[40];
+                            for (int k = 0; k < 16; ++k) { std::snprintf(ha + 2 * k, 3, "%02x", a[start + k]); std::snprintf(hb + 2 * k, 3, "%02x", b[start + k]); }
+                            std::fprintf(stderr, "[rollbackdiff]   0x%06llx..0x%06llx (%lld B)  A=%s B=%s\n",
+                                         (long long)start, (long long)last, (long long)(last - start + 1), ha, hb);
+                        }
                         ++ranges;
                     }
                     start = i; last = i;
@@ -4807,11 +4813,17 @@ extern "C" void ps2xGuestSleepMs(unsigned ms)
     }
     static std::mutex s_m;
     static std::condition_variable s_cv;   // never notified: only the deadline ends this wait
+    // [rollback] In frame-stepped mode the deadline is on the VIRTUAL clock, which only advances
+    // when the controller delivers a vblank: a sleeping fiber then wakes after a definite number of
+    // ticks instead of after a wall-clock interval that spans a different number of ticks paced
+    // (play) and unpaced (re-simulation) -- the last one-tick divergence the self-test showed.
+    const bool virt = ps2xVirtualClockOn();
+    const uint64_t vdeadline = ps2xVirtualClockGet() + (uint64_t)ms * 1000000ull;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     bool parkedOnce = false;               // even 0 ms parks once, so one probe pass happens
     std::unique_lock<std::mutex> lk(s_m);
     auto pred = [&]() { if (!parkedOnce) { parkedOnce = true; return false; }
-                        return std::chrono::steady_clock::now() >= deadline; };
+                        return virt ? (ps2xVirtualClockGet() >= vdeadline) : (std::chrono::steady_clock::now() >= deadline); };
     rt->guestWaitT(s_cv, lk, pred, WP_SCHED_YIELD);   // [rollback] pred lives on this stack
 }
 void PS2Runtime::run()
