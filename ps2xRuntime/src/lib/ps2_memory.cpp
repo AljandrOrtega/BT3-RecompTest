@@ -242,6 +242,15 @@ namespace
     // rolled-back re-run reproduce the original, and two netplay machines agree.
     bool     g_vclockOn = false;
     uint64_t g_vclockNs = 0;
+}
+// [rollback] In frame-stepped mode the DMA channels report IDLE as soon as the kick is queued: the
+// worker's completion time is host time, and a guest spin on CHCR.STR would run a different number
+// of iterations paced vs unpaced -- the last non-deterministic input the self-test showed. The
+// controller's vblank pacing replaces the pacing the busy report provided (jobs copy their data at
+// enqueue, so buffer reuse after "done" is safe, as [syncrelax] already relies on).
+extern "C" bool ps2xFrameStepOn();
+namespace
+{
     inline uint64_t steadyClockNs()
     {
         if (g_vclockOn) return g_vclockNs;
@@ -3385,7 +3394,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 // On the i5-12400 the drain + this spin were ~600 ms/s of the game thread ([waitprof]).
                 // =0 restores the always-busy report; =2 never reports busy (dev only: fast-forwards fast boxes).
                 if (asyncKickEnabled() && chan < 3u &&
-                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0 && !ps2xAsyncPaceRelaxed())
+                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0 && !ps2xAsyncPaceRelaxed() && !ps2xFrameStepOn())
                     return m_ioRegisters[address] | 0x100u;   // still RUNNING
 
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;

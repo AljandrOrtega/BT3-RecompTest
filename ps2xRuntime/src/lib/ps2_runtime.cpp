@@ -548,6 +548,15 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    // [rollback] CADENCE COUNTERS: the branch counters that decide when a guest fiber yields, pumps
+    // the CD tick, or checks the vsync. They live on the shared host thread, so a rollback did not
+    // reset their phase: the first yield after a restore landed at a different branch offset than
+    // in the original run, the ADX server thread (a spinner) made different progress relative to
+    // main, and the sound block differed by "one request in flight". In frame-stepped mode the
+    // controller zeroes them at every frame boundary, which makes the cadence a pure function of
+    // the frame's work. Function-local statics before; the aliases below keep the call sites.
+    thread_local uint64_t g_cadNestedFairness = 0u, g_cadMainNestedYield = 0u, g_cadTickCounter = 0u;
+    thread_local uint32_t g_cadBackEdge = 0u, g_cadAdxCtr = 0u, g_cadDp = 0u;
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
     // Per-host-thread guest tid for the deterministic scheduler (main = 1).
     thread_local int g_schedTid = 1;
@@ -2338,7 +2347,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     if (ctx == &m_cpuContext)
     {
         static const bool s_tickPumpEnabled = []() { const char *v = std::getenv("PS2X_TICKPUMP"); return !(v && v[0] == '0'); }();
-        static thread_local uint64_t s_tickCounter = 0u;
+        uint64_t &s_tickCounter = g_cadTickCounter;   // [rollback] cadence counter (file scope)
         static thread_local bool s_pumping = false;
         // Pump interval: running the (expensive) tick FUN_0028a3b0 every 2048 branches
         // is huge redundant overhead (the game calls it too). Default 1048576 (1M);
@@ -2395,7 +2404,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             // Only test the vsync change every 512 branches -- checking (even the lock-free
             // GetCurrentVSyncTick + hasFunction) on EVERY guest branch is millions of calls
             // per frame. Once/512-branches is still far finer than the once/vsync we act on.
-            static thread_local uint32_t s_adxCtr = 0u;
+            uint32_t &s_adxCtr = g_cadAdxCtr;   // [rollback] cadence counter (file scope)
             if (s_adxVsyncPump && ((++s_adxCtr & 0x1FFu) == 0u) && s_tickPumpEnabled && !s_pumping && hasFunction(0x0028a530u))
             {
                 const uint64_t vs = ps2_syscalls::GetCurrentVSyncTick();
@@ -2770,7 +2779,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         // fairness yield never fires because the spin never returns there;
         // dispatchGuestBranch IS hit every iteration, so release the lock + yield
         // here periodically to let other guest threads make progress.
-        static thread_local uint64_t s_nestedFairness = 0u;
+        uint64_t &s_nestedFairness = g_cadNestedFairness;   // [rollback] cadence counter (file scope)
         constexpr uint64_t kNestedFairnessInterval = 256u;
         if ((++s_nestedFairness % kNestedFairnessInterval) == 0u)
         {
@@ -2797,7 +2806,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // spins too (the tick-pump branch above runs only for the main thread).
     if (m_schedEnabled && g_schedIsGuest && ctx == &m_cpuContext)
     {
-        static thread_local uint64_t s_mainNestedYield = 0u;
+        uint64_t &s_mainNestedYield = g_cadMainNestedYield;   // [rollback] cadence counter (file scope)
         constexpr uint64_t kMainNestedInterval = 1024u;
         if ((++s_mainNestedYield % kMainNestedInterval) == 0u)
         {
@@ -3662,7 +3671,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             // file server or hands the cooperative token over. Every 16k dispatches on the main thread: tick the
             // server if it has not run for 20 ms (no sleep), and yield once if another guest thread is runnable.
             static const bool s_dpOn = [](){ const char *v = std::getenv("PS2X_DISPATCHPUMP"); return !(v && v[0] == '0'); }();
-            static thread_local uint32_t s_dp = 0;
+            uint32_t &s_dp = g_cadDp;   // [rollback] cadence counter (file scope)
             if (s_dpOn && m_schedEnabled && ctx == &m_cpuContext && ((++s_dp & 0x3FFFu) == 0u))
             {
                 if (ps2xCdTickStale(20u)) ps2xCdTickOnly(rdram, ctx, this);
@@ -4249,6 +4258,8 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
                 continue;
             }
             ps2xRollbackAtBoundary(*this);
+            g_cadNestedFairness = 0u; g_cadMainNestedYield = 0u; g_cadTickCounter = 0u;   // [rollback] cadence phase = 0 at every boundary
+            g_cadBackEdge = 0u; g_cadAdxCtr = 0u; g_cadDp = 0u;
             { std::lock_guard<std::mutex> lk(g_gateM); g_gate.openFrame = g_gate.waitFrame; }
             g_gateCv.notify_all();
         }
@@ -4399,7 +4410,7 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
 
 bool PS2Runtime::shouldPreemptGuestExecution()
 {
-    thread_local uint32_t s_backEdgeYieldCounter = 0u;
+    uint32_t &s_backEdgeYieldCounter = g_cadBackEdge;   // [rollback] cadence counter (file scope)
     const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
     const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;
     if (++s_backEdgeYieldCounter < yieldInterval)

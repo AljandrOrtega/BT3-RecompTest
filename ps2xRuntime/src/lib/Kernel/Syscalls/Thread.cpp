@@ -1398,13 +1398,29 @@ namespace
     struct KSema   { int id; int count, maxCount, initCount; uint32_t attr, option; int waiters; bool deleted; };
     struct KEvf    { int id; uint32_t attr, option, initBits, bits; int waiters; bool deleted; };
     struct KernelSnap { std::vector<KThread> th; std::vector<KSema> se; std::vector<KEvf> ev;
-                        int nextThread = 2, nextSema = 1, nextEvf = 1; uint64_t vsyncTick = 0; uint32_t vsFlag = 0, vsTick = 0; };
+                        int nextThread = 2, nextSema = 1, nextEvf = 1; uint64_t vsyncTick = 0; uint32_t vsFlag = 0, vsTick = 0;
+                        // SIF RPC bookkeeping (State.h) and the SIF stub's own state (SIF.cpp)
+                        std::unordered_map<uint32_t, RpcServerState> rpcServers; std::unordered_map<uint32_t, RpcClientState> rpcClients;
+                        uint64_t rpcSeq = 0; bool rpcInit = false; uint32_t rpcNextId = 1, rpcPacket = 0, rpcServer = 0, rpcQueue = 0;
+                        void *sif = nullptr;
+                        ~KernelSnap(); };
+    extern "C" void ps2xSifStateFree(void *);
+    KernelSnap::~KernelSnap() { if (sif) ps2xSifStateFree(sif); }
 }
 extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr);
 extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr);
+extern "C" void *ps2xSifStateCapture();
+extern "C" bool ps2xSifStateRestore(void *);
 extern "C" void *ps2xKernelStateCapture()
 {
     KernelSnap *s = new KernelSnap();
+    {
+        std::lock_guard<std::mutex> lk(g_rpc_mutex);
+        s->rpcServers = g_rpc_servers; s->rpcClients = g_rpc_clients; s->rpcSeq = g_sif_rpc_debug_next_seq;
+        s->rpcInit = g_rpc_initialized; s->rpcNextId = g_rpc_next_id; s->rpcPacket = g_rpc_packet_index;
+        s->rpcServer = g_rpc_server_index; s->rpcQueue = g_rpc_active_queue;
+    }
+    s->sif = ps2xSifStateCapture();
     {
         std::lock_guard<std::mutex> lk(g_thread_map_mutex);
         for (auto &kv : g_threads)
@@ -1487,6 +1503,13 @@ extern "C" bool ps2xKernelStateRestore(void *h)
         g_nextEventFlagId = s->nextEvf;
     }
     ps2xVsyncStateSet(s->vsyncTick, s->vsFlag, s->vsTick);
+    {
+        std::lock_guard<std::mutex> lk(g_rpc_mutex);
+        g_rpc_servers = s->rpcServers; g_rpc_clients = s->rpcClients; g_sif_rpc_debug_next_seq = s->rpcSeq;
+        g_rpc_initialized = s->rpcInit; g_rpc_next_id = s->rpcNextId; g_rpc_packet_index = s->rpcPacket;
+        g_rpc_server_index = s->rpcServer; g_rpc_active_queue = s->rpcQueue;
+    }
+    if (s->sif && !ps2xSifStateRestore(s->sif)) return false;
     return true;
 }
 extern "C" void ps2xKernelStateFree(void *h) { delete static_cast<KernelSnap *>(h); }

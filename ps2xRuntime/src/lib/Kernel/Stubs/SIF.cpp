@@ -1120,3 +1120,42 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 }
+
+// [rollback] The SIF stub's host state: the DMA transfer-id counter the guest stores into its sound
+// packets (the write-watch found a rolled-back re-run continuing from the FUTURE id), the SIF
+// registers, command handlers and buffers, and the IOP heap allocations. Captured/restored with
+// the kernel snapshot (Thread.cpp).
+namespace
+{
+    struct SifSnap
+    {
+        uint32_t nextDmaId = 1u, cmdBuffer = 0u, sysCmdBuffer = 0u, heapNext = 0u;
+        bool cmdInitialized = false;
+        std::unordered_map<uint32_t, uint32_t> regs, sregs, cmdHandlers;
+        std::map<uint32_t, uint32_t> heap;
+    };
+}
+extern "C" void *ps2xSifStateCapture()
+{
+    SifSnap *s = new SifSnap();
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifDmaTransferMutex); s->nextDmaId = ps2_stubs::g_nextSifDmaTransferId; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifCmdStateMutex); s->regs = ps2_stubs::g_sifRegs; s->sregs = ps2_stubs::g_sifSregs;
+      s->cmdHandlers = ps2_stubs::g_sifCmdHandlers; s->cmdBuffer = ps2_stubs::g_sifCmdBuffer; s->sysCmdBuffer = ps2_stubs::g_sifSysCmdBuffer;
+      s->cmdInitialized = ps2_stubs::g_sifCmdInitialized; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifHeapMutex); s->heap = ps2_stubs::g_sifHeapAllocations;
+    }
+    return s;
+}
+extern "C" bool ps2xSifStateRestore(void *h)
+{
+    const SifSnap *s = static_cast<const SifSnap *>(h);
+    if (!s) return false;
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifDmaTransferMutex); ps2_stubs::g_nextSifDmaTransferId = s->nextDmaId; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifCmdStateMutex); ps2_stubs::g_sifRegs = s->regs; ps2_stubs::g_sifSregs = s->sregs;
+      ps2_stubs::g_sifCmdHandlers = s->cmdHandlers; ps2_stubs::g_sifCmdBuffer = s->cmdBuffer; ps2_stubs::g_sifSysCmdBuffer = s->sysCmdBuffer;
+      ps2_stubs::g_sifCmdInitialized = s->cmdInitialized; }
+    { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifHeapMutex); ps2_stubs::g_sifHeapAllocations = s->heap;
+    }
+    return true;
+}
+extern "C" void ps2xSifStateFree(void *h) { delete static_cast<SifSnap *>(h); }
