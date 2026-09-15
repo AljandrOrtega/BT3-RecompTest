@@ -50,6 +50,16 @@ function Test-FileCmd($name) {
     return [bool](Get-Command $exe -ErrorAction SilentlyContinue)
 }
 
+# Run a native command line through cmd.exe. This keeps pip/aqtinstall progress
+# and warnings (which they write to stderr) from being surfaced as terminating
+# NativeCommandError records under $ErrorActionPreference = "Stop".
+function Invoke-CmdLine([string]$Line) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { cmd.exe /d /s /c $Line } finally { $ErrorActionPreference = $prev }
+    return $LASTEXITCODE
+}
+
 # ─── VS environment ─────────────────────────────────────────────────────────────
 function Import-VSEnvironment {
     Step "Locating Visual Studio Build Tools"
@@ -145,15 +155,15 @@ function Ensure-Prerequisites {
     }
 
     Step "Installing Python packages (aqtinstall, pefile)"
-    python -m pip install --quiet --upgrade aqtinstall pefile 2>$null
-    if ($LASTEXITCODE -ne 0) { Fail "pip install failed" }
+    $pipRc = Invoke-CmdLine "python -m pip install --quiet --upgrade --disable-pip-version-check --no-warn-script-location aqtinstall pefile 2>nul"
+    if ($pipRc -ne 0) { Fail "pip install failed (exit $pipRc)" }
     Log "aqtinstall + pefile ready"
 
     # Qt via aqtinstall (skip if already present)
     if (-not (Test-Path $QT_ROOT)) {
         Step "Downloading Qt $QT_VERSION ($QT_HOST, $QT_TARGET) via aqtinstall"
-        python -m aqt install-qt $QT_HOST desktop $QT_VERSION $QT_TARGET --outputdir $QT_BASE
-        if ($LASTEXITCODE -ne 0) { Fail "aqt install-qt failed (exit $LASTEXITCODE)" }
+        $aqtRc = Invoke-CmdLine "python -m aqt install-qt $QT_HOST desktop $QT_VERSION $QT_TARGET --outputdir `"$QT_BASE`" 2>nul"
+        if ($aqtRc -ne 0) { Fail "aqt install-qt failed (exit $aqtRc)" }
         if (-not (Test-Path $QT_ROOT)) { Fail "Qt not found at $QT_ROOT after install" }
         Log "Qt installed: $QT_ROOT"
     } else {
