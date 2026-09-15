@@ -4466,6 +4466,26 @@ namespace
     // had arrived: it sat in the pulse loop for its full 20 s timeout with the display frozen, and
     // the step-3 re-assert -- which is what holds 1P VS 2P against the screen's own entry code --
     // returned on its first line every frame. That is why DP came up as 1P vs COM.
+    // The fight does NOT read duelObj+0x13c. That is only Battle Settings' working copy -- it
+    // reads 0 until the menu is opened, while the game's default is 240 s, which is why writing it
+    // alone changed nothing. Leaving Battle Settings commits it into a PER-SLOT table
+    // (0x355c3c..0x355c58):
+    //     base = [0x2ff28c] ; slot = duelObj->0x134 ; base[slot*4 + 0xc34] = duelObj->0x13c
+    // Confirmed against four full-RAM dumps: the only word in 32 MB that held 0, then 4, then 2
+    // across three time-limit settings was 0x6be254, and [0x2ff28c] + 0xc34 lands exactly there.
+    // (The neighbouring 0x140 -> +0xc38 commit is a different Battle Settings option we do not
+    // expose; leave it alone so the game's stored default survives.)
+    static void bt3NetCommitTimeLimit(uint8_t *rdram, uint32_t duelObj,
+                                      uint32_t (*rd)(const uint8_t *, uint32_t),
+                                      void (*wr)(uint8_t *, uint32_t, uint32_t))
+    {
+        const uint32_t base = rd(rdram, 0x2ff28cu) & 0x1FFFFFFFu;
+        if (!base || !duelObj) return;
+        const uint32_t slot = rd(rdram, duelObj + 0x134u);
+        if (slot >= 64u) return;          // it indexes a table: do not scribble on a wild value
+        wr(rdram, base + slot * 4u + 0xc34u, (uint32_t)ps2NetTimeLimit());
+    }
+
     static uint32_t bt3NetTargetState() { return ps2NetBattleType() == 0 ? 0x27u : 0x28u; }
 
     std::atomic<bool> g_netJumpWantConfirm{false};
@@ -4502,7 +4522,9 @@ namespace
             // Leaving it at the default is why DP came up playing like Team -- the screen had a
             // DP type with no budget behind it.
             wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
-            // +0x13c is the Battle Settings time limit, found by dumping RAM at four settings and
+            bt3NetCommitTimeLimit(rdram, duelObj, &rd32, &wr32);
+            // +0x13c is Battle Settings' working copy. Keep writing it so the menu agrees with the
+            // table if it is ever displayed; the commit above is what the fight actually reads., found by dumping RAM at four settings and
             // keeping the only pointer-reachable value that tracked 3 -> 2 -> 1 -> 0 in order.
             wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
             wr32(rdram, stateObj + 0x620u, rd32(rdram, duelObj + 0x110u));      // what 0x356234 does
@@ -4657,6 +4679,8 @@ namespace
             // have made had the player navigated it, and the gate below reads it back out.
             wr32(rdram, duelObj + 0x114u, (uint32_t)ps2NetBattleType());
             wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
+            wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
+            bt3NetCommitTimeLimit(rdram, duelObj, &rd32, &wr32);
             std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u, dp -> %u\n",
                          duelObj, (unsigned)ps2NetBattleType(), (unsigned)ps2NetDpLimit());
             // Advance with a PLAIN WRITE, not bt3MenuGoto: that helper needs the MAIN-MENU object
@@ -4812,25 +4836,25 @@ namespace
         const uint32_t so = ld(0x2ff10cu) & 0x1FFFFFFFu;
         const uint32_t du = ld(0x3b38e8u) & 0x1FFFFFFFu;
         const uint32_t cf = ld(0x3b38d8u) & 0x1FFFFFFFu;
-        uint32_t cur[13] = {0};
+        uint32_t cur[14] = {0};
         if (so) { cur[0] = ld(so + 0x18u);  cur[1] = ld(so + 0x620u); cur[2] = ld(so + 0x624u);
                   cur[3] = ld(so + 0x628u); cur[4] = ld(so + 0x630u); }
         if (du) { cur[5] = ld(du + 0x110u); cur[6] = ld(du + 0x114u); cur[7] = ld(du + 0x118u);
                   cur[8] = ld(du + 0x13cu); }
         if (cf) { cur[9] = ld(cf + 0x3c38u); cur[10] = ld(cf + 0x3c3cu); cur[11] = ld(cf + 0x3c40u); }
-        // The time limit the player picks in Battle Settings is reported at 0x6ba274 under PCSX2.
-        // Every RetroAchievements address is OURS MINUS 0x4000 (their 0x6af198 screen id is our
-        // 0x6b3198), so the candidate here is 0x6be274. Watch it ABSOLUTELY just to confirm the
-        // mapping -- a heap literal is not something to ship a write against, it only tells us
-        // which object to then reach through a pointer.
-        cur[12] = ld(0x6be274u);
-        static uint32_t s_prev[13]; static bool s_have = false;
+        // The COMMITTED time limit, reached the way the game reaches it (0x355c3c..0x355c58)
+        // rather than as a heap literal: base = [0x2ff28c], slot = duelObj->0x134.
+        const uint32_t tlb = ld(0x2ff28cu) & 0x1FFFFFFFu;
+        const uint32_t slot = du ? ld(du + 0x134u) : 0u;
+        cur[12] = slot;
+        cur[13] = (tlb && slot < 64u) ? ld(tlb + slot * 4u + 0xc34u) : 0u;
+        static uint32_t s_prev[14]; static bool s_have = false;
         if (s_have && std::memcmp(cur, s_prev, sizeof cur) == 0) return;
-        static const char *kName[13] = { "screen", "st.mode", "st.type", "st.628", "st.630",
+        static const char *kName[14] = { "screen", "st.mode", "st.type", "st.628", "st.630",
                                          "du.110", "du.114", "du.118", "du.13c",
-                                         "cf.3c38", "cf.3c3c", "cf.3c40", "abs.6be274" };
+                                         "cf.3c38", "cf.3c3c", "cf.3c40", "tl.slot", "tl.value" };
         std::fprintf(stderr, "[matchwatch] frame %llu |", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
-        for (int i = 0; i < 13; ++i)
+        for (int i = 0; i < 14; ++i)
             std::fprintf(stderr, " %s=%u%s", kName[i], cur[i], (s_have && cur[i] != s_prev[i]) ? "*" : "");
         std::fprintf(stderr, "%s%s\n", du ? "" : "  (no duelObj)", so ? "" : "  (no stateObj)");
         std::memcpy(s_prev, cur, sizeof cur); s_have = true;
