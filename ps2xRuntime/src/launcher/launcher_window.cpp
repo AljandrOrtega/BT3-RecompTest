@@ -10,6 +10,7 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QDateTime>
 #include <QDir>
 #include <QEasingCurve>
 #include <QFile>
@@ -189,6 +190,20 @@ QString LauncherWindow::findGameElf()
     return QString();
 }
 
+void LauncherWindow::logVulkanFallback(const QString &msg)
+{
+    const QString logsDir = QDir(apppaths::userRoot()).filePath(QStringLiteral("logs"));
+    QDir().mkpath(logsDir);
+    QFile f(QDir(logsDir).filePath(QStringLiteral("vulkan-fallback.log")));
+    if (f.open(QIODevice::Append | QIODevice::Text))
+    {
+        f.write(QDateTime::currentDateTime().toString(Qt::ISODate).toUtf8());
+        f.write("  ");
+        f.write(msg.toUtf8());
+        f.write("\n");
+    }
+}
+
 void LauncherWindow::onPlayClicked()
 {
     if (!m_plainRunner && m_gameElf.isEmpty())
@@ -238,6 +253,22 @@ void LauncherWindow::onPlayClicked()
         // at the deploy root -- where the launcher wrote them -- not data/.
         env.insert(QStringLiteral("PS2X_EXEDIR"), apppaths::userRoot());
         env.insert(QStringLiteral("PS2X_ASSETDIR"), apppaths::assets());
+#ifdef _WIN32
+        // [vulkan] Windows: paraLLEl-GS runs on the bundled Mesa lavapipe ICD by
+        // default. The vendor Vulkan driver (AMD amdvlk64.dll) access-violates
+        // inside its shader compiler on Polaris/GCN parts and kills the runner.
+        // Set PS2X_VK_NATIVE=1 to opt out and use the system Vulkan driver.
+        if (SettingsManager::instance().renderer() == SettingsManager::kRendererParallelGS &&
+            qEnvironmentVariable("PS2X_VK_NATIVE") != QLatin1String("1"))
+        {
+            const QString lvp = appDir.filePath(QStringLiteral("lavapipe/lvp_icd.x86_64.json"));
+            if (QFile::exists(lvp))
+            {
+                env.insert(QStringLiteral("VK_DRIVER_FILES"), lvp);
+                env.insert(QStringLiteral("VK_ICD_FILENAMES"), lvp);
+            }
+        }
+#endif
 #if !defined(_WIN32) && !defined(Q_OS_MACOS)
         // position-independent loader search is a POSIX concept; Windows
         // resolves the bundled dlls from the executable's own directory, and
@@ -251,6 +282,55 @@ void LauncherWindow::onPlayClicked()
         // Launch detached: the game extracts + execs its own inner runner.
         proc->setProgram(m_gameElf);
     }
+#ifdef _WIN32
+    if (m_plainRunner)
+    {
+        // [vulkan] Keep the game under the launcher so a crash in the vendor
+        // Vulkan driver (or any early failure) is detected and retried once with
+        // OpenGL, dropping a line in logs/vulkan-fallback.log.
+        m_gameProc = proc;
+        const qint64 startMs = QDateTime::currentMSecsSinceEpoch();
+        connect(proc, &QProcess::finished, this,
+                [this, proc, startMs](int code, QProcess::ExitStatus status)
+                {
+                    const qint64 elapsedMs = QDateTime::currentMSecsSinceEpoch() - startMs;
+                    const bool crashed = (status == QProcess::CrashExit) ||
+                                         (code != 0 && (static_cast<quint32>(code) & 0xC0000000u) != 0u);
+                    const bool retryable =
+                        crashed && elapsedMs < 60000 && !m_fallbackRetried &&
+                        SettingsManager::instance().renderer() == SettingsManager::kRendererParallelGS;
+                    if (retryable)
+                    {
+                        m_fallbackRetried = true;
+                        logVulkanFallback(QStringLiteral(
+                            "runner exited abnormally (code=%1 status=%2 after %3 ms); "
+                            "retrying with the OpenGL renderer")
+                            .arg(code).arg(int(status)).arg(elapsedMs));
+                        SettingsManager::instance().setRenderer(SettingsManager::kRendererOpenGL);
+                        SettingsManager::instance().save();
+                        m_gameProc = nullptr;
+                        proc->deleteLater();
+                        onPlayClicked();
+                        return;
+                    }
+                    m_gameProc = nullptr;
+                    proc->deleteLater();
+                    qApp->quit();
+                });
+        proc->start();
+        if (!proc->waitForStarted(5000))
+        {
+            QMessageBox::critical(this, QStringLiteral("Could not start the game"), proc->errorString());
+            proc->deleteLater();
+            m_gameProc = nullptr;
+            return;
+        }
+        // Hide (do not close) so the launcher survives to relay the fallback.
+        hide();
+        return;
+    }
+#endif
+
     if (!proc->startDetached())
     {
         QMessageBox::critical(this, QStringLiteral("Could not start the game"), proc->errorString());

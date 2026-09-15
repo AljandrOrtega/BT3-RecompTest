@@ -61,7 +61,11 @@ else()
     set(LA_LINK archive_static)
 endif()
 
-add_executable(Launcher ${LAUNCHER_SOURCES})
+set(LAUNCHER_RES "")
+if(WIN32)
+    set(LAUNCHER_RES "${CMAKE_CURRENT_SOURCE_DIR}/bt3.rc")
+endif()
+add_executable(Launcher ${LAUNCHER_SOURCES} ${LAUNCHER_RES})
 # [windows] Qt GUI app under a WIN32 subsystem: without this the plain
 # add_executable produces a console-subsystem exe and a terminal window pops up
 # on every launch (the runtime suppresses its own via PS2X_SHOW_WINDOWS_CONSOLE).
@@ -102,6 +106,12 @@ target_link_libraries(Launcher PRIVATE
     Qt${QT_VERSION_MAJOR}::Network
     ${LA_LINK}
     glfw)
+
+# The pinned libarchive is a static library (archive_static builds it itself with
+# LIBARCHIVE_STATIC, which is PRIVATE); archive_extract.cpp includes archive.h and
+# would otherwise import every archive_* symbol with __declspec(dllimport), which
+# lld-link cannot resolve against a .lib. Keep the same macro on the launcher side.
+target_compile_definitions(Launcher PRIVATE LIBARCHIVE_STATIC)
 
 if(NOT MSVC)
     target_compile_options(Launcher PRIVATE -Wall -Wextra)

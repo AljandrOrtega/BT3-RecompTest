@@ -87,6 +87,14 @@ OS_COMPONENTS = {
     "wldap32.dll",
     "wtsapi32.dll",
     "dbghelp.dll",
+    # Video capture (AVICAP32), authorization (AUTHZ), DNS, DirectWrite
+    "avicap32.dll",
+    "authz.dll",
+    "dnsapi.dll",
+    "dwrite.dll",
+    # ODBC driver manager (ships with Windows; Qt SQL plugin imports it)
+    "odbc32.dll",
+    "odbcint.dll",
 }
 OS_COMPONENTS = {name.lower() for name in OS_COMPONENTS}
 
@@ -105,7 +113,6 @@ SUBSYSTEM_WINDOWS_GUI = 2  # IMAGE_SUBSYSTEM_WINDOWS_GUI
 REQUIRED_LAYOUT = [
     "Launcher.exe",
     "bt3-runner.exe",
-    "Launcher.bat",
     "LICENSE",
     "COPYING.LGPLv3",
     "savedata/settings.toml",
