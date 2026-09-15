@@ -225,13 +225,13 @@ def deploy_tree(runner: Path, out: Path) -> None:
         if src.exists():
             copytree_overlay(src, out / a)
 
-    # runtime DLLs (Windows). The runner itself gets copied by build_and_deploy.sh
-    # on Linux; here we place it next to the data so the tree is self-contained.
+    # runtime DLLs (Windows) live next to the runner in the build dir; copy them
+    # too so the tree is self-contained. build_and_deploy.sh replaces the runner
+    # with the self-extracting payload ELF on Linux; here we always place it.
     if IS_WINDOWS:
         for p in runner.parent.glob("*.dll"):
             shutil.copy2(p, out / p.name)
-    else:
-        shutil.copy2(runner, out / runner.name)
+    shutil.copy2(runner, out / runner.name)
     shutil.copymode(runner, out / runner.name)
     print(f"  runner -> {out / runner.name}")
     print(f"Deploy tree ready: {out}")

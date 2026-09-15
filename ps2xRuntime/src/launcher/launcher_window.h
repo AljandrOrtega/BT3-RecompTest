@@ -34,6 +34,9 @@ private:
     void updateHint();
     void checkGameData();
     bool openInstallWizard();
+    // [vulkan] Windows: append a line to logs/vulkan-fallback.log so the
+    // auto-fallback (vendor Vulkan driver crash -> OpenGL) is diagnosable.
+    void logVulkanFallback(const QString &msg);
     // [firstboot] pulse the SETTINGS button until the user opens it, so a
     // first-time user (no settings.toml yet) is drawn to Settings > Misc.
     void startSettingsGlow();
@@ -56,6 +59,7 @@ private:
     bool m_plainRunner = false;
     bool m_gameDataValid = false;
     bool m_wizardShown = false;
+    bool m_fallbackRetried = false;   // [vulkan] Windows: retry OpenGL at most once
     QGraphicsDropShadowEffect *m_settingsGlow = nullptr;
     QPropertyAnimation *m_settingsGlowAnim = nullptr;
     QGraphicsDropShadowEffect *m_playGlow = nullptr;

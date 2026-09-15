@@ -13,11 +13,12 @@ image** — this repository contains no game code, assets, or media.
 
 - **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
   supported — the committed function maps are for the USA executable.
-- Linux, Windows or macOS (Windows/macOS experimental), x86-64 CPU with SSE4.1.
-  On macOS the build is native arm64 (Apple Silicon) or x86-64, one at a time;
-  see [the port notes](docs/MACOS-PORT.md).
+- Linux, Windows or macOS, x86-64 CPU with SSE4.1 (Windows can build with the
+  Docker flow or natively via `build-windows.ps1`; macOS experimental). On macOS
+  the build is native arm64 (Apple Silicon) or x86-64, one at a time; see
+  [the port notes](docs/MACOS-PORT.md).
 - ~16 GB RAM and ~10 GB free disk for the build.
-- Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
+- Linux packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
   `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
   and the X11/OpenGL development headers (raylib builds from source).
 
@@ -31,6 +32,14 @@ image** — this repository contains no game code, assets, or media.
   ```sh
   sudo pacman -S --needed base-devel cmake git python rsync libarchive ffmpeg
   ```
+
+  Native Windows (see `build-windows.ps1`):
+  - VS Build Tools 2022 with the C++ Clang Compiler for Windows
+    (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`), installable with
+    `winget install -e --id Microsoft.VisualStudio.2022.BuildTools`
+  - CMake >= 3.21, Ninja, Python 3, Git for Windows
+  - Qt 6.5.3 `win64_msvc2019_64` (downloaded automatically via aqtinstall on
+    first run), plus the `aqtinstall` and `pefile` Python packages
 
 ## Build + deploy — one command
 
@@ -50,9 +59,10 @@ reuse an existing `games/bt3/work/` tree and only rebuild the runner.
 `tools/release/package.sh` then wraps everything into the single release
 artifact. See `docs/DEPLOY.md` for the full picture.
 
-**Windows:** no toolchain to install — the build runs inside a
+**Windows (Docker):** no toolchain to install — the build runs inside a
 [Docker](https://www.docker.com/products/docker-desktop/) container that
 cross-compiles for Windows (clang-cl + xwin + lld-link; no Visual Studio).
+Prefer the native `build-windows.ps1` flow (below) if Docker is not available.
 You need **Docker Desktop** and **Git for Windows** (for `bash`). The simplest
 route is to double-click `tools\release-windows\build-windows.bat`: it starts
 Docker Desktop if needed, prompts for your ISO (or accepts a `.iso` dragged on
@@ -109,8 +119,38 @@ or run `install game.sh` for a desktop menu entry + icon. The launcher boots
 `bt3-runner` with the extracted `data/SLUS_216.78` and the bundled `lib/`
 automatically.
 
-**Windows** (`cmd.exe`, release): open the extracted folder and run
-`Launcher.exe`; it starts `bt3-runner.exe` with the game data.
+**Windows (native, PowerShell):** the native build runs locally with Visual
+Studio Build Tools 2022 (ClangCL + Win11 SDK), Ninja, Python 3 and Qt 6 (fetched
+via aqtinstall). No Docker or WSL. Double-click `build-windows.ps1` in PowerShell
+or run it from a terminal; the first run installs all missing prerequisites via
+winget and pip. To install only the dependencies, run the standalone script:
+
+```powershell
+.\install-deps-windows.ps1 -Install   # install all prerequisites
+.\build-windows.ps1 -Iso "C:\path\to\bt3-usa.iso"
+```
+
+Call it without arguments to be prompted for the ISO and output directory. Pass
+`-SkipSetup` to reuse an existing `games/bt3/work/` tree (rebuild only). Once the
+stage passes the PE gate, package the release zip with:
+
+```powershell
+.\package-windows.ps1
+```
+
+Produce `build\release-windows\out\stage\` and
+`build\release-windows\out\BT3-Recomp-x86_64.zip` + `.sha256`. The game data is
+never shipped: the launcher's install wizard extracts it from your own ISO.
+
+**Windows** (release): open the extracted folder and run `Launcher.exe`; it
+starts `bt3-runner.exe` with the game data.
+
+On Windows, `paraLLEl-GS` runs on a bundled Mesa **lavapipe** (software Vulkan)
+ICD because several vendor Vulkan drivers (notably the AMD proprietary driver on
+Polaris/GCN, `amdvlk64.dll`) access-violate during shader compilation. If the
+runner still dies, the launcher automatically retries once with the OpenGL
+renderer and records it in `logs\vulkan-fallback.log`. Set `PS2X_VK_NATIVE=1`
+to use the system Vulkan driver instead of the bundled lavapipe.
 
 For raw runner runs (no launcher):
 
@@ -139,6 +179,9 @@ Known issues:
 | Path | What it is |
 | --- | --- |
 | `build_and_deploy.sh` | Linux one-command build + deploy (ISO prompt, portable game tree) |
+| `build-windows.ps1` | Windows one-command native build + deploy (no Docker/WSL; installs deps, builds runner + Qt launcher, stages, PE gate) |
+| `install-deps-windows.ps1` | Windows standalone dependency installer (VS Build Tools, CMake, Ninja, Python, Qt) — run `-Install` |
+| `package-windows.ps1` | Windows release packaging from the native stage (`BT3-Recomp-x86_64.zip` + `.sha256`) |
 | `tools/release/package.sh` | wraps the deploy tree into the release tarball (`BT3-Recomp-x86_64.tar.gz` + `.sha256`) |
 | `games/bt3/setup.py` | cross-platform build pipeline (`--deploy`, `--skip-setup`, `--jobs`) |
 | `docs/DEPLOY.md` | the deploy structure and cross-platform packaging documentation |
