@@ -4477,10 +4477,18 @@ namespace
             if (g_orig356090) g_orig356090(rdram, ctx, runtime);
             return;
         }
-        g_netJumpWantConfirm.store(false, std::memory_order_relaxed);
         const uint32_t duelObj  = rd32(rdram, 0x3b38e8u) & 0x1FFFFFFFu;
         const uint32_t stateObj = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
-        if (duelObj && stateObj)
+        if (!duelObj || !stateObj)
+        {
+            // The duel module has not allocated yet (or has been torn down). Confirming now would
+            // commit NOTHING and still return non-zero, so the caller would transition on whatever
+            // stale setup the state object still holds -- which is how a DP match came up with the
+            // default 10 DP budget. Stay armed, run the real menu, and try again next frame.
+            if (g_orig356090) g_orig356090(rdram, ctx, runtime);
+            return;
+        }
+        g_netJumpWantConfirm.store(false, std::memory_order_relaxed);
         {
             wr32(rdram, duelObj + 0x110u, 1u);                                  // 1P VS 2P
             // 0x114 is the battle type: 0 Single, 1 Team, 2 DP. Taken from the netplay session
@@ -4579,8 +4587,16 @@ namespace
         // remembering that it already ran once this process.
         static uint32_t s_session = 0;
         static int s_step = 0; static uint64_t s_waitUntil = 0;
+        // s_pulseStart lives HERE, not inside step 2, because a static in there survives the
+        // connection: on a second connect it still held the first one's frame, so the 600-frame
+        // timeout had already expired and step 2 gave up on its very first tick. Every piece of
+        // this state machine has to be reset per session, the armed gate flag included -- a gate
+        // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
+        static uint64_t s_pulseStart = 0;
         if (s_session != ps2NetSession())
-        { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; g_netJumpHold.store(0, std::memory_order_relaxed); }
+        { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0;
+          g_netJumpWantConfirm.store(false, std::memory_order_relaxed);
+          g_netJumpHold.store(0, std::memory_order_relaxed); }
         if (s_step >= 3)
         {
             // HOLD the match setup. Writing it once is not enough: the mode is normally committed
@@ -4664,7 +4680,6 @@ namespace
                 // in between. 3 frames down, 5 up, so roughly four presses a second. The previous
                 // version pressed once and waited 240 frames before retrying, which is the 8-second
                 // "slow clicking" -- that was my retry timer, not the game being slow.
-                static uint64_t s_pulseStart = 0;
                 if (!s_pulseStart) s_pulseStart = now;
                 if (now - s_pulseStart > 600u)      // ~20 s: something is wrong, stop hiding it
                 {
