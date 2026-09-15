@@ -680,6 +680,13 @@ public:
     // this parks in the scheduler and re-checks; under threads it is exactly today's
     // cv.wait_for, so the default path is unchanged.
     bool fibersEnabled() const { return m_fibersEnabled; }
+    // Take over THIS host thread as the fiber scheduler: adopt it as the scheduler context, run
+    // `mainEntry` as guest tid 1's fiber, and drive the round-robin until the runtime stops.
+    // Returns when every guest fiber has finished or a stop was requested.
+    void schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry);
+    // Register a guest thread as a fiber instead of a host std::thread. It does not run until the
+    // scheduler picks it.
+    bool schedFiberSpawn(int tid, int prio, std::function<void()> body);
     // Returns true when pred() became true, false if the runtime is stopping.
     bool guestWait(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
                    const std::function<bool()> &pred, int waitPoint,
@@ -699,6 +706,8 @@ private:
     };
     int schedPickNextLocked(int afterTid);
     void schedFiberPark();                   // [fibers] switch this guest fiber back to the scheduler
+    void schedFiberLoop();                   // [fibers] the scheduler body, runs on m_schedFiber
+    bool schedFiberRunnableLocked(int tid) const;
     bool m_schedEnabled = false;
     bool m_fibersEnabled = false;            // [fibers] PS2X_FIBERS=1 and m_schedEnabled
     struct Ps2xFiber *m_schedFiber = nullptr; // [fibers] the host thread that runs the guest fibers

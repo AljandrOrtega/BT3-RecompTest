@@ -378,7 +378,9 @@ namespace ps2_syscalls
         g_activeThreads.fetch_add(1, std::memory_order_relaxed);
         try
         {
-            std::thread worker([=]() mutable
+            // [fibers] The body is identical either way; only who drives it changes -- a host
+            // std::thread, or a fiber the scheduler switches to on its own thread.
+            auto workerBody = [=]() mutable
                                {
             {
                 std::string name = "PS2Thread_" + std::to_string(tid);
@@ -625,8 +627,13 @@ namespace ps2_syscalls
             // Notify anybody waiting for termination (like TerminateThread)
             info->cv.notify_all();
 
-            g_activeThreads.fetch_sub(1, std::memory_order_relaxed); });
-            registerHostThread(tid, std::move(worker));
+            g_activeThreads.fetch_sub(1, std::memory_order_relaxed); };
+            if (!(runtime && runtime->fibersEnabled() &&
+                  runtime->schedFiberSpawn(tid, static_cast<int>(info->currentPriority), workerBody)))
+            {
+                std::thread worker(workerBody);
+                registerHostThread(tid, std::move(worker));
+            }
         }
         catch (const std::exception &e)
         {

@@ -3890,6 +3890,15 @@ void PS2Runtime::schedAcquire(int tid, int prio)
     slot->blocked = false;
     if (m_schedCurrent < 0) m_schedCurrent = tid;
     if (schedDbgOn()) std::cerr << "[sched] tid " << tid << " ACQUIRE-wait (cur=" << m_schedCurrent << ")" << std::endl;
+    if (m_fibersEnabled)
+    {
+        // [fibers] The token is handed over by SWITCHING, not by notifying: the other guest
+        // threads are fibers on this very host thread, so blocking here would stop the one we are
+        // waiting for. Drop the lock across the switch or the next fiber deadlocks on it.
+        while (!(m_schedCurrent == tid || isStopRequested()))
+        { lk.unlock(); schedFiberPark(); lk.lock(); }
+        return;
+    }
     while (!(m_schedCurrent == tid || isStopRequested()))
     {
         Ps2xWaitScope wslot(WP_SCHED_SLOT);
@@ -3915,9 +3924,159 @@ void PS2Runtime::schedAcquire(int tid, int prio)
 // wait the call sites used to do inline. Under fibers it must NOT block the host thread -- every
 // guest fiber shares it, including the one the token was just handed to -- so it parks in the
 // scheduler and re-checks the predicate each time it is scheduled.
-// [fibers] The fiber this host thread is currently executing. Null until guest threads are moved
-// onto fibers, which is why schedFiberPark still has a thread-path fallback.
+// [fibers] FIBER-LOCAL STORAGE.
+//
+// Collapsing the guest threads onto one host thread makes every thread_local in the guest path
+// ALIAS between them: tid 1 sets g_schedTid = 1, the scheduler switches to tid 3's fiber which sets
+// it to 3, and when tid 1 resumes it believes it is tid 3. The first run showed this as
+// "[mutex] tid 1 isGuest=1 want-lock, curHolder=1" -- a thread waiting on a lock it already held,
+// which is impossible for a real thread and is the signature of this aliasing.
+//
+// Only the variables carrying guest-thread IDENTITY need swapping. The rest of the runtime's
+// thread_locals are either per-subsystem caches on threads that are not fibers (GS, kick, stage2)
+// or VU1 state that cannot be interrupted mid-kick, because no park point exists inside one.
+namespace
+{
+    struct GuestTls
+    {
+        std::unordered_map<PS2Runtime *, uint32_t> depths;
+        int  schedTid = 1;
+        bool isGuest = false;
+        uint32_t lastPc = 0, lastRa = 0;
+    };
+    // Keyed by tid, and deliberately NOT in SchedThread: keeping it here avoids touching
+    // ps2_runtime.h, which every generated runner source includes (a ~10 minute rebuild).
+    std::map<int, GuestTls> g_fiberTls;
+}
+
+// [fibers] The fiber this host thread is currently executing. All guest fibers share one host
+// thread, so a single thread_local tracks whichever is live; schedFiberPark switches back from it.
 static thread_local Ps2xFiber *g_curFiber = nullptr;
+
+// [fibers] A guest fiber's body plus the bookkeeping the scheduler needs when it ends.
+namespace
+{
+    struct FiberBody
+    {
+        PS2Runtime *rt = nullptr;
+        int tid = 0;
+        std::function<void()> body;
+    };
+}
+
+bool PS2Runtime::schedFiberRunnableLocked(int tid) const
+{
+    auto it = m_schedThreads.find(tid);
+    if (it == m_schedThreads.end() || !it->second) return false;
+    const SchedThread &t = *it->second;
+    return t.present && !t.blocked && !t.finished && t.fiber != nullptr;
+}
+
+bool PS2Runtime::schedFiberSpawn(int tid, int prio, std::function<void()> body)
+{
+    if (!m_fibersEnabled) return false;
+    FiberBody *fb = new FiberBody{this, tid, std::move(body)};
+    // 8 MB: BT3 nests deeply (the CDVD wait loops never unwind), and this is reserved address
+    // space, not committed memory. ps2xFiberLiveStack reports the part actually in use.
+    Ps2xFiber *f = ps2xFiberCreate(
+        [](void *arg)
+        {
+            FiberBody *b = static_cast<FiberBody *>(arg);
+            PS2Runtime *rt = b->rt;
+            const int tid = b->tid;
+            try { b->body(); }
+            catch (const std::exception &e) { std::fprintf(stderr, "[fibers] tid %d ended: %s\n", tid, e.what()); }
+            catch (...) { std::fprintf(stderr, "[fibers] tid %d ended (unknown exception)\n", tid); }
+            {
+                std::lock_guard<std::mutex> lk(rt->m_schedMutex);
+                auto it = rt->m_schedThreads.find(tid);
+                if (it != rt->m_schedThreads.end() && it->second)
+                { it->second->finished = true; it->second->present = false; }
+            }
+            delete b;
+            // A fiber entry must never return -- there is no stack beneath it. Hand control back
+            // to the scheduler, which will never pick this tid again now that it is finished.
+            for (;;) rt->schedFiberPark();
+        },
+        fb, 8u * 1024u * 1024u);
+    if (!f) { delete fb; std::fprintf(stderr, "[fibers] could not create a fiber for tid %d\n", tid); return false; }
+
+    std::lock_guard<std::mutex> lk(m_schedMutex);
+    auto &slot = m_schedThreads[tid];
+    if (!slot) { slot = std::make_unique<SchedThread>(); slot->order = m_schedOrderCounter++; }
+    slot->prio = prio; slot->present = true; slot->blocked = false; slot->finished = false;
+    slot->fiber = f;
+    return true;
+}
+
+void PS2Runtime::schedFiberLoop()
+{
+    while (!isStopRequested())
+    {
+        Ps2xFiber *f = nullptr;
+        bool anyLeft = false;
+        {
+            std::lock_guard<std::mutex> lk(m_schedMutex);
+            for (const auto &kv : m_schedThreads)
+                if (kv.second && !kv.second->finished) { anyLeft = true; break; }
+            int next = -1;
+            if (m_schedCurrent >= 0 && schedFiberRunnableLocked(m_schedCurrent)) next = m_schedCurrent;
+            else
+            {
+                const int pick = schedPickNextLocked(m_schedCurrent);
+                if (pick >= 0 && schedFiberRunnableLocked(pick)) next = pick;
+            }
+            if (next >= 0) { m_schedCurrent = next; f = m_schedThreads[next]->fiber; }
+        }
+        if (!anyLeft) return;            // every guest fiber has finished
+        if (!f)
+        {
+            // Nobody runnable: all guest fibers are parked on host workers (kick/stage2/GS).
+            // Those threads are independent and will make progress, so give them the CPU rather
+            // than spinning -- this is the one place the fiber scheduler must not busy-wait.
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            continue;
+        }
+        // Swap this fiber's identity in before handing it the CPU, and back out when it parks.
+        // Only the fiber we switched to can have run, so saving its slot on return is sufficient.
+        {
+            GuestTls &t = g_fiberTls[m_schedCurrent];
+            g_guestExecutionDepths = t.depths;
+            g_schedTid = t.schedTid; g_schedIsGuest = t.isGuest;
+            g_schedLastPc = t.lastPc; g_schedLastRa = t.lastRa;
+        }
+        const int ran = m_schedCurrent;
+        g_curFiber = f;
+        ps2xFiberSwitch(m_schedFiber, f);
+        g_curFiber = m_schedFiber;   // back in the scheduler
+        {
+            GuestTls &t = g_fiberTls[ran];
+            t.depths = g_guestExecutionDepths;
+            t.schedTid = g_schedTid; t.isGuest = g_schedIsGuest;
+            t.lastPc = g_schedLastPc; t.lastRa = g_schedLastRa;
+        }
+    }
+}
+
+void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry)
+{
+    m_schedFiber = ps2xFiberAdoptCurrent();
+    if (!m_schedFiber)
+    {
+        std::fprintf(stderr, "[fibers] could not adopt the host thread -- running tid %d directly\n", mainTid);
+        mainEntry();
+        return;
+    }
+    if (!schedFiberSpawn(mainTid, mainPrio, std::move(mainEntry)))
+    {
+        std::fprintf(stderr, "[fibers] could not spawn tid %d -- aborting fiber mode\n", mainTid);
+        return;
+    }
+    { std::lock_guard<std::mutex> lk(m_schedMutex); m_schedCurrent = mainTid; }
+    std::fprintf(stderr, "[fibers] scheduler running, tid %d is on a fiber\n", mainTid);
+    schedFiberLoop();
+    std::fprintf(stderr, "[fibers] scheduler exited\n");
+}
 
 void PS2Runtime::schedFiberPark()
 {
@@ -3977,6 +4136,13 @@ void PS2Runtime::schedYield(int tid)
     // guest thread AND host service threads (interrupt handlers) can actually run
     // -- otherwise everything that needs the lock deadlocks behind us.
     const uint32_t depth = releaseGuestExecution();
+    if (m_fibersEnabled)
+    {
+        std::unique_lock<std::mutex> lk(m_schedMutex);
+        while (!(m_schedCurrent == tid || isStopRequested()))
+        { lk.unlock(); schedFiberPark(); lk.lock(); }
+    }
+    else
     {
         std::unique_lock<std::mutex> lk(m_schedMutex);
         auto it = m_schedThreads.find(tid);
@@ -4235,6 +4401,14 @@ void PS2Runtime::run()
         }
         try
         {
+            if (m_fibersEnabled)
+            {
+                // [fibers] This host thread becomes the scheduler; tid 1 runs dispatchLoop on a
+                // fiber. schedFiberBoot returns when every guest fiber has finished or a stop was
+                // requested, so the surrounding shutdown logging still runs as before.
+                schedFiberBoot(1, 0, [this]() { dispatchLoop(m_memory.getRDRAM(), &m_cpuContext); });
+            }
+            else
             dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
             std::cerr << "[GAMETHREAD-EXIT] final pc=0x" << std::hex << m_cpuContext.pc
                       << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0))
