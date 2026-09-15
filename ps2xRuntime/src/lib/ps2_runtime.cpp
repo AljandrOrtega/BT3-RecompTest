@@ -4032,9 +4032,13 @@ namespace
     // required as well; the users check fibersEnabled() themselves. (PS2X_FRAMEGATE is taken: it
     // is game_overrides' vsync pacing brake, which frame-stepping replaces.)
     bool g_rollbackUnpaced = false;   // [rollback] the controller lifts the 60 Hz vblank pacing (re-simulation)
+    // [statesync] Fibers imply frame stepping: the overlay can then turn rollback + state sync on at
+    // connect time, which needs the controller to own the frame boundary from boot. PS2X_FRAMESTEP=0 forces it off.
     FrameGate g_gate = []() { FrameGate g; const char *e = std::getenv("PS2X_FRAMESTEP"); const char *r = std::getenv("PS2X_ROLLBACKTEST");
-                              const char *n = std::getenv("PS2X_NET_ROLLBACK");
-                              g.on = (e && e[0] && e[0] != '0') || (r && r[0]) || (n && n[0] && n[0] != '0'); return g; }();
+                              const char *n = std::getenv("PS2X_NET_ROLLBACK"); const char *f = std::getenv("PS2X_FIBERS");
+                              g.on = (e && e[0] && e[0] != '0') || (r && r[0]) || (n && n[0] && n[0] != '0') || (f && f[0] && f[0] != '0');
+                              if (e && e[0] == '0') g.on = false;
+                              return g; }();
     std::mutex g_gateM;
     std::condition_variable g_gateCv;
     // [fibers] Probing state (see schedFiberLoop). File-static for the same header reason.
@@ -5149,23 +5153,25 @@ struct Ps2xRollback
     // true when the boundary should carry on as a synced one (inputs from here), false to skip it.
     static bool syncStep(PS2Runtime &rt)
     {
-        static const char *s_path = [](){ const char *v = std::getenv("PS2X_NET_SYNCFILE"); return (v && v[0]) ? v : "/tmp/bt3_netsync.bin"; }();
         using clock = std::chrono::steady_clock;
         if (ps2NetSyncIsHost())
         {
+            // Not from inside the boot: the logo / movie-skip phase reaches the frame kick through call
+            // chains the joiner passes exactly once, early -- a state published there is never adoptable
+            // later. The title is up by ~frame 230 with the intro skipped; wait a little past that.
+            if (g_gate.waitFrame < 300u)
+            {
+                static bool s_said = false;
+                if (!s_said) { s_said = true; std::fprintf(stderr, "[statesync] host: peer connected during boot; publishing once past frame 300\n"); }
+                return false;
+            }
             std::vector<uint8_t> blob;
             const auto t0 = clock::now();
             if (!syncCapture(rt, blob)) { std::fprintf(stderr, "[statesync] host: capture failed\n"); ps2NetDisconnect("state sync capture failed"); return false; }
-            const std::string tmp = std::string(s_path) + ".tmp";
-            std::FILE *f = std::fopen(tmp.c_str(), "wb");
-            const bool wrote = f && std::fwrite(blob.data(), 1, blob.size(), f) == blob.size();
-            if (f) std::fclose(f);
-            if (!wrote || std::rename(tmp.c_str(), s_path) != 0)
-            { std::fprintf(stderr, "[statesync] host: cannot write %s\n", s_path); ps2NetDisconnect("state sync write failed"); return false; }
-            const double msCap = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-            std::fprintf(stderr, "[statesync] host: frame %llu, %zu bytes -> %s (%.1f ms); waiting for the joiner\n",
-                         (unsigned long long)g_gate.waitFrame, blob.size(), s_path, msCap);
-            ps2NetSyncOffer((uint32_t)g_gate.waitFrame, blob.size(), s_path);
+            const size_t bytes = blob.size();
+            std::fprintf(stderr, "[statesync] host: frame %llu, %zu bytes (%.1f ms); publishing over TCP, waiting for the joiner\n",
+                         (unsigned long long)g_gate.waitFrame, bytes, std::chrono::duration<double, std::milli>(clock::now() - t0).count());
+            ps2NetSyncOffer((uint32_t)g_gate.waitFrame, std::move(blob));
             const bool ok = ps2NetSyncWaitDone(180000u);
             const double sWait = std::chrono::duration<double>(clock::now() - t0).count();
             if (!ok) { std::fprintf(stderr, "[statesync] host: no acknowledgement after %.1f s\n", sWait); if (ps2NetActive()) ps2NetDisconnect("state sync timed out"); return false; }
@@ -5173,17 +5179,18 @@ struct Ps2xRollback
             std::fprintf(stderr, "[statesync] host: joiner adopted frame %llu (%.1f s)\n", (unsigned long long)g_gate.waitFrame, sWait);
             return true;
         }
-        uint32_t f = 0; uint64_t bytes = 0; char path[128] = {};
-        if (!ps2NetSyncOffered(&f, &bytes, path, sizeof path)) return false;   // nothing offered yet: keep stepping our own game
-        static std::vector<uint8_t> s_blob; static uint32_t s_blobFrame = 0xFFFFFFFFu; static uint32_t s_tries = 0;
+        uint32_t f = 0; uint64_t bytes = 0;
+        if (!ps2NetSyncOffered(&f, &bytes)) return false;   // nothing offered yet: keep stepping our own game
+        static std::vector<uint8_t> s_blob; static uint32_t s_blobFrame = 0xFFFFFFFFu; static uint32_t s_tries = 0, s_fetchFails = 0;
         static clock::time_point s_t0;
         if (s_blobFrame != f)
         {
-            std::FILE *in = std::fopen(path, "rb");
             std::vector<uint8_t> b;
-            if (in) { std::fseek(in, 0, SEEK_END); const long sz = std::ftell(in); std::fseek(in, 0, SEEK_SET);
-                      if (sz > 0) { b.resize((size_t)sz); if (std::fread(b.data(), 1, b.size(), in) != b.size()) b.clear(); } std::fclose(in); }
-            if (b.size() != bytes) { std::fprintf(stderr, "[statesync] joiner: %s has %zu bytes, offered %llu -- waiting\n", path, b.size(), (unsigned long long)bytes); return false; }
+            if (!ps2NetSyncFetch(b) || b.size() != bytes)
+            {
+                if (++s_fetchFails >= 5u) { std::fprintf(stderr, "[statesync] joiner: cannot fetch the state\n"); ps2NetDisconnect("state sync fetch failed"); }
+                return false;
+            }
             s_blob.swap(b); s_blobFrame = f; s_tries = 0; s_t0 = clock::now();
             std::fprintf(stderr, "[statesync] joiner: offer for frame %u (%zu bytes) at our frame %llu\n", f, s_blob.size(), (unsigned long long)g_gate.waitFrame);
         }
@@ -5197,7 +5204,7 @@ struct Ps2xRollback
             ps2NetSyncApplied(f);
             std::fprintf(stderr, "[statesync] joiner: adopted frame %u after %u boundaries (%.1f s, apply %.1f ms)\n",
                          f, s_tries + 1u, std::chrono::duration<double>(clock::now() - s_t0).count(), ms);
-            s_blob.clear(); s_blob.shrink_to_fit();
+            s_blob.clear(); s_blob.shrink_to_fit(); s_blobFrame = 0xFFFFFFFFu;
             return true;
         }
         ++s_tries;
@@ -5220,12 +5227,17 @@ struct Ps2xRollback
         const uint64_t frame = g_gate.waitFrame;   // read after the sync step: an adopted state moves it
         uint8_t *rdram = g_gate.rdram;
         auto dropEntry = [](RingEntry &e) { ps2xSimSnapFree(e.sim); delete e.fib; };
+        // [desyncdump] with PS2X_NET_DUMPDIR the ring keeps 12 extra frames (the peer's hash for a frame
+        // arrives a few frames after ours), so the divergent frame's RAM is still there to dump -- no
+        // per-frame copies, which cost enough to change the rollback pattern under test.
+        static const bool s_dumpOn = [](){ const char *v = std::getenv("PS2X_NET_DUMPDIR"); return v && v[0]; }();
+        const uint32_t keep = W + (s_dumpOn ? 12u : 0u);
         auto captureInto = [&](uint64_t f)
         {
             PS2Runtime::GuestExecutionScope lock(&rt);
             for (auto &e : ring) if (e.frame == f) { dropEntry(e); e.sim = ps2xSimSnapCapture(&rt, rdram); e.fib = captureFibers(rt); return; }
             ring.push_back(RingEntry{f, ps2xSimSnapCapture(&rt, rdram), captureFibers(rt)});
-            while (!ring.empty() && ring.front().frame + W < f) { dropEntry(ring.front()); ring.pop_front(); }
+            while (!ring.empty() && ring.front().frame + keep < f) { dropEntry(ring.front()); ring.pop_front(); }
         };
         if (resimTarget)
         {
@@ -5236,7 +5248,8 @@ struct Ps2xRollback
                 // its drawing one frame ahead (skinning / decal buffers, uploads), and a frame that was
                 // skipped leaves those one frame stale on the first frame shown after the rollback (P2's
                 // hands parting from the body once per rollback).
-                if (frame + 1u >= resimTarget) ps2xRenderSkipSet(false);
+                static const bool s_renderLast = [](){ const char *v = std::getenv("PS2X_ROLLBACK_RENDERLAST"); return !(v && v[0] == '0'); }();
+                if (s_renderLast && frame + 1u >= resimTarget) ps2xRenderSkipSet(false);
                 return;
             }
         }
@@ -5284,37 +5297,27 @@ struct Ps2xRollback
         // Desync detection on CONFIRMED state only: the ring's oldest entry (frame - W) has every input
         // it depends on known (the stall rule) and was refreshed by any rollback that reached it, so its
         // RAM hash is comparable across the two machines. Every 60 frames (a 32 MB hash is ~10 ms).
-        if (!ring.empty() && (frame % ps2NetCheckEvery()) == 0u && ring.front().frame + W <= frame)
+        if (!ring.empty() && (frame % ps2NetCheckEvery()) == 0u && ring.front().frame + keep <= frame)
         {
             if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
                 ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0u, 0u));
         }
-        // [desyncdump] PS2X_NET_DUMPDIR=<dir>: keep the last 24 confirmed frames' RAM (the peer's hash for a
-        // frame arrives a few frames after ours was set, by which time the ring has moved on) and, when the
-        // confirmed hashes first differ, write that frame's RAM so the two dumps can be diffed offline.
+        // [desyncdump] PS2X_NET_DUMPDIR=<dir>: when the confirmed hashes first differ, write that frame's RAM
+        // from the (deepened) ring so the two sides' dumps can be diffed offline.
         static const char *s_dumpDir = std::getenv("PS2X_NET_DUMPDIR");
         static bool s_dumped = false;
         if (s_dumpDir && s_dumpDir[0] && !s_dumped)
         {
-            static std::deque<std::pair<uint64_t, std::vector<uint8_t>>> hist;
-            if (!ring.empty() && ring.front().frame + W <= frame)
-            {
-                if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
-                {
-                    bool have = false; for (const auto &h : hist) if (h.first == ring.front().frame) { have = true; break; }
-                    if (!have) { hist.emplace_back(ring.front().frame, std::vector<uint8_t>(ram, ram + 32u * 1024u * 1024u)); while (hist.size() > 24u) hist.pop_front(); }
-                }
-            }
             if (const uint32_t df = ps2NetDesyncFrame())
             {
                 s_dumped = true;
-                const std::vector<uint8_t> *ram = nullptr; for (const auto &h : hist) if (h.first == df) { ram = &h.second; break; }
+                const RingEntry *e = nullptr; for (const auto &x : ring) if (x.frame == df) { e = &x; break; }
+                const uint8_t *ram = e ? ps2xSimSnapRam(e->sim) : nullptr;
                 char path[512]; std::snprintf(path, sizeof path, "%s/desync_%u_p%d.bin", s_dumpDir, df, ps2NetLocalPlayer());
                 std::FILE *f = ram ? std::fopen(path, "wb") : nullptr;
-                if (f) { std::fwrite(ram->data(), 1, ram->size(), f); std::fclose(f); }
-                std::fprintf(stderr, "[desyncdump] frame %u: %s (history %llu..%llu)\n", df, f ? path : (ram ? "cannot write" : "not in the history"),
-                             hist.empty() ? 0ull : (unsigned long long)hist.front().first, hist.empty() ? 0ull : (unsigned long long)hist.back().first);
-                hist.clear();
+                if (f) { std::fwrite(ram, 1, 32u * 1024u * 1024u, f); std::fclose(f); }
+                std::fprintf(stderr, "[desyncdump] frame %u: %s (ring %llu..%llu)\n", df, f ? path : (e ? "cannot write" : "no longer in the ring"),
+                             ring.empty() ? 0ull : (unsigned long long)ring.front().frame, ring.empty() ? 0ull : (unsigned long long)ring.back().frame);
             }
         }
     }

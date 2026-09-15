@@ -1,6 +1,7 @@
 // [netplay] see src/lib/ps2_netplay.cpp
 #pragma once
 #include <cstdint>
+#include <vector>
 
 #pragma pack(push, 1)
 struct Ps2xNetInput { uint16_t buttons; uint8_t rx, ry, lx, ly; };   // 6 bytes on the wire
@@ -39,15 +40,20 @@ uint32_t ps2NetRollbackWindow();                       // 0 = lockstep as before
 // network. Returns the absolute frame to roll back to (0 = none), and sets *mustStall when a remote
 // input older than the window is still missing (the controller then waits as lockstep did).
 uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall);
-// [statesync] State sync at connect (PS2X_NET_SYNC=1; needs the rollback controller). The host publishes
-// its frame-boundary state (a file for now: PS2X_NET_SYNCFILE, visible to both), the joiner adopts it at
-// a structurally comparable boundary and acknowledges; inputs are exchanged from that frame on.
+// [statesync] State sync at connect (on by default with a rollback window; PS2X_NET_SYNC=0 disables). The
+// host publishes its frame-boundary state over a TCP connection on its port number, the joiner adopts it
+// at a structurally comparable boundary and acknowledges; inputs are exchanged from that frame on.
+void     ps2NetSetRollback(int frames);                         // overlay: 0 = lockstep (env PS2X_NET_ROLLBACK is the default)
+int      ps2NetRollbackSetting();
+void     ps2NetSetSync(bool on);
+bool     ps2NetSyncSetting();
 bool     ps2NetSyncPending();                                   // connected, sync on, state not yet adopted
 bool     ps2NetSyncOn();                                        // sync enabled for this session (netjump must stay out: it writes state on one side)
 bool     ps2NetSyncIsHost();
-void     ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path);   // host: announce the blob
-bool     ps2NetSyncWaitDone(uint32_t timeoutMs);                 // host: pump until the joiner's DONE; sets the frame base
-bool     ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes, char *path, size_t pathCap);   // joiner: an offer arrived
+void     ps2NetSyncOffer(uint32_t frameAbs, std::vector<uint8_t> &&blob);   // host: publish (TCP) + announce
+bool     ps2NetSyncWaitDone(uint32_t timeoutMs);                 // host: serve the blob, pump until the joiner's DONE; sets the frame base
+bool     ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes); // joiner: an offer arrived
+bool     ps2NetSyncFetch(std::vector<uint8_t> &out);            // joiner: pull the blob over TCP (blocking, 30 s timeout)
 void     ps2NetSyncApplied(uint32_t frameAbs);                   // joiner: state adopted; sets the base, sends DONE
 uint32_t ps2NetCheckEvery();      // PS2X_NET_CHECKEVERY: confirmed-state checksum interval (default 60)
 uint32_t ps2NetDesyncFrame();     // [desyncdump] the first frame whose confirmed hashes differed, 0 = none

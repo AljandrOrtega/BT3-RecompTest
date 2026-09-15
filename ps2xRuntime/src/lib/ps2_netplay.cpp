@@ -128,10 +128,14 @@ struct Net
     std::deque<std::pair<std::chrono::steady_clock::time_point, NetPkt>> held;
     std::atomic<uint64_t> predictions{0}, rollbacks{0}, mispredicts{0};
     // [statesync]
-    bool        syncOn = false;        // PS2X_NET_SYNC=1
+    bool        syncOn = false;        // PS2X_NET_SYNC=1 / overlay
     bool        synced = true;         // false from connect until the state sync completes (when syncOn)
     bool        syncOffered = false, syncDone = false;
     uint32_t    syncFrame = 0; uint64_t syncBytes = 0; char syncPath[96] = {};
+    int         port = 0;              // host: the UDP listen port; the state blob goes over TCP on the same number
+    std::vector<uint8_t> syncBlob;     // host: the published state until the joiner acknowledged
+    SOCKET      syncListen = INVALID_SOCKET;
+    bool        envDefaults = false;   // PS2X_NET_ROLLBACK / PS2X_NET_SYNC read once; the overlay may override
     uint32_t    desyncFrame = 0;       // [desyncdump] first frame whose confirmed hash differed (0 = none yet)
     uint32_t    checkEvery = 60;       // PS2X_NET_CHECKEVERY: confirmed-state checksum interval in frames
 };
@@ -339,26 +343,38 @@ uint32_t ps2NetDelay() { return g.delay; }
 // Shared by the env path and the overlay's Host/Join buttons. `listenPort != 0` hosts;
 // otherwise `conn` is "host:port". Safe to call while the game is running: the socket is the
 // only state, and the frame hook pumps it from the next frame on.
+// [rollback] The environment sets the defaults once; the overlay's Netplay tab may change them before Host/Join.
+static void netEnvDefaults()
+{
+    if (g.envDefaults) return;
+    g.envDefaults = true;
+    const char *w = std::getenv("PS2X_NET_ROLLBACK");
+    g.rbWindow = (w && w[0]) ? (uint32_t)std::atoi(w) : 0u;
+    if (g.rbWindow > 30u) g.rbWindow = 30u;
+    const char *l = std::getenv("PS2X_NET_FAKELAG");
+    g.fakeLagMs = (l && l[0]) ? (uint32_t)std::atoi(l) : 0u;
+    const char *ti = std::getenv("PS2X_NET_TESTINPUT");
+    g.testInput = ti && ti[0] && ti[0] != '0';
+    const char *sy = std::getenv("PS2X_NET_SYNC");
+    g.syncOn = !(sy && sy[0] == '0');   // [statesync] on unless PS2X_NET_SYNC=0 (only meaningful with a rollback window)
+    if (const char *ce = std::getenv("PS2X_NET_CHECKEVERY")) { const int v = std::atoi(ce); if (v >= 1 && v <= 3600) g.checkEvery = (uint32_t)v; }
+}
+void ps2NetSetRollback(int frames) { netEnvDefaults(); if (frames >= 0 && frames <= 30) g.rbWindow = (uint32_t)frames; }
+int  ps2NetRollbackSetting()        { netEnvDefaults(); return (int)g.rbWindow; }
+void ps2NetSetSync(bool on)         { netEnvDefaults(); g.syncOn = on; }
+bool ps2NetSyncSetting()            { netEnvDefaults(); return g.syncOn; }
+
 static bool netStart(const char *conn, int listenPort, int player)
 {
-    {   // [rollback] window and fake lag from the environment
-        const char *w = std::getenv("PS2X_NET_ROLLBACK");
-        g.rbWindow = (w && w[0]) ? (uint32_t)std::atoi(w) : 0u;
-        if (g.rbWindow > 30u) g.rbWindow = 30u;
-        const char *l = std::getenv("PS2X_NET_FAKELAG");
-        g.fakeLagMs = (l && l[0]) ? (uint32_t)std::atoi(l) : 0u;
-        const char *ti = std::getenv("PS2X_NET_TESTINPUT");
-        g.testInput = ti && ti[0] && ti[0] != '0';
-        if (g.rbWindow) std::fprintf(stderr, "[netplay] rollback window %u frames%s\n", g.rbWindow, g.fakeLagMs ? " (with fake lag)" : "");
-        const char *sy = std::getenv("PS2X_NET_SYNC");
-        g.syncOn = sy && sy[0] && sy[0] != '0' && g.rbWindow != 0u;   // [statesync] needs the frame-boundary controller
-        g.synced = !g.syncOn;
-        if (sy && sy[0] && sy[0] != '0' && !g.rbWindow) std::fprintf(stderr, "[netplay] PS2X_NET_SYNC needs PS2X_NET_ROLLBACK: ignored\n");
-        if (g.syncOn) std::fprintf(stderr, "[netplay] state sync at connect (%s)\n", g.listening ? "host publishes" : "joiner adopts");
-        if (const char *ce = std::getenv("PS2X_NET_CHECKEVERY")) { const int v = std::atoi(ce); if (v >= 1 && v <= 3600) g.checkEvery = (uint32_t)v; }
-        if (g.fakeLagMs) std::fprintf(stderr, "[netplay] fake receive lag %u ms\n", g.fakeLagMs);
-    }
+    netEnvDefaults();
     if (g.active) { std::fprintf(stderr, "[netplay] already connected\n"); return false; }
+    const bool syncWanted = g.syncOn;
+    g.syncOn = syncWanted && g.rbWindow != 0u;   // [statesync] needs the frame-boundary controller
+    g.synced = !g.syncOn;
+    if (g.rbWindow) std::fprintf(stderr, "[netplay] rollback window %u frames%s\n", g.rbWindow, g.fakeLagMs ? " (with fake lag)" : "");
+    if (syncWanted && !g.rbWindow) std::fprintf(stderr, "[netplay] state sync needs a rollback window: lockstep without sync\n");
+    if (g.syncOn) std::fprintf(stderr, "[netplay] state sync at connect (%s)\n", listenPort ? "host publishes" : "joiner adopts");
+    g.port = listenPort;
 #if defined(_WIN32)
     static bool s_wsa = [](){ WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); return true; }();
     (void)s_wsa;
@@ -418,10 +434,12 @@ void ps2NetDisconnect(const char *why)
     sendBye();
     std::lock_guard<std::mutex> lk(g.mtx);
     if (g.sock != INVALID_SOCKET) { PS2X_CLOSESOCK(g.sock); g.sock = INVALID_SOCKET; }
+    if (g.syncListen != INVALID_SOCKET) { PS2X_CLOSESOCK(g.syncListen); g.syncListen = INVALID_SOCKET; }
+    g.syncBlob.clear(); g.syncBlob.shrink_to_fit();
     g.active = false; g.connected = false; g.peerKnown = false; g.listening = false;
     g.local.clear(); g.remote.clear(); g.peerHash.clear(); g.ourHash.clear();
     g.needBase = true; g.base = 0; g.checkFrame = 0; g.checkValue = 0;
-    g.synced = !g.syncOn; g.syncOffered = false; g.syncDone = false;   // [statesync]
+    g.synced = true; g.syncOffered = false; g.syncDone = false;   // [statesync] (netStart re-derives syncOn from the setting)
     std::fprintf(stderr, "[netplay] disconnected (%s) -- local pads restored\n", why ? why : "requested");
 }
 
@@ -672,14 +690,59 @@ void ps2NetFrame(uint32_t frame)
 }
 
 // ---- [statesync] ------------------------------------------------------------------------
+// The blob (40 MB) goes over a TCP connection on the host's port number (UDP carries the inputs, TCP
+// the one-time state): the host listens while it waits for the acknowledgement, the joiner connects
+// when it sees the OFFER, reads [u64 size][bytes], and adopts. Blocking sockets with timeouts; both
+// sides are parked in the sync anyway.
+static void sockTimeouts(SOCKET s, int ms)
+{
+#if defined(_WIN32)
+    DWORD t = (DWORD)ms; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof t); setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof t);
+#else
+    timeval tv{}; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+}
+static bool sendAll(SOCKET s, const uint8_t *p, size_t n)
+{
+    while (n)
+    {
+        const int k = (int)::send(s, reinterpret_cast<const char *>(p), (int)(n > (1u << 20) ? (1u << 20) : n), 0);
+        if (k <= 0) return false;
+        p += k; n -= (size_t)k;
+    }
+    return true;
+}
+static bool recvAll(SOCKET s, uint8_t *p, size_t n)
+{
+    while (n)
+    {
+        const int k = (int)::recv(s, reinterpret_cast<char *>(p), (int)(n > (1u << 20) ? (1u << 20) : n), 0);
+        if (k <= 0) return false;
+        p += k; n -= (size_t)k;
+    }
+    return true;
+}
 bool ps2NetSyncPending() { return g.active && g.connected && g.syncOn && !g.synced; }
 bool ps2NetSyncOn()      { return g.active && g.syncOn; }
 bool ps2NetSyncIsHost()  { return g.listening; }
-void ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path)
+void ps2NetSyncOffer(uint32_t frameAbs, std::vector<uint8_t> &&blob)
 {
-    g.syncFrame = frameAbs; g.syncBytes = bytes; g.syncDone = false;
-    std::strncpy(g.syncPath, path ? path : "", sizeof g.syncPath - 1u); g.syncPath[sizeof g.syncPath - 1u] = 0;
-    sendSyncCtl(1u, frameAbs, bytes, g.syncPath);
+    g.syncFrame = frameAbs; g.syncBytes = blob.size(); g.syncDone = false; g.syncPath[0] = 0;
+    g.syncBlob = std::move(blob);
+    if (g.syncListen == INVALID_SOCKET)
+    {
+        g.syncListen = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (g.syncListen != INVALID_SOCKET)
+        {
+            int one = 1; setsockopt(g.syncListen, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&one), sizeof one);
+            sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons(static_cast<uint16_t>(g.port));
+            if (::bind(g.syncListen, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0 || ::listen(g.syncListen, 1) != 0)
+            { std::fprintf(stderr, "[statesync] host: TCP listen on %d failed\n", g.port); PS2X_CLOSESOCK(g.syncListen); g.syncListen = INVALID_SOCKET; }
+            else setNonBlocking(g.syncListen);
+        }
+    }
+    sendSyncCtl(1u, frameAbs, g.syncBytes, nullptr);
 }
 bool ps2NetSyncWaitDone(uint32_t timeoutMs)
 {
@@ -690,23 +753,60 @@ bool ps2NetSyncWaitDone(uint32_t timeoutMs)
         pump();
         if (!g.active || !g.connected) return false;
         if (g.syncDone) break;
+        if (g.syncListen != INVALID_SOCKET)
+        {   // a joiner asking for the blob: serve it (blocking; the joiner is parked in the sync too)
+            sockaddr_in from{}; socklen_t fl = sizeof from;
+            const SOCKET c = ::accept(g.syncListen, reinterpret_cast<sockaddr *>(&from), &fl);
+            if (c != INVALID_SOCKET)
+            {
+#if !defined(_WIN32)
+                const int fl2 = fcntl(c, F_GETFL, 0); fcntl(c, F_SETFL, fl2 & ~O_NONBLOCK);
+#endif
+                sockTimeouts(c, 30000);
+                const uint64_t sz = g.syncBlob.size();
+                const auto ts = std::chrono::steady_clock::now();
+                const bool ok = sendAll(c, reinterpret_cast<const uint8_t *>(&sz), sizeof sz) && sendAll(c, g.syncBlob.data(), g.syncBlob.size());
+                PS2X_CLOSESOCK(c);
+                std::fprintf(stderr, "[statesync] host: sent %llu bytes over TCP in %.2f s (%s)\n", (unsigned long long)sz,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count(), ok ? "ok" : "FAILED");
+            }
+        }
         const auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() > (long)timeoutMs) return false;
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastOffer).count() >= 200)   // UDP: repeat the offer
-        { lastOffer = now; sendSyncCtl(1u, g.syncFrame, g.syncBytes, g.syncPath); }
+        { lastOffer = now; sendSyncCtl(1u, g.syncFrame, g.syncBytes, nullptr); }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    if (g.syncListen != INVALID_SOCKET) { PS2X_CLOSESOCK(g.syncListen); g.syncListen = INVALID_SOCKET; }
+    g.syncBlob.clear(); g.syncBlob.shrink_to_fit();
     syncResetTables(g.syncFrame);
     std::fprintf(stderr, "[netplay] frame base = %u (state sync)\n", g.syncFrame);
     return true;
 }
-bool ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes, char *path, size_t pathCap)
+bool ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes)
 {
     pump();
     if (!g.syncOffered) return false;
     *frameAbs = g.syncFrame; *bytes = g.syncBytes;
-    if (path && pathCap) { std::strncpy(path, g.syncPath, pathCap - 1u); path[pathCap - 1u] = 0; }
     return true;
+}
+bool ps2NetSyncFetch(std::vector<uint8_t> &out)
+{
+    out.clear();
+    const SOCKET c = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (c == INVALID_SOCKET) return false;
+    sockTimeouts(c, 30000);
+    sockaddr_in a = g.peer;   // the host's address; its TCP listener uses its UDP port number
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = ::connect(c, reinterpret_cast<sockaddr *>(&a), sizeof a) == 0;
+    uint64_t sz = 0;
+    if (ok) ok = recvAll(c, reinterpret_cast<uint8_t *>(&sz), sizeof sz) && sz > 0 && sz <= (256ull << 20);
+    if (ok) { out.resize((size_t)sz); ok = recvAll(c, out.data(), out.size()); }
+    PS2X_CLOSESOCK(c);
+    if (!ok) out.clear();
+    std::fprintf(stderr, "[statesync] joiner: TCP fetch %s (%llu bytes, %.2f s)\n", ok ? "ok" : "FAILED", (unsigned long long)sz,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
 }
 void ps2NetSyncApplied(uint32_t frameAbs)
 {
