@@ -4812,21 +4812,53 @@ namespace
         const uint32_t so = ld(0x2ff10cu) & 0x1FFFFFFFu;
         const uint32_t du = ld(0x3b38e8u) & 0x1FFFFFFFu;
         const uint32_t cf = ld(0x3b38d8u) & 0x1FFFFFFFu;
-        uint32_t cur[12] = {0};
+        uint32_t cur[13] = {0};
         if (so) { cur[0] = ld(so + 0x18u);  cur[1] = ld(so + 0x620u); cur[2] = ld(so + 0x624u);
                   cur[3] = ld(so + 0x628u); cur[4] = ld(so + 0x630u); }
         if (du) { cur[5] = ld(du + 0x110u); cur[6] = ld(du + 0x114u); cur[7] = ld(du + 0x118u);
                   cur[8] = ld(du + 0x13cu); }
         if (cf) { cur[9] = ld(cf + 0x3c38u); cur[10] = ld(cf + 0x3c3cu); cur[11] = ld(cf + 0x3c40u); }
-        static uint32_t s_prev[12]; static bool s_have = false;
+        // The time limit the player picks in Battle Settings is reported at 0x6ba274 under PCSX2.
+        // Every RetroAchievements address is OURS MINUS 0x4000 (their 0x6af198 screen id is our
+        // 0x6b3198), so the candidate here is 0x6be274. Watch it ABSOLUTELY just to confirm the
+        // mapping -- a heap literal is not something to ship a write against, it only tells us
+        // which object to then reach through a pointer.
+        cur[12] = ld(0x6be274u);
+        static uint32_t s_prev[13]; static bool s_have = false;
         if (s_have && std::memcmp(cur, s_prev, sizeof cur) == 0) return;
-        static const char *kName[12] = { "screen", "st.mode", "st.type", "st.628", "st.630",
-                                         "du.110", "du.114", "du.118", "du.time",
-                                         "cf.3c38", "cf.3c3c", "cf.3c40" };
+        static const char *kName[13] = { "screen", "st.mode", "st.type", "st.628", "st.630",
+                                         "du.110", "du.114", "du.118", "du.13c",
+                                         "cf.3c38", "cf.3c3c", "cf.3c40", "abs.6be274" };
         std::fprintf(stderr, "[matchwatch] frame %llu |", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
-        for (int i = 0; i < 12; ++i)
+        for (int i = 0; i < 13; ++i)
             std::fprintf(stderr, " %s=%u%s", kName[i], cur[i], (s_have && cur[i] != s_prev[i]) ? "*" : "");
         std::fprintf(stderr, "%s%s\n", du ? "" : "  (no duelObj)", so ? "" : "  (no stateObj)");
+        std::memcpy(s_prev, cur, sizeof cur); s_have = true;
+    }
+
+    // [matchwatch] PS2X_MATCHWATCH=2 also reports every word of the duel object's first 0x400
+    // bytes that changes. duelObj+0x13c was picked by diffing whole-RAM dumps at four time-limit
+    // settings, and it reads 0 when the game's default is 3 -- so it is probably the wrong field.
+    // Walking Battle Settings with this on names the right one directly.
+    static void bt3MatchScan(uint8_t *rdram)
+    {
+        static const int s_lvl = [](){ const char *v = std::getenv("PS2X_MATCHWATCH");
+                                       return (v && v[0]) ? std::atoi(v) : 0; }();
+        if (s_lvl < 2 || !rdram) return;
+        uint32_t du = 0; std::memcpy(&du, rdram + (0x3b38e8u & PS2_RAM_MASK), 4);
+        du &= 0x1FFFFFFFu;
+        static uint32_t s_base = 0; static uint32_t s_prev[0x100]; static bool s_have = false;
+        if (!du) { s_have = false; return; }
+        if (du != s_base) { s_base = du; s_have = false; }
+        uint32_t cur[0x100];
+        std::memcpy(cur, rdram + (du & PS2_RAM_MASK), sizeof cur);
+        if (!s_have) { std::memcpy(s_prev, cur, sizeof cur); s_have = true; return; }
+        if (std::memcmp(cur, s_prev, sizeof cur) == 0) return;
+        std::fprintf(stderr, "[matchscan] frame %llu duelObj=0x%x |",
+                     (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), du);
+        for (int i = 0; i < 0x100; ++i)
+            if (cur[i] != s_prev[i]) std::fprintf(stderr, " +0x%03x: %u -> %u", i * 4, s_prev[i], cur[i]);
+        std::fprintf(stderr, "\n");
         std::memcpy(s_prev, cur, sizeof cur); s_have = true;
     }
 
@@ -4892,6 +4924,7 @@ namespace
         }
         bt3StateWatch(rdram, ctx);   // [statewatch]
         bt3MatchWatch(rdram);        // [matchwatch]
+        bt3MatchScan(rdram);         // [matchwatch] level 2
         bt3MemWatch(rdram);          // [memwatch]
         bt3MemBlock(rdram);          // [memblock]
         bt3DumpKey(rdram);           // [dumpkey]
