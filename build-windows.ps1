@@ -58,6 +58,20 @@ function Test-FileCmd($name) {
     return [bool](Get-Command $exe -ErrorAction SilentlyContinue)
 }
 
+# Qt ships both release and debug DLLs in the same folder: the debug one is
+# "<base>d.dll" and its release sibling "<base>.dll" sits next to it. A naive
+# "*d.dll" match is WRONG — it also matches release plugins whose name
+# legitimately ends in a "d" before ".dll" (qschannelbackend.dll,
+# qopensslbackend.dll, qcertonlybackend.dll). Deleting those silently removes
+# Qt's TLS backends and makes HTTPS downloads fail with "TLS initialization
+# failed". Only treat a file as debug when the release counterpart exists.
+function Test-QtDebugDll([System.IO.FileInfo]$File) {
+    $n = $File.Name
+    if ($n -notmatch 'd\.dll$') { return $false }
+    $release = $n.Substring(0, $n.Length - 5) + '.dll'
+    return (Test-Path (Join-Path $File.DirectoryName $release))
+}
+
 # ─── VS environment ─────────────────────────────────────────────────────────────
 function Import-VSEnvironment {
     Step "Locating Visual Studio Build Tools"
@@ -249,27 +263,27 @@ Step "Bundling DLLs"
 $stageLib = Join-Path $STAGE "lib"
 New-Item -ItemType Directory -Force -Path $stageLib | Out-Null
 
-# Qt6 DLLs (only release — debug *d.dll require debug MSVC runtime the gate rejects)
+# Qt6 DLLs (only release — debug DLLs require the debug MSVC runtime the gate rejects)
 $qtBin = Join-Path $QT_ROOT "bin"
 if (Test-Path $qtBin) {
     Get-ChildItem $qtBin -Filter "Qt6*.dll" |
-        Where-Object { $_.Name -notmatch "d\.dll$" } |
+        Where-Object { -not (Test-QtDebugDll $_) } |
         ForEach-Object {
             Copy-Item $_.FullName (Join-Path $stageLib $_.Name) -Force
         }
     Log "Qt6 release DLLs copied"
 } else { Fail "Qt bin dir not found: $qtBin" }
 
-# Qt plugins (only release — no debug *d.dll)
+# Qt plugins (release only; keep the release TLS backends)
 $qtPluginSrc = Get-ChildItem $QT_ROOT -Directory -Filter "plugins" -ErrorAction SilentlyContinue |
                Select-Object -First 1
 $qtPluginDst = Join-Path $stageLib "qt6\plugins"
 New-Item -ItemType Directory -Force -Path $qtPluginDst | Out-Null
 if ($qtPluginSrc) {
-    # Copy the directory tree but exclude debug plugin DLLs and SQL driver
-    # plugins (qsqlpsql.dll needs the non-system LIBPQ.dll; not used here).
+    # Copy the directory tree but exclude the debug plugin DLLs and the SQL
+    # driver plugins (qsqlpsql.dll needs the non-system LIBPQ.dll; unused here).
     Copy-Item "$($qtPluginSrc.FullName)\*" $qtPluginDst -Recurse -Force
-    Get-ChildItem $qtPluginDst -Recurse -Filter "*d.dll" | Remove-Item -Force
+    Get-ChildItem $qtPluginDst -Recurse -Filter "*.dll" | Where-Object { Test-QtDebugDll $_ } | Remove-Item -Force
     Remove-Item -Recurse -Force (Join-Path $qtPluginDst "sqldrivers") -ErrorAction SilentlyContinue
     Log "Qt plugins (release) copied"
 } else { Log "WARNING: Qt plugins dir not found" }
