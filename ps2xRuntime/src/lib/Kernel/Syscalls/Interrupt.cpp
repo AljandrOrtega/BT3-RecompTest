@@ -437,6 +437,63 @@ namespace ps2_syscalls
         }
     }
 
+    // [rollback] ONE vblank tick: the body the timer worker used to inline. In frame-stepped mode
+    // (PS2X_FRAMESTEP / PS2X_ROLLBACKTEST) the fiber scheduler's controller calls it whenever every
+    // guest fiber is parked, paced to 60 Hz for play and unpaced during re-simulation -- so the
+    // number of vblanks a guest frame sees is a function of guest progress, not of wall time,
+    // which is what a rollback re-run (and two netplay machines) need to agree on.
+    static void interruptTick(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        // GS CSR FIELD (bit 13) toggles every vsync on real hardware (interlace
+        // even/odd field). It was frozen at 0 here, which breaks games that key
+        // per-field double-buffering off it: BT3 builds its display list into
+        // alternating 1MB pool halves and derives the DMA kick address from FIELD.
+        // Frozen FIELD => every other frame's chain is kicked at the wrong half,
+        // whose first block is a bookkeeping header that parses as qwc=0 REFE
+        // ("empty chain, end") -> the whole 3D scene of that frame is dropped.
+        // PS2X_NOFIELD=1 restores the frozen behavior for A/B.
+        {
+            static const bool s_noField = [](){ const char *v = std::getenv("PS2X_NOFIELD"); return v && v[0] && v[0] != '0'; }();
+            if (!s_noField)
+                runtime->memory().gs().csr.fetch_xor(0x2000ull);
+        }
+        const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
+        ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
+        dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
+        // Drive EE timer interrupts (Timer0-3, INTC causes 9-12). Games use
+        // these as periodic ticks for service threads (sound, timer-delay loops);
+        // the runtime pumps them here. Firing only ONCE per vblank (60Hz) paces
+        // the game's Timer2-driven service loop (sub_002BAAF8) at 60Hz -> ~12fps.
+        // PS2X_TIMERMULT fires them N times/vblank to approximate the real
+        // sub-frame timer rate so those waits complete faster (higher game fps).
+        static const int s_timerMult = []() {
+            const char *v = std::getenv("PS2X_TIMERMULT");
+            int m = v ? std::atoi(v) : 1;
+            return m < 1 ? 1 : (m > 256 ? 256 : m);
+        }();
+        for (int tm = 0; tm < s_timerMult; ++tm)
+            for (uint32_t timerCause = 9u; timerCause <= 12u; ++timerCause)
+            {
+                runtime->memory().raiseEeTimerInterruptFlag(timerCause);
+                dispatchIntcHandlersForCause(rdram, runtime, timerCause);
+            }
+        // NOTE: BT3 CD read-completion is now driven inline from the
+        // read-poll (game_overrides.cpp bt3CdReadStatePoll), which is
+        // race-free; the old cross-thread pump (bt3PumpCdTick) is left in
+        // place but no longer called (it raced/starved).
+    }
+
+    extern "C" bool ps2xFrameStepOn();   // ps2_runtime.cpp: frame-stepped mode (the controller delivers the ticks)
+    extern "C" void ps2xInterruptTick(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        const int saved = g_currentThreadId;
+        g_currentThreadId = -1;   // handlers identify as the interrupt context, as on the worker
+        interruptTick(rdram, runtime);
+        g_currentThreadId = saved;
+    }
+
     static void interruptWorkerMain(uint8_t *rdram, PS2Runtime *runtime)
     {
         g_currentThreadId = -1;
@@ -467,48 +524,12 @@ namespace ps2_syscalls
                 continue;
             }
 
-            for (int i = 0; i < ticksToProcess; ++i)
-            {
-                // GS CSR FIELD (bit 13) toggles every vsync on real hardware (interlace
-                // even/odd field). It was frozen at 0 here, which breaks games that key
-                // per-field double-buffering off it: BT3 builds its display list into
-                // alternating 1MB pool halves and derives the DMA kick address from FIELD.
-                // Frozen FIELD => every other frame's chain is kicked at the wrong half,
-                // whose first block is a bookkeeping header that parses as qwc=0 REFE
-                // ("empty chain, end") -> the whole 3D scene of that frame is dropped.
-                // PS2X_NOFIELD=1 restores the frozen behavior for A/B.
-                {
-                    static const bool s_noField = [](){ const char *v = std::getenv("PS2X_NOFIELD"); return v && v[0] && v[0] != '0'; }();
-                    if (!s_noField)
-                        runtime->memory().gs().csr.fetch_xor(0x2000ull);
-                }
-                const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
-                ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
-                dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-                dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
-                // Drive EE timer interrupts (Timer0-3, INTC causes 9-12). Games use
-                // these as periodic ticks for service threads (sound, timer-delay loops);
-                // the runtime pumps them here. Firing only ONCE per vblank (60Hz) paces
-                // the game's Timer2-driven service loop (sub_002BAAF8) at 60Hz -> ~12fps.
-                // PS2X_TIMERMULT fires them N times/vblank to approximate the real
-                // sub-frame timer rate so those waits complete faster (higher game fps).
-                static const int s_timerMult = []() {
-                    const char *v = std::getenv("PS2X_TIMERMULT");
-                    int m = v ? std::atoi(v) : 1;
-                    return m < 1 ? 1 : (m > 256 ? 256 : m);
-                }();
-                for (int tm = 0; tm < s_timerMult; ++tm)
-                    for (uint32_t timerCause = 9u; timerCause <= 12u; ++timerCause)
-                    {
-                        runtime->memory().raiseEeTimerInterruptFlag(timerCause);
-                        dispatchIntcHandlersForCause(rdram, runtime, timerCause);
-                    }
-                // NOTE: BT3 CD read-completion is now driven inline from the
-                // read-poll (game_overrides.cpp bt3CdReadStatePoll), which is
-                // race-free; the old cross-thread pump (bt3PumpCdTick) is left in
-                // place but no longer called (it raced/starved).
+            if (ps2xFrameStepOn())
+            {   // [rollback] the frame-stepping controller owns vblank delivery; this thread only keeps time
+                continue;
             }
+            for (int i = 0; i < ticksToProcess; ++i)
+                interruptTick(rdram, runtime);
         }
 
         g_irq_worker_running.store(false, std::memory_order_release);
@@ -585,6 +606,20 @@ namespace ps2_syscalls
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime)
     {
         (void)WaitForNextVSyncTick(rdram, runtime);
+    }
+
+    // [rollback] the vsync tick counter and flag registration, for the snapshot
+    extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr)
+    {
+        std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
+        *tick = g_vsync_tick_counter.load(std::memory_order_relaxed);
+        *flagAddr = g_vsync_registration.flagAddr; *tickAddr = g_vsync_registration.tickAddr;
+    }
+    extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr)
+    {
+        std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
+        g_vsync_tick_counter.store(tick, std::memory_order_relaxed);
+        g_vsync_registration.flagAddr = flagAddr; g_vsync_registration.tickAddr = tickAddr;
     }
 
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -203,6 +203,54 @@ size_t ps2xFiberLiveStack(const Ps2xFiber *f, const uint8_t **outBase)
 #endif
 }
 
+// [rollback] blob = [ucontext_t][uint64_t liveSize][live stack bytes, lowest address first].
+size_t ps2xFiberSnapshotSize(const Ps2xFiber *f)
+{
+#if defined(PS2X_FIBER_UCTX)
+    const uint8_t *base = nullptr;
+    const size_t live = ps2xFiberLiveStack(f, &base);
+    if (!f || f->entry || !base) return 0;
+    return sizeof(ucontext_t) + sizeof(uint64_t) + live;
+#else
+    (void)f; return 0;
+#endif
+}
+
+bool ps2xFiberSnapshot(const Ps2xFiber *f, void *buf, size_t size)
+{
+#if defined(PS2X_FIBER_UCTX)
+    const uint8_t *base = nullptr;
+    const size_t live = ps2xFiberLiveStack(f, &base);
+    if (!f || f->entry || !base || !buf || size < sizeof(ucontext_t) + sizeof(uint64_t) + live) return false;
+    uint8_t *o = static_cast<uint8_t *>(buf);
+    std::memcpy(o, &f->ctx, sizeof(ucontext_t));            o += sizeof(ucontext_t);
+    const uint64_t n = live; std::memcpy(o, &n, sizeof n);  o += sizeof n;
+    std::memcpy(o, base, live);
+    return true;
+#else
+    (void)f; (void)buf; (void)size; return false;
+#endif
+}
+
+bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size)
+{
+#if defined(PS2X_FIBER_UCTX)
+    if (!f || f->entry || !f->stack || !buf || size < sizeof(ucontext_t) + sizeof(uint64_t)) return false;
+    const uint8_t *i = static_cast<const uint8_t *>(buf);
+    ucontext_t ctx; std::memcpy(&ctx, i, sizeof ctx);       i += sizeof ctx;
+    uint64_t n = 0; std::memcpy(&n, i, sizeof n);           i += sizeof n;
+    if (size < sizeof(ucontext_t) + sizeof(uint64_t) + n || n > f->stackSize) return false;
+    // The context's fpregs pointer refers into the ucontext_t itself; restoring into the same
+    // object keeps it valid. The stack goes back to the same addresses it was copied from.
+    std::memcpy(&f->ctx, &ctx, sizeof ctx);
+    f->ctx.uc_mcontext.fpregs = &f->ctx.__fpregs_mem;
+    std::memcpy(f->stack + f->stackSize - n, i, n);
+    return true;
+#else
+    (void)f; (void)buf; (void)size; return false;
+#endif
+}
+
 // ---------------------------------------------------------------------------------------------
 // Self-test: two fibers handing control back and forth, plus a stack high-water reading. This is
 // here so the primitive is proven on the actual toolchain before the scheduler depends on it.

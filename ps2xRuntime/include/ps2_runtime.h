@@ -691,6 +691,21 @@ public:
     bool guestWait(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
                    const std::function<bool()> &pred, int waitPoint,
                    std::chrono::milliseconds slice = std::chrono::milliseconds(250));
+    // [rollback] Heap-free form for park sites. A rollback restores a parked fiber's STACK, so a
+    // frame parked here must not point at heap that may since have been freed -- and std::function
+    // may heap-allocate its target. The predicate lives on the caller's stack; only its address
+    // crosses. Prefer guestWaitT everywhere a fiber can park.
+    bool guestWaitFn(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
+                     bool (*pred)(void *), void *predCtx, int waitPoint,
+                     std::chrono::milliseconds slice = std::chrono::milliseconds(250));
+    template <typename P>
+    bool guestWaitT(std::condition_variable &cv, std::unique_lock<std::mutex> &lk, P &pred, int waitPoint,
+                    std::chrono::milliseconds slice = std::chrono::milliseconds(250))
+    {
+        return guestWaitFn(cv, lk, [](void *p) { return (*static_cast<P *>(p))(); },
+                           static_cast<void *>(&pred), waitPoint, slice);
+    }
+    friend struct Ps2xRollback;   // [rollback] the snapshot/restore of scheduler + fiber state (ps2_runtime.cpp)
 
 private:
     struct SchedThread
@@ -707,6 +722,7 @@ private:
     int schedPickNextLocked(int afterTid);
     void schedFiberPark();                   // [fibers] switch this guest fiber back to the scheduler
     void schedFiberLoop();                   // [fibers] the scheduler body, runs on m_schedFiber
+    bool schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx);   // [rollback] ... until stop() (true) or every fiber finished (false)
     bool schedFiberRunnableLocked(int tid) const;
     bool m_schedEnabled = false;
     bool m_fibersEnabled = false;            // [fibers] PS2X_FIBERS=1 and m_schedEnabled

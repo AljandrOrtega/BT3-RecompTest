@@ -1020,6 +1020,7 @@ PS2Runtime::PS2Runtime()
             }
             if (m_fibersEnabled)
                 std::fprintf(stderr, "[fibers] enabled: guest threads run as fibers on the game thread\n");
+
         }
         if (m_schedEnabled)
             std::cerr << "[sched] deterministic cooperative guest scheduler ENABLED" << std::endl;
@@ -3977,10 +3978,32 @@ namespace
         bool isGuest = false;
         uint32_t lastPc = 0, lastRa = 0;
         int  kernelTid = 1;   // the kernel's g_currentThreadId (State.h): SleepThread/GetThreadId/ensureCurrentThreadInfo key on it
+        uint32_t waitDepth = 0;   // [rollback] guestWaitBegin's released guest-exec depth (a heap scope object would dangle after a restore)
+        int waitPoint = -1;       // [schedwhy] the WP_* site this fiber last parked at (printed in [sched-state] as wp=)
     };
+    // [rollback] The frame gate. In frame-stepped mode tid 1 parks here inside the frame hook and
+    // the scheduler hands the boundary to the controller (schedFiberBoot), which is how the HOST
+    // comes to own a frame boundary: advance_frame() = open the gate, run until it is reached again.
+    struct FrameGate
+    {
+        bool on = false;
+        uint64_t waitFrame = 0;   // the frame tid 1 is parked at (written by the fiber before it parks)
+        uint64_t openFrame = 0;   // gate is open for frames <= this (written by the controller)
+        uint8_t *rdram = nullptr;
+        R5900Context *ctx = nullptr;
+    };
+    // Frame-stepped mode: PS2X_FRAMESTEP=1, or implied by a feature that needs it. Fibers are
+    // required as well; the users check fibersEnabled() themselves. (PS2X_FRAMEGATE is taken: it
+    // is game_overrides' vsync pacing brake, which frame-stepping replaces.)
+    bool g_rollbackUnpaced = false;   // [rollback] the controller lifts the 60 Hz vblank pacing (re-simulation)
+    FrameGate g_gate = []() { FrameGate g; const char *e = std::getenv("PS2X_FRAMESTEP"); const char *r = std::getenv("PS2X_ROLLBACKTEST");
+                              g.on = (e && e[0] && e[0] != '0') || (r && r[0]); return g; }();
+    std::mutex g_gateM;
+    std::condition_variable g_gateCv;
     // [fibers] Probing state (see schedFiberLoop). File-static for the same header reason.
     int  g_schedProbeCursor = -1;    // last probed tid: round-robin position over the blocked fibers
     bool g_schedProbeArmed = false;  // one probe is due before the next runnable pick
+    bool g_schedIdleReturn = false;  // [rollback] schedFiberLoopUntil returned because every fiber was parked (not the stop predicate)
     // Keyed by tid, and deliberately NOT in SchedThread: keeping it here avoids touching
     // ps2_runtime.h, which every generated runner source includes (a ~10 minute rebuild).
     std::map<int, GuestTls> g_fiberTls;
@@ -4051,7 +4074,9 @@ bool PS2Runtime::schedFiberSpawn(int tid, int prio, std::function<void()> body)
     return true;
 }
 
-void PS2Runtime::schedFiberLoop()
+void PS2Runtime::schedFiberLoop() { (void)schedFiberLoopUntil(nullptr, nullptr); }
+
+bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
 {
     // [fibers] PROBING. Under threads a parked guest thread wakes ITSELF: the condition_variable
     // notify runs its host thread, which re-checks the predicate and calls schedAcquire -- the only
@@ -4118,14 +4143,20 @@ void PS2Runtime::schedFiberLoop()
             }
             if (next >= 0) f = m_schedThreads[next]->fiber;
         }
-        if (!anyLeft) return;            // every guest fiber has finished
+        if (!anyLeft) return false;      // every guest fiber has finished
+        if (stop && stop(stopCtx)) return true;   // [rollback] the controller's boundary (checked with no fiber running)
         if (!f)
         {
             // Nobody runnable: every present fiber is parked, so only host threads can change
             // anything. Keep probing, and nap once per fruitless pass over the blocked fibers --
             // this is the one place the fiber scheduler must not busy-wait.
             if (blockedCount == 0 || (idleProbes % blockedCount) == 0)
+            {
+                // [rollback] In frame-stepped mode an idle scheduler means the guest is waiting for an
+                // interrupt (a vblank, mostly): hand the controller the decision instead of napping.
+                if (g_gate.on && idleProbes != 0) { g_schedIdleReturn = true; return true; }
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
             ++idleProbes;
             g_schedProbeArmed = true;
             continue;
@@ -4162,8 +4193,13 @@ void PS2Runtime::schedFiberLoop()
         }
         if (!failedProbe) g_schedProbeArmed = true;
     }
+    return false;
 }
 
+static void ps2xRollbackAtBoundary(PS2Runtime &rt);   // [rollback] defined with Ps2xRollback below
+extern "C" void ps2xInterruptTick(uint8_t *rdram, PS2Runtime *runtime);   // [rollback] Kernel/Syscalls/Interrupt.cpp: one vblank
+extern "C" void ps2xVirtualClockEnable();                                  // [rollback] ps2_memory.cpp: EE timers on the stepped clock
+extern "C" void ps2xVirtualClockAdvance(uint64_t ns);
 void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry)
 {
     m_schedFiber = ps2xFiberAdoptCurrent();
@@ -4180,7 +4216,43 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
     }
     { std::lock_guard<std::mutex> lk(m_schedMutex); m_schedCurrent = mainTid; }
     std::fprintf(stderr, "[fibers] scheduler running, tid %d is on a fiber\n", mainTid);
-    schedFiberLoop();
+    if (g_gate.on)
+    {
+        // [rollback] Frame-stepped mode: run until tid 1 parks at the frame gate, give the
+        // controller the boundary (every fiber is parked, nothing holds the guest lock), open the
+        // gate for that frame, repeat. This loop IS advance_frame().
+        std::fprintf(stderr, "[rollback] frame step on: the host owns the frame boundary and delivers the vblanks\n");
+        ps2xVirtualClockEnable();   // the EE timers now advance per delivered vblank, not per wall clock
+        // Vblank pacing: 60 Hz on an absolute schedule (a slow guest catches up without sleeping);
+        // the controller may lift it for re-simulation.
+        using clock = std::chrono::steady_clock;
+        auto nextVblank = clock::now();
+        const auto period = std::chrono::microseconds(16667);
+        while (!isStopRequested())
+        {
+            g_schedIdleReturn = false;
+            const bool stopped = schedFiberLoopUntil([](void *) { return g_gate.waitFrame > g_gate.openFrame; }, nullptr);
+            if (!stopped) break;                 // every guest fiber finished
+            if (g_schedIdleReturn)
+            {   // every fiber is parked: the guest is waiting for an interrupt -> deliver one vblank
+                if (!g_rollbackUnpaced)
+                {
+                    const auto now = clock::now();
+                    if (nextVblank > now) std::this_thread::sleep_until(nextVblank);
+                    else if (now - nextVblank > period * 4) nextVblank = now;   // fell far behind: resync, do not burst
+                }
+                nextVblank += period;
+                ps2xVirtualClockAdvance(16666667ull);
+                ps2xInterruptTick(m_memory.getRDRAM(), this);
+                continue;
+            }
+            ps2xRollbackAtBoundary(*this);
+            { std::lock_guard<std::mutex> lk(g_gateM); g_gate.openFrame = g_gate.waitFrame; }
+            g_gateCv.notify_all();
+        }
+    }
+    else
+        schedFiberLoop();
     std::fprintf(stderr, "[fibers] scheduler exited\n");
 }
 
@@ -4200,6 +4272,15 @@ bool PS2Runtime::guestWait(std::condition_variable &cv, std::unique_lock<std::mu
                            const std::function<bool()> &pred, int waitPoint,
                            std::chrono::milliseconds slice)
 {
+    return guestWaitFn(cv, lk, [](void *p) { return (*static_cast<const std::function<bool()> *>(p))(); },
+                       const_cast<std::function<bool()> *>(&pred), waitPoint, slice);
+}
+
+bool PS2Runtime::guestWaitFn(std::condition_variable &cv, std::unique_lock<std::mutex> &lk,
+                             bool (*predFn)(void *), void *predCtx, int waitPoint,
+                             std::chrono::milliseconds slice)
+{
+    auto pred = [predFn, predCtx]() { return predFn(predCtx); };
     if (pred()) return true;
     if (!m_fibersEnabled)
     {
@@ -4215,6 +4296,7 @@ bool PS2Runtime::guestWait(std::condition_variable &cv, std::unique_lock<std::mu
     // Fiber path. The lock must be dropped around the switch: another guest fiber runs on this
     // very thread and will want it, and holding it across a switch is a self-deadlock rather than
     // ordinary contention.
+    if (g_schedIsGuest) g_fiberTls[g_schedTid].waitPoint = waitPoint;   // [schedwhy]
     while (!pred())
     {
         if (isStopRequested()) return false;
@@ -4478,8 +4560,233 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 std::atomic<uint32_t> g_bt3StateLive{0xffffffffu};   // [barblock] last bt3state seen by the status probe
 static PS2Runtime *g_waitHookRuntime = nullptr;   // [barblock]
-void *PS2Runtime::guestWaitBegin() { return new GuestExecutionReleaseScope(this); }
-void PS2Runtime::guestWaitEnd(void *handle) { delete static_cast<GuestExecutionReleaseScope *>(handle); }
+void *PS2Runtime::guestWaitBegin()
+{
+    if (m_fibersEnabled && g_schedIsGuest)
+    {   // [rollback] No heap: a fiber parked inside this scope is restored from its stack, so the
+        // handle must be a slot that outlives every snapshot. GuestTls entries are never erased.
+        GuestTls &t = g_fiberTls[g_schedTid];
+        t.waitDepth = releaseGuestExecution();
+        if (m_schedEnabled) schedBeginBlock(g_schedTid);
+        return &t;
+    }
+    return new GuestExecutionReleaseScope(this);
+}
+void PS2Runtime::guestWaitEnd(void *handle)
+{
+    if (m_fibersEnabled && g_schedIsGuest)
+    {
+        GuestTls *t = static_cast<GuestTls *>(handle);
+        if (m_schedEnabled && std::uncaught_exceptions() == 0) schedAcquire(g_schedTid, 0);
+        const uint32_t d = t->waitDepth; t->waitDepth = 0;
+        reacquireGuestExecution(d);
+        return;
+    }
+    delete static_cast<GuestExecutionReleaseScope *>(handle);
+}
+
+// [rollback] The frame gate (see FrameGate). Called from the frame hook on tid 1 with the guest
+// lock held; parks the fiber until the controller opens the gate for this frame. Off unless a
+// frame-stepped feature enabled it, and a no-op on the thread path.
+extern "C" bool ps2xFrameStepOn() { return g_gate.on && g_waitHookRuntime && g_waitHookRuntime->fibersEnabled(); }
+extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx)
+{
+    PS2Runtime *rt = g_waitHookRuntime;
+    if (!rt || !g_gate.on || !rt->fibersEnabled() || !g_schedIsGuest || g_schedTid != 1) return;
+    g_gate.waitFrame = frame; g_gate.rdram = rdram; g_gate.ctx = ctx;
+    void *scope = ps2xGuestWaitBegin();
+    {
+        std::unique_lock<std::mutex> lk(g_gateM);
+        auto pred = [rt]() { return g_gate.openFrame >= g_gate.waitFrame || rt->isStopRequested(); };
+        rt->guestWaitT(g_gateCv, lk, pred, WP_FRAMEGATE);
+    }
+    ps2xGuestWaitEnd(scope);
+}
+
+// [rollback] Snapshot/restore of everything the fiber scheduler owns: each parked fiber's stack and
+// register context, the per-fiber TLS, the scheduler's bookkeeping, the frame gate and tid 1's
+// R5900 context (a runtime member; the workers' contexts are locals on their own fiber stacks and
+// travel with them). The guest-visible memory and the emulated devices are ps2xSimSnap* in
+// game_overrides.cpp, next to savestate v3 whose regions it reuses.
+extern "C" void *ps2xSimSnapCapture(PS2Runtime *rt, uint8_t *rdram);
+extern "C" bool  ps2xSimSnapRestore(void *snap, PS2Runtime *rt, uint8_t *rdram);
+extern "C" void  ps2xSimSnapFree(void *snap);
+extern "C" uint64_t ps2xSimSnapFrame(const void *snap);
+extern "C" uint64_t ps2xRamHash(const uint8_t *rdram, uint32_t skipLo, uint32_t skipHi);
+extern "C" void *ps2xKernelStateCapture();               // Kernel/Syscalls/Thread.cpp
+extern "C" bool  ps2xKernelStateRestore(void *);
+extern "C" void  ps2xKernelStateFree(void *);
+extern "C" void *ps2xMemDeviceCapture(PS2Memory *);      // ps2_memory.cpp
+extern "C" bool  ps2xMemDeviceRestore(PS2Memory *, void *);
+extern "C" void  ps2xMemDeviceFree(void *);
+
+extern std::atomic<uint64_t> g_bt3FrameCount;
+
+struct Ps2xRollback
+{
+    struct FiberSnap
+    {
+        struct Th { int tid; int prio; bool blocked, present, finished; uint64_t order; uint32_t blockPc, blockRa; std::vector<uint8_t> fiber; };
+        std::vector<Th> threads;
+        int current = -1; uint64_t orderCounter = 0; int probeCursor = -1; bool probeArmed = false;
+        std::map<int, GuestTls> tls;
+        FrameGate gate;
+        R5900Context cpu;
+        size_t stackBytes = 0;
+        void *kernel = nullptr;   // ps2xKernelStateCapture
+        void *dev = nullptr;      // ps2xMemDeviceCapture
+        ~FiberSnap() { if (kernel) ps2xKernelStateFree(kernel); if (dev) ps2xMemDeviceFree(dev); }
+    };
+    static FiberSnap *captureFibers(PS2Runtime &rt)
+    {
+        std::lock_guard<std::mutex> lk(rt.m_schedMutex);
+        FiberSnap *s = new FiberSnap();
+        for (auto &kv : rt.m_schedThreads)
+        {
+            if (!kv.second) continue;
+            PS2Runtime::SchedThread &st = *kv.second;
+            FiberSnap::Th th{kv.first, st.prio, st.blocked, st.present, st.finished, st.order, st.blockPc, st.blockRa, {}};
+            if (st.fiber && !st.finished)
+            {
+                const size_t n = ps2xFiberSnapshotSize(st.fiber);
+                if (n) { th.fiber.resize(n); if (!ps2xFiberSnapshot(st.fiber, th.fiber.data(), n)) th.fiber.clear(); }
+                s->stackBytes += th.fiber.size();
+            }
+            s->threads.push_back(std::move(th));
+        }
+        s->current = rt.m_schedCurrent; s->orderCounter = rt.m_schedOrderCounter;
+        s->probeCursor = g_schedProbeCursor; s->probeArmed = g_schedProbeArmed;
+        s->tls = g_fiberTls; s->gate = g_gate; s->cpu = rt.m_cpuContext;
+        s->kernel = ps2xKernelStateCapture();
+        s->dev = ps2xMemDeviceCapture(&rt.m_memory);
+        return s;
+    }
+    static bool restoreFibers(PS2Runtime &rt, const FiberSnap &s)
+    {
+        std::lock_guard<std::mutex> lk(rt.m_schedMutex);
+        for (const auto &th : s.threads)
+        {
+            auto it = rt.m_schedThreads.find(th.tid);
+            if (it == rt.m_schedThreads.end() || !it->second) { std::fprintf(stderr, "[rollback] tid %d vanished\n", th.tid); return false; }
+            PS2Runtime::SchedThread &st = *it->second;
+            if (!th.fiber.empty() && !(st.fiber && ps2xFiberRestore(st.fiber, th.fiber.data(), th.fiber.size())))
+            { std::fprintf(stderr, "[rollback] tid %d: fiber restore failed\n", th.tid); return false; }
+            st.prio = th.prio; st.blocked = th.blocked; st.present = th.present; st.finished = th.finished;
+            st.order = th.order; st.blockPc = th.blockPc; st.blockRa = th.blockRa;
+        }
+        rt.m_schedCurrent = s.current; rt.m_schedOrderCounter = s.orderCounter;
+        g_schedProbeCursor = s.probeCursor; g_schedProbeArmed = s.probeArmed;
+        // Element-wise, never map assignment: a parked fiber holds the ADDRESS of its GuestTls node
+        // (guestWaitBegin's handle), and entries are never erased, so nodes must stay put.
+        for (const auto &kv : s.tls) g_fiberTls[kv.first] = kv.second;
+        g_gate = s.gate; rt.m_cpuContext = s.cpu;
+        if (s.kernel && !ps2xKernelStateRestore(s.kernel)) return false;
+        if (s.dev && !ps2xMemDeviceRestore(&rt.m_memory, s.dev)) return false;
+        return true;
+    }
+
+    // [rollbacktest] PS2X_ROLLBACKTEST=<k>[:<start>[:<period>]]: at frame `start` take a snapshot,
+    // run k frames, hash RAM; restore, run the same k frames again, hash again; report, and repeat
+    // every `period` frames. The instrument for the whole rollback effort: a mismatch's byte diff
+    // names the host-side state the snapshot still misses, and the second run's wall time is the
+    // re-simulation cost. The screen shows the rewind.
+    static void atBoundary(PS2Runtime &rt)
+    {
+        static const char *s_env = std::getenv("PS2X_ROLLBACKTEST");
+        if (!s_env || !s_env[0]) return;
+        static uint64_t s_k = 0, s_start = 0, s_period = 0;
+        static bool s_parsed = false;
+        if (!s_parsed)
+        {
+            s_parsed = true;
+            s_k = std::strtoull(s_env, nullptr, 10);
+            const char *c = std::strchr(s_env, ':'); s_start = c ? std::strtoull(c + 1, nullptr, 10) : 1200u;
+            const char *c2 = c ? std::strchr(c + 1, ':') : nullptr; s_period = c2 ? std::strtoull(c2 + 1, nullptr, 10) : 600u;
+            if (s_k == 0) s_k = 2;
+            std::fprintf(stderr, "[rollbacktest] k=%llu start=%llu period=%llu\n",
+                         (unsigned long long)s_k, (unsigned long long)s_start, (unsigned long long)s_period);
+        }
+        enum { Idle, RunA, RunB };
+        static int s_phase = Idle;
+        static void *s_sim = nullptr; static FiberSnap *s_fib = nullptr;
+        static uint64_t s_target = 0, s_next = 0, s_hashA = 0, s_hashAgp = 0;
+        static std::vector<uint8_t> s_ramA;   // RAM after the first run, for the byte diff that names what the snapshot misses
+        static std::chrono::steady_clock::time_point s_tA, s_tB;
+        static uint32_t s_n = 0;
+        const uint64_t frame = g_gate.waitFrame;
+        uint8_t *rdram = g_gate.rdram;
+        if (s_next == 0) s_next = s_start;
+        if (s_phase == Idle)
+        {
+            if (frame < s_next) return;
+            PS2Runtime::GuestExecutionScope lock(&rt);   // no host service thread runs guest code under the copy
+            s_sim = ps2xSimSnapCapture(&rt, rdram);
+            s_fib = captureFibers(rt);
+            s_target = frame + s_k; s_phase = RunA; s_tA = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[rollbacktest] #%u snapshot at frame %llu (fiber stacks %zu bytes), running %llu frames\n",
+                         s_n, (unsigned long long)frame, s_fib->stackBytes, (unsigned long long)s_k);
+            return;
+        }
+        if (frame < s_target) return;
+        if (s_phase == RunA)
+        {
+            PS2Runtime::GuestExecutionScope lock(&rt);
+            const double msA = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_tA).count();
+            s_hashA = ps2xRamHash(rdram, 0u, 0u);
+            s_hashAgp = ps2xRamHash(rdram, 0x2c0000u, 0x300000u);   // minus the sound-stream window (host-paced audio)
+            s_ramA.assign(rdram, rdram + 32u * 1024u * 1024u);
+            const bool okS = ps2xSimSnapRestore(s_sim, &rt, rdram);
+            const bool okF = restoreFibers(rt, *s_fib);
+            std::fprintf(stderr, "[rollbacktest] #%u frame %llu hashA=%016llx (%.1f ms for %llu frames); restore sim=%d fibers=%d -> back at frame %llu\n",
+                         s_n, (unsigned long long)frame, (unsigned long long)s_hashA, msA, (unsigned long long)s_k, (int)okS, (int)okF,
+                         (unsigned long long)g_gate.waitFrame);
+            if (!okS || !okF) { s_phase = Idle; s_next = frame + s_period; return; }
+            // The gate is closed for the restored frame; the boot loop opens it right after we return.
+            g_gate.openFrame = g_gate.waitFrame - 1u;
+            s_phase = RunB; s_tB = std::chrono::steady_clock::now();
+            g_rollbackUnpaced = true;   // re-simulation: vblanks as fast as the guest consumes them
+            return;
+        }
+        if (s_phase == RunB)
+        {
+            PS2Runtime::GuestExecutionScope lock(&rt);
+            const double msB = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_tB).count();
+            const uint64_t hashB = ps2xRamHash(rdram, 0u, 0u);
+            const uint64_t hashBgp = ps2xRamHash(rdram, 0x2c0000u, 0x300000u);
+            std::fprintf(stderr, "[rollbacktest] #%u frame %llu hashB=%016llx (%.1f ms) -> %s (minus the stream window: %s)\n",
+                         s_n, (unsigned long long)frame, (unsigned long long)hashB, msB, hashB == s_hashA ? "MATCH" : "DIFFER",
+                         hashBgp == s_hashAgp ? "MATCH" : "DIFFER");
+            if (hashB != s_hashA && s_ramA.size() == 32u * 1024u * 1024u)
+            {   // Differing byte ranges (merged when closer than 64 bytes), first 40: the addresses name the
+                // game structure and therefore the host-side state that did not roll back with the rest.
+                const uint8_t *a = s_ramA.data(); const uint8_t *b = rdram;
+                uint32_t ranges = 0, bytes = 0; int64_t start = -1, last = -1;
+                for (uint32_t i = 0; i < 32u * 1024u * 1024u; ++i)
+                {
+                    if (a[i] == b[i]) continue;
+                    ++bytes;
+                    if (start >= 0 && (int64_t)i - last <= 64) { last = i; continue; }
+                    if (start >= 0)
+                    {
+                        if (ranges < 40) std::fprintf(stderr, "[rollbackdiff]   0x%06llx..0x%06llx (%lld B)  A=%02x%02x%02x%02x B=%02x%02x%02x%02x\n",
+                            (long long)start, (long long)last, (long long)(last - start + 1),
+                            a[start], a[start+1], a[start+2], a[start+3], b[start], b[start+1], b[start+2], b[start+3]);
+                        ++ranges;
+                    }
+                    start = i; last = i;
+                }
+                if (start >= 0) { if (ranges < 40) std::fprintf(stderr, "[rollbackdiff]   0x%06llx..0x%06llx (%lld B)\n", (long long)start, (long long)last, (long long)(last - start + 1)); ++ranges; }
+                std::fprintf(stderr, "[rollbackdiff] %u ranges, %u bytes differ\n", ranges, bytes);
+            }
+            s_ramA.clear(); s_ramA.shrink_to_fit();
+            ps2xSimSnapFree(s_sim); s_sim = nullptr; delete s_fib; s_fib = nullptr;
+            g_rollbackUnpaced = false;
+            s_phase = Idle; s_next = frame + s_period; ++s_n;
+        }
+    }
+};
+static void ps2xRollbackAtBoundary(PS2Runtime &rt) { Ps2xRollback::atBoundary(rt); }
+
 extern "C" void *ps2xGuestWaitBegin() { gprof::enter(gprof::WAIT); return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }   // [guestprof] WAIT
 extern "C" void ps2xGuestWaitEnd(void *h) { gprof::leave(); if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
 // [fibers] A host sleep on a guest fiber stops EVERY guest fiber, so a hook that sleeps while it waits
@@ -4503,10 +4810,9 @@ extern "C" void ps2xGuestSleepMs(unsigned ms)
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     bool parkedOnce = false;               // even 0 ms parks once, so one probe pass happens
     std::unique_lock<std::mutex> lk(s_m);
-    rt->guestWait(s_cv, lk,
-                  [&]() { if (!parkedOnce) { parkedOnce = true; return false; }
-                          return std::chrono::steady_clock::now() >= deadline; },
-                  WP_SCHED_YIELD);
+    auto pred = [&]() { if (!parkedOnce) { parkedOnce = true; return false; }
+                        return std::chrono::steady_clock::now() >= deadline; };
+    rt->guestWaitT(s_cv, lk, pred, WP_SCHED_YIELD);   // [rollback] pred lives on this stack
 }
 void PS2Runtime::run()
 {
@@ -5084,6 +5390,7 @@ void PS2Runtime::run()
                         std::cerr << " tid" << kv.first << "(" << (s.present?"P":"-") << (s.blocked?"B":"-")
                                   << ",ord=" << s.order;
                         if (s.blocked) std::cerr << ",pc=0x" << std::hex << s.blockPc << ",ra=0x" << s.blockRa << std::dec;   // [schedwhy]
+                        if (s.blocked && m_fibersEnabled) { auto tl = g_fiberTls.find(kv.first); if (tl != g_fiberTls.end()) std::cerr << ",wp=" << tl->second.waitPoint; }
                         if (s.blocked)
                         {   // [schedwhy2]
                             int wt = 0, wid = 0, sc = -1, sw = -1, wk = 0;

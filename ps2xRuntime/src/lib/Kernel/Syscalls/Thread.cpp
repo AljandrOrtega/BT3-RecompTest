@@ -1384,3 +1384,109 @@ extern "C" bool ps2xThreadWaitInfo(int tid, int *waitType, int *waitId, int *sem
 // SleepThread/GetThreadId/ensureCurrentThreadInfo (which key on it) all acted on the wrong thread.
 int  ps2xKernelCurrentTid() { return g_currentThreadId; }
 void ps2xKernelSetCurrentTid(int tid) { g_currentThreadId = tid; }
+
+// [rollback] The host side of the EE kernel: thread records, semaphores, event flags and the id
+// counters, plus the vsync tick/registration (Interrupt.cpp). A rolled-back fiber parked inside
+// SleepThread is inconsistent with a live ThreadInfo that says RUN, and the game's timer service
+// consults ReferThreadStatus before waking anyone -- that was the first post-rollback freeze.
+// Alarms are not covered (BT3 sets none). Records the live maps have that the snapshot lacks are
+// left alone; ones the snapshot has that vanished are reported and skipped.
+namespace
+{
+    struct KThread { int tid; uint32_t entry, stack, stackSize, gp, priority, attr, option, arg, tlsBase, currentPc;
+                     bool started, ownsStack, terminated, forceRelease; int status, waitType, waitId, wakeupCount, currentPriority, suspendCount; };
+    struct KSema   { int id; int count, maxCount, initCount; uint32_t attr, option; int waiters; bool deleted; };
+    struct KEvf    { int id; uint32_t attr, option, initBits, bits; int waiters; bool deleted; };
+    struct KernelSnap { std::vector<KThread> th; std::vector<KSema> se; std::vector<KEvf> ev;
+                        int nextThread = 2, nextSema = 1, nextEvf = 1; uint64_t vsyncTick = 0; uint32_t vsFlag = 0, vsTick = 0; };
+}
+extern "C" void ps2xVsyncStateGet(uint64_t *tick, uint32_t *flagAddr, uint32_t *tickAddr);
+extern "C" void ps2xVsyncStateSet(uint64_t tick, uint32_t flagAddr, uint32_t tickAddr);
+extern "C" void *ps2xKernelStateCapture()
+{
+    KernelSnap *s = new KernelSnap();
+    {
+        std::lock_guard<std::mutex> lk(g_thread_map_mutex);
+        for (auto &kv : g_threads)
+        {
+            if (!kv.second) continue;
+            ThreadInfo &i = *kv.second;
+            std::lock_guard<std::mutex> il(i.m);
+            s->th.push_back(KThread{ kv.first, i.entry, i.stack, i.stackSize, i.gp, i.priority, i.attr, i.option, i.arg, i.tlsBase,
+                                     i.currentPc.load(), i.started, i.ownsStack, i.terminated.load(), i.forceRelease.load(),
+                                     i.status, i.waitType, i.waitId, i.wakeupCount, i.currentPriority, i.suspendCount });
+        }
+        s->nextThread = g_nextThreadId;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sema_map_mutex);
+        for (auto &kv : g_semas)
+        {
+            if (!kv.second) continue;
+            SemaInfo &i = *kv.second; std::lock_guard<std::mutex> il(i.m);
+            s->se.push_back(KSema{ kv.first, i.count, i.maxCount, i.initCount, i.attr, i.option, i.waiters, i.deleted });
+        }
+        s->nextSema = g_nextSemaId;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_event_flag_map_mutex);
+        for (auto &kv : g_eventFlags)
+        {
+            if (!kv.second) continue;
+            EventFlagInfo &i = *kv.second; std::lock_guard<std::mutex> il(i.m);
+            s->ev.push_back(KEvf{ kv.first, i.attr, i.option, i.initBits, i.bits, i.waiters, i.deleted });
+        }
+        s->nextEvf = g_nextEventFlagId;
+    }
+    ps2xVsyncStateGet(&s->vsyncTick, &s->vsFlag, &s->vsTick);
+    return s;
+}
+extern "C" bool ps2xKernelStateRestore(void *h)
+{
+    const KernelSnap *s = static_cast<const KernelSnap *>(h);
+    if (!s) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_thread_map_mutex);
+        for (const KThread &t : s->th)
+        {
+            auto it = g_threads.find(t.tid);
+            if (it == g_threads.end() || !it->second) { std::fprintf(stderr, "[rollback] kernel: thread %d vanished\n", t.tid); continue; }
+            ThreadInfo &i = *it->second;
+            { std::lock_guard<std::mutex> il(i.m);
+              i.entry = t.entry; i.stack = t.stack; i.stackSize = t.stackSize; i.gp = t.gp; i.priority = t.priority; i.attr = t.attr;
+              i.option = t.option; i.arg = t.arg; i.tlsBase = t.tlsBase; i.currentPc.store(t.currentPc); i.started = t.started;
+              i.ownsStack = t.ownsStack; i.terminated.store(t.terminated); i.forceRelease.store(t.forceRelease);
+              i.status = t.status; i.waitType = t.waitType; i.waitId = t.waitId; i.wakeupCount = t.wakeupCount;
+              i.currentPriority = t.currentPriority; i.suspendCount = t.suspendCount; }
+            i.cv.notify_all();
+        }
+        g_nextThreadId = s->nextThread;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sema_map_mutex);
+        for (const KSema &t : s->se)
+        {
+            auto it = g_semas.find(t.id);
+            if (it == g_semas.end() || !it->second) { std::fprintf(stderr, "[rollback] kernel: sema %d vanished\n", t.id); continue; }
+            SemaInfo &i = *it->second;
+            { std::lock_guard<std::mutex> il(i.m); i.count = t.count; i.maxCount = t.maxCount; i.initCount = t.initCount; i.attr = t.attr; i.option = t.option; i.waiters = t.waiters; i.deleted = t.deleted; }
+            i.cv.notify_all();
+        }
+        g_nextSemaId = s->nextSema;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_event_flag_map_mutex);
+        for (const KEvf &t : s->ev)
+        {
+            auto it = g_eventFlags.find(t.id);
+            if (it == g_eventFlags.end() || !it->second) { std::fprintf(stderr, "[rollback] kernel: evf %d vanished\n", t.id); continue; }
+            EventFlagInfo &i = *it->second;
+            { std::lock_guard<std::mutex> il(i.m); i.attr = t.attr; i.option = t.option; i.initBits = t.initBits; i.bits = t.bits; i.waiters = t.waiters; i.deleted = t.deleted; }
+            i.cv.notify_all();
+        }
+        g_nextEventFlagId = s->nextEvf;
+    }
+    ps2xVsyncStateSet(s->vsyncTick, s->vsFlag, s->vsTick);
+    return true;
+}
+extern "C" void ps2xKernelStateFree(void *h) { delete static_cast<KernelSnap *>(h); }

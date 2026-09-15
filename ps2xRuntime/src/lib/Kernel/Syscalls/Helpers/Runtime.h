@@ -32,17 +32,21 @@ static void waitWithGuestExecutionReleasedUntilUnlocked(PS2Runtime *runtime,
                                                         WaitFn waitFn,
                                                         FinishFn finishFn)
 {
-    auto releaseGuestExecution = std::make_unique<PS2Runtime::GuestExecutionReleaseScope>(runtime);
-
-    waitFn();
-    finishFn();
-
-    if (lock.owns_lock())
+    // [rollback] A stack object, not a unique_ptr: a fiber parked inside waitFn() is restored from
+    // its stack by a rollback, and a restored frame must not point at heap that was freed since.
+    // The ordering the heap version bought is kept by scoping: the local lock is released BEFORE
+    // this scope's destructor reacquires guest execution.
     {
-        lock.unlock();
-    }
+        PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
 
-    releaseGuestExecution.reset();
+        waitFn();
+        finishFn();
+
+        if (lock.owns_lock())
+        {
+            lock.unlock();
+        }
+    }
 }
 
 template <typename Lock, typename WaitFn>
@@ -68,7 +72,7 @@ static void waitGuestUntil(PS2Runtime *runtime, Lock &lock, std::condition_varia
         {
             // Ps2xWaitScope (the [waitprof] per-site bracket) is not visible from this header, and
             // the null-runtime path is a fallback that guest code never takes, so it goes without.
-            if (runtime) runtime->guestWait(cv, lock, std::function<bool()>(pred), waitPoint);
+            if (runtime) runtime->guestWaitT(cv, lock, pred, waitPoint);   // [rollback] heap-free: pred stays on this stack
             else { (void)waitPoint; cv.wait(lock, pred); }
         },
         finishFn);

@@ -42,6 +42,16 @@ size_t ps2xFiberLiveStack(const Ps2xFiber *f, const uint8_t **outBase);
 
 bool ps2xFiberSupported();
 
+// [rollback] Snapshot of a PARKED fiber -- its saved register context plus the live part of its
+// stack -- into caller-provided storage, and the restore that puts both back so the fiber resumes
+// exactly where the snapshot was taken. Only meaningful while the fiber is parked (the scheduler
+// has control), and only when its frames reference nothing on the heap that may since have been
+// freed: every park site must keep its state on the stack. Sizes vary per snapshot (the live stack
+// does), so ask first. Returns 0 / false for the adopted entry fiber and on platforms without it.
+size_t ps2xFiberSnapshotSize(const Ps2xFiber *f);
+bool ps2xFiberSnapshot(const Ps2xFiber *f, void *buf, size_t size);
+bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size);
+
 // PS2X_FIBERTEST=1: ping-pong two fibers at startup and report. Proves the primitive works on this
 // toolchain before anything depends on it.
 void ps2xFiberSelfTest();

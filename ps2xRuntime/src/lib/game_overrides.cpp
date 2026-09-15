@@ -4566,6 +4566,89 @@ namespace
         return true;
     }
 
+    // [rollback] In-memory snapshot of the guest simulation for rollback: the same regions and
+    // device state savestate v3 writes to disk, kept as one heap object so a restore is a handful
+    // of memcpys (a 32 MB copy is ~0.5 ms). The fiber stacks and scheduler state are the runtime's
+    // half (Ps2xRollback in ps2_runtime.cpp); the two are captured together at a frame gate.
+    struct SimSnap
+    {
+        uint64_t frame = 0, rand64 = 0; uint32_t randCalls = 0;
+        std::vector<uint8_t> ram, sp, iop, vu0d, vu1d, vram, vu0c, vu1c;
+        VU1State v0{}, v1{};
+        std::vector<SinkSer> sinks;
+        GsRegSer gs{};
+    };
+    static void snapCopy(std::vector<uint8_t> &dst, const uint8_t *src, size_t n) { dst.resize(n); if (n) std::memcpy(dst.data(), src, n); }
+    extern "C" void *ps2xSimSnapCapture(PS2Runtime *runtime, uint8_t *rdram)
+    {
+        SimSnap *s = new SimSnap();
+        PS2Memory &mem = runtime->memory();
+        s->frame = g_bt3FrameCount.load(std::memory_order_relaxed);
+        s->rand64 = ps2_stubs::ps2RandState(); s->randCalls = ps2_stubs::ps2RandCallCount();
+        snapCopy(s->ram, rdram, PS2_RAM_SIZE);
+        if (uint8_t *sp = ps2GetScratchpadHostPtr()) snapCopy(s->sp, sp, PS2_SCRATCHPAD_SIZE);
+        snapCopy(s->iop,  mem.getIOPRAM(),  2u * 1024u * 1024u);
+        snapCopy(s->vu0d, mem.getVU0Data(), PS2_VU0_DATA_SIZE);
+        snapCopy(s->vu1d, mem.getVU1Data(), PS2_VU1_DATA_SIZE);
+        snapCopy(s->vram, mem.getGSVRAM(),  PS2_GS_VRAM_SIZE);
+        snapCopy(s->vu0c, mem.getVU0Code(), PS2_VU0_CODE_SIZE);
+        snapCopy(s->vu1c, mem.getVU1Code(), PS2_VU1_CODE_SIZE);
+        s->v0 = runtime->vu0().state(); s->v1 = runtime->vu1().state();
+        {
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            for (const auto &kv : g_iopSinks)
+            {
+                const IopSink &v = kv.second;
+                s->sinks.push_back(SinkSer{ kv.first, v.streamId, v.returnedBytes, v.heldBytes, v.wallBaseBytes,
+                                            v.frameBase, v.frameBaseBytes, (uint8_t)v.wallClock, (uint8_t)v.ringFullIdle,
+                                            (uint8_t)v.frameClock, 0u });
+            }
+        }
+        gsRegPack(mem.gs(), s->gs);
+        return s;
+    }
+    extern "C" bool ps2xSimSnapRestore(void *h, PS2Runtime *runtime, uint8_t *rdram)
+    {
+        const SimSnap *s = static_cast<const SimSnap *>(h);
+        if (!s || s->ram.size() != PS2_RAM_SIZE) return false;
+        PS2Memory &mem = runtime->memory();
+        std::memcpy(rdram, s->ram.data(), PS2_RAM_SIZE);
+        if (uint8_t *sp = ps2GetScratchpadHostPtr()) if (s->sp.size() == PS2_SCRATCHPAD_SIZE) std::memcpy(sp, s->sp.data(), PS2_SCRATCHPAD_SIZE);
+        std::memcpy(mem.getIOPRAM(),  s->iop.data(),  s->iop.size());
+        std::memcpy(mem.getVU0Data(), s->vu0d.data(), s->vu0d.size());
+        std::memcpy(mem.getVU1Data(), s->vu1d.data(), s->vu1d.size());
+        std::memcpy(mem.getGSVRAM(),  s->vram.data(), s->vram.size());
+        std::memcpy(mem.getVU0Code(), s->vu0c.data(), s->vu0c.size());
+        std::memcpy(mem.getVU1Code(), s->vu1c.data(), s->vu1c.size());
+        runtime->vu0().state() = s->v0; runtime->vu1().state() = s->v1;
+        {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(g_iopSinkM);
+            for (const SinkSer &ss : s->sinks)
+            {
+                IopSink &d = g_iopSinks[ss.key];
+                d.streamId = ss.streamId; d.returnedBytes = ss.returnedBytes; d.heldBytes = ss.heldBytes;
+                d.wallBaseBytes = ss.wallBaseBytes; d.frameBase = ss.frameBase; d.frameBaseBytes = ss.frameBaseBytes;
+                d.wallClock = ss.wallClock != 0; d.ringFullIdle = ss.ringFullIdle != 0; d.frameClock = ss.frameClock != 0;
+                d.wallBase = now; d.ringFullSince = now;
+            }
+        }
+        gsRegUnpack(s->gs, mem.gs());
+        g_bt3FrameCount.store(s->frame, std::memory_order_relaxed);
+        ps2_stubs::ps2RandRestore(s->rand64, s->randCalls);
+        return true;
+    }
+    extern "C" void ps2xSimSnapFree(void *h) { delete static_cast<SimSnap *>(h); }
+    extern "C" uint64_t ps2xSimSnapFrame(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s ? s->frame : 0u; }
+    extern "C" uint64_t ps2xRamHash(const uint8_t *rdram, uint32_t skipLo, uint32_t skipHi)
+    {   // 64-bit FNV-1a over 8-byte words (~10 ms for 32 MB), optionally skipping [skipLo, skipHi)
+        uint64_t h = 1469598103934665603ull;
+        const uint64_t *w = reinterpret_cast<const uint64_t *>(rdram);
+        const size_t lo = skipLo / 8u, hi = skipHi / 8u;
+        for (size_t i = 0; i < PS2_RAM_SIZE / 8u; ++i) { if (i >= lo && i < hi) continue; h ^= w[i]; h *= 1099511628211ull; }
+        return h;
+    }
+
     // [memwatch] PS2X_MEMWATCH=<hex>[,<hex>...] -- print these EE words whenever any of them
     // changes. Built to verify the RetroAchievements-documented menu variables against this
     // build, since a static dump cannot: menu variables are typically only meaningful WHILE their
@@ -5079,6 +5162,8 @@ namespace
         s_last = st;
     }
 
+    extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx);   // [rollback] ps2_runtime.cpp
+    extern "C" bool ps2xFrameStepOn();                                                        // [rollback] ps2_runtime.cpp
     void bt3FrameKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00100ab8
     {
         // Keep the SE stream fed from the active voices. Effects are produced incrementally so
@@ -5086,6 +5171,9 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        // [rollback] the frame gate: in frame-stepped mode tid 1 parks here until the host controller
+        // has had the boundary (snapshot / rollback) and opened the gate. No-op otherwise.
+        ps2xFrameGateWait(g_bt3FrameCount.load(std::memory_order_relaxed), rdram, ctx);
         {   // [savestate] one save, one load, both at this hook -- see the note above
             static const char *s_save = std::getenv("PS2X_SAVESTATE");
             static const char *s_load = std::getenv("PS2X_LOADSTATE");
@@ -5216,7 +5304,8 @@ namespace
             static const bool s_forceHeavy = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCEHEAVY"); return v && v[0] && v[0] != '0'; }();
             const bool heavy = s_forceHeavy || g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
             g_ps2xFrameGateHeavy.store(s_gate && heavy && PS2Memory::asyncKickEnabled(), std::memory_order_relaxed);   // [syncrelax]
-            if (s_gate && heavy && PS2Memory::asyncKickEnabled())
+            // [rollback] in frame-stepped mode the controller paces vblanks; a host sleep here would only starve them
+            if (s_gate && heavy && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
             {
                 static uint64_t s_lastTick = 0;
                 // [fps60gate] The 2-tick target IS a 30 fps lock: two vsyncs at 60 Hz = 33.3 ms. That is

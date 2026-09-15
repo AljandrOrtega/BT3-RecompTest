@@ -235,8 +235,16 @@ namespace
                address == kEeTimer0Hold;
     }
 
+    // [rollback] VIRTUAL CLOCK. The EE timers advance on this clock; in frame-stepped mode the
+    // scheduler's controller drives it (1/60 s per delivered vblank) instead of the wall clock, so
+    // Timer2 counts -- which the game's timer service compares against guest-side deadlines to
+    // decide which thread to wake -- become a function of guest progress. That is what lets a
+    // rolled-back re-run reproduce the original, and two netplay machines agree.
+    bool     g_vclockOn = false;
+    uint64_t g_vclockNs = 0;
     inline uint64_t steadyClockNs()
     {
+        if (g_vclockOn) return g_vclockNs;
         using namespace std::chrono;
         return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
     }
@@ -492,6 +500,65 @@ bool PS2Memory::isScratchpad(uint32_t address) const
 {
     return ps2IsScratchpadAddress(address);
 }
+
+// [rollback] virtual clock control (see steadyClockNs)
+extern "C" void ps2xVirtualClockEnable()
+{
+    if (g_vclockOn) return;
+    using namespace std::chrono;
+    g_vclockNs = static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+    g_vclockOn = true;
+}
+extern "C" void ps2xVirtualClockAdvance(uint64_t ns) { if (g_vclockOn) g_vclockNs += ns; }
+extern "C" uint64_t ps2xVirtualClockGet() { return g_vclockNs; }
+extern "C" void ps2xVirtualClockSet(uint64_t ns) { g_vclockNs = ns; }
+
+// [rollback] The device state PS2Memory keeps outside guest memory: the I/O register file (EE
+// timers, INTC, DMAC, SIF...), the timers' clock bookkeeping, pending DMA completions, the PATH3
+// mask and its parked FIFO, the VIF1 image-transfer carry, and the virtual clock. Pending GIF/VIF
+// transfers are expected empty at a frame boundary and are copied anyway.
+namespace
+{
+    struct MemDeviceSnap
+    {
+        std::unordered_map<uint32_t, uint32_t> io;
+        uint64_t t0Last = 0, t0Frac = 0, tLast[4] = {}, tFrac[4] = {};
+        std::vector<uint32_t> dmac;
+        bool path3Masked = false, vif1DirectHl = false;
+        uint32_t vif1ImgQwc = 0;
+        std::vector<std::vector<uint8_t>> path3Fifo;
+        std::vector<PS2Memory::PendingTransfer> gif, vif0, vif1;
+        uint64_t vclock = 0;
+    };
+}
+extern "C" void *ps2xMemDeviceCapture(PS2Memory *m)
+{
+    MemDeviceSnap *s = new MemDeviceSnap();
+    s->io = m->m_ioRegisters;
+    s->t0Last = m->m_timer0LastHostNs; s->t0Frac = m->m_timer0FractionNs;
+    for (int i = 0; i < 4; ++i) { s->tLast[i] = g_eeTimerLastNs[i]; s->tFrac[i] = g_eeTimerFracNs[i]; }
+    { std::lock_guard<std::mutex> lk(m->m_completedDmacMutex); s->dmac = m->m_completedDmacCauses; }
+    s->path3Masked = m->m_path3Masked; s->vif1DirectHl = m->m_vif1PendingPath2DirectHl; s->vif1ImgQwc = m->m_vif1PendingPath2ImageQwc;
+    s->path3Fifo = m->m_path3MaskedFifo;
+    s->gif = m->m_pendingGifTransfers; s->vif0 = m->m_pendingVif0Transfers; s->vif1 = m->m_pendingVif1Transfers;
+    s->vclock = g_vclockNs;
+    return s;
+}
+extern "C" bool ps2xMemDeviceRestore(PS2Memory *m, void *h)
+{
+    const MemDeviceSnap *s = static_cast<const MemDeviceSnap *>(h);
+    if (!s) return false;
+    m->m_ioRegisters = s->io;
+    m->m_timer0LastHostNs = s->t0Last; m->m_timer0FractionNs = s->t0Frac;
+    for (int i = 0; i < 4; ++i) { g_eeTimerLastNs[i] = s->tLast[i]; g_eeTimerFracNs[i] = s->tFrac[i]; }
+    { std::lock_guard<std::mutex> lk(m->m_completedDmacMutex); m->m_completedDmacCauses = s->dmac; }
+    m->m_path3Masked = s->path3Masked; m->m_vif1PendingPath2DirectHl = s->vif1DirectHl; m->m_vif1PendingPath2ImageQwc = s->vif1ImgQwc;
+    m->m_path3MaskedFifo = s->path3Fifo;
+    m->m_pendingGifTransfers = s->gif; m->m_pendingVif0Transfers = s->vif0; m->m_pendingVif1Transfers = s->vif1;
+    g_vclockNs = s->vclock;
+    return true;
+}
+extern "C" void ps2xMemDeviceFree(void *h) { delete static_cast<MemDeviceSnap *>(h); }
 
 uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
 {
