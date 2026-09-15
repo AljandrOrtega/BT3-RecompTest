@@ -799,6 +799,7 @@ extern "C" void ps2xCdTickOnly(uint8_t *, R5900Context *, PS2Runtime *);
 extern "C" void ps2xFixupRingDump();   // [fixupring]
 extern "C" void *ps2xGuestWaitBegin();
 extern "C" void ps2xGuestWaitEnd(void *);
+extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] sleep that parks the fiber, not the host thread
 extern "C" void ps2xSpinPump(uint8_t *, R5900Context *, PS2Runtime *);   // [spinpump] game_overrides.cpp
 
 PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
@@ -3646,7 +3647,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
                     static std::atomic<uint32_t> s_dy{0};
                     const uint32_t k = s_dy.fetch_add(1u);
                     if (k < 4u || (k % 20000u) == 0u) std::fprintf(stderr, "[dispatchpump] main thread yield (x%u) at pc 0x%x\n", k + 1u, pc);
-                    void *scope = ps2xGuestWaitBegin(); std::this_thread::yield(); ps2xGuestWaitEnd(scope);
+                    void *scope = ps2xGuestWaitBegin(); ps2xGuestSleepMs(0u); ps2xGuestWaitEnd(scope);
                 }
             }
         }
@@ -4451,6 +4452,32 @@ void *PS2Runtime::guestWaitBegin() { return new GuestExecutionReleaseScope(this)
 void PS2Runtime::guestWaitEnd(void *handle) { delete static_cast<GuestExecutionReleaseScope *>(handle); }
 extern "C" void *ps2xGuestWaitBegin() { gprof::enter(gprof::WAIT); return g_waitHookRuntime ? g_waitHookRuntime->guestWaitBegin() : nullptr; }   // [guestprof] WAIT
 extern "C" void ps2xGuestWaitEnd(void *h) { gprof::leave(); if (h && g_waitHookRuntime) g_waitHookRuntime->guestWaitEnd(h); }
+// [fibers] A host sleep on a guest fiber stops EVERY guest fiber, so a hook that sleeps while it waits
+// for another guest thread to make progress -- the [nullpkt] loader wait, [spinpump], [dispatchpump]
+// -- never sees that progress: the 2026-09-15 demo-fight freeze was bt3WaitFieldNonZero running out
+// its 1000 ms cap because the loader fiber was never probed while the host thread slept. Under
+// fibers this parks the caller until the deadline instead, so the scheduler keeps probing and
+// running the others; under threads it is exactly the sleep (or yield, for 0 ms) it replaces. Call
+// it inside a ps2xGuestWaitBegin/End scope, as the sleeps were, so the token is released too.
+extern "C" void ps2xGuestSleepMs(unsigned ms)
+{
+    PS2Runtime *rt = g_waitHookRuntime;
+    if (!rt || !rt->fibersEnabled())
+    {
+        if (ms == 0u) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        return;
+    }
+    static std::mutex s_m;
+    static std::condition_variable s_cv;   // never notified: only the deadline ends this wait
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    bool parkedOnce = false;               // even 0 ms parks once, so one probe pass happens
+    std::unique_lock<std::mutex> lk(s_m);
+    rt->guestWait(s_cv, lk,
+                  [&]() { if (!parkedOnce) { parkedOnce = true; return false; }
+                          return std::chrono::steady_clock::now() >= deadline; },
+                  WP_SCHED_YIELD);
+}
 void PS2Runtime::run()
 {
     g_waitHookRuntime = this;   // [barblock]

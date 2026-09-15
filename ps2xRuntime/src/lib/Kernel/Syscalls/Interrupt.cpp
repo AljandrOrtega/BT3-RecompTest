@@ -570,18 +570,15 @@ namespace ps2_syscalls
         std::unique_lock<std::mutex> lock(g_vsync_flag_mutex);
         uint64_t current = g_vsync_tick_counter;
         uint64_t result = current;
-        waitWithGuestExecutionReleasedUntilUnlocked(
-            runtime,
-            lock,
-            [&]()
-            {
-                g_vsync_cv.wait(lock, [current, runtime]()
-                                { return g_vsync_tick_counter > current || (runtime != nullptr && runtime->isStopRequested()); });
-            },
-            [&]()
-            {
-                result = g_vsync_tick_counter;
-            });
+        // [fibers] Host-driven (the vblank worker signals it), but it must still PARK the fiber: a raw
+        // cv wait blocks the shared host thread, so no other guest fiber ran during the frame wait --
+        // which under threads (token released) is where the loader and sound threads got most of
+        // their time. The predicate only reads the counter, so re-checking it per probe is free.
+        waitGuestUntil(
+            runtime, lock, g_vsync_cv,
+            [current, runtime]() { return g_vsync_tick_counter > current || (runtime != nullptr && runtime->isStopRequested()); },
+            WP_SYNC_OTHER,
+            [&]() { result = g_vsync_tick_counter; });
         return result;
     }
 

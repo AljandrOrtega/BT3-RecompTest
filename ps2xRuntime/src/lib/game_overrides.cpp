@@ -2862,6 +2862,7 @@ namespace
     }
     extern "C" void *ps2xGuestWaitBegin();
     extern "C" void ps2xGuestWaitEnd(void *);
+    extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] parks the guest fiber, not the host thread
     extern "C" void ps2xSpinPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_SPINPUMP"); return !(v && v[0] == '0'); }();
@@ -2875,7 +2876,7 @@ namespace
         if (k < 6u || (k % 5000u) == 0u)
             std::fprintf(stderr, "[spinpump] guest thread spinning at pc 0x%x: ticked the CD server + yielded (x%u)\n", ctx->pc, k + 1u);
         void *scope = ps2xGuestWaitBegin();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ps2xGuestSleepMs(1u);   // [fibers] a host sleep here would stop the very threads the CD tick serves
         ps2xGuestWaitEnd(scope);
     }
 
@@ -5250,6 +5251,7 @@ namespace
     PS2Runtime::RecompiledFunction g_orig113478 = nullptr;
     extern "C" void *ps2xGuestWaitBegin();
     extern "C" void ps2xGuestWaitEnd(void *);
+    extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] parks the guest fiber, not the host thread
     // Wait (yielding the guest execution token so the loader threads can run) until the 32-bit
     // field at `addr` becomes non-zero. Returns the value (0 after the cap).
     static uint32_t bt3WaitFieldNonZero(uint8_t *rdram, uint32_t addr, const char *what, uint32_t pc, R5900Context *ctx = nullptr, PS2Runtime *runtime = nullptr)
@@ -5272,7 +5274,7 @@ namespace
                 if (tickGuard.engaged) { bt3RunCdTickInline(rdram, ctx, runtime); s_bt3CdTicking = false; }
             }
             void *scope = ps2xGuestWaitBegin();
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ps2xGuestSleepMs(2u);   // [fibers] the loader is a fiber on this host thread: park, do not sleep
             ps2xGuestWaitEnd(scope);
             waited += 2;
             v = rd();
