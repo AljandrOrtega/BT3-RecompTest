@@ -4020,6 +4020,8 @@ namespace
     // ~80k yields/s in a fight = most of the re-simulation cost); now it does so only when the
     // generation moved since the last probe, with a probe every 64 yields as a safety net.
     std::atomic<uint64_t> g_schedSignalGen{0};
+    // [rollbacktest] where the re-simulation's time goes (accumulated while g_rollbackUnpaced)
+    uint64_t g_rbTicks = 0, g_rbTickNs = 0, g_rbSwitches = 0, g_rbProbes = 0, g_rbIdles = 0, g_rbBoundaries = 0, g_rbBoundaryNs = 0;
     // Keyed by tid, and deliberately NOT in SchedThread: keeping it here avoids touching
     // ps2_runtime.h, which every generated runner source includes (a ~10 minute rebuild).
     std::map<int, GuestTls> g_fiberTls;
@@ -4170,7 +4172,7 @@ bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
             {
                 // [rollback] In frame-stepped mode an idle scheduler means the guest is waiting for an
                 // interrupt (a vblank, mostly): hand the controller the decision instead of napping.
-                if (g_gate.on && idleProbes != 0) { g_schedIdleReturn = true; return true; }
+                if (g_gate.on && idleProbes != 0) { g_schedIdleReturn = true; ++g_rbIdles; return true; }
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
             ++idleProbes;
@@ -4188,6 +4190,7 @@ bool PS2Runtime::schedFiberLoopUntil(bool (*stop)(void *), void *stopCtx)
             ps2xKernelSetCurrentTid(t.kernelTid);
         }
         g_curFiber = f;
+        ++g_rbSwitches; if (probe) ++g_rbProbes;
         ps2xFiberSwitch(m_schedFiber, f);
         g_curFiber = m_schedFiber;   // back in the scheduler
         {
@@ -4263,10 +4266,13 @@ void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()>
                 }
                 nextVblank += period;
                 ps2xVirtualClockAdvance(16666667ull);
-                ps2xInterruptTick(m_memory.getRDRAM(), this);
+                { const auto t0 = clock::now();
+                  ps2xInterruptTick(m_memory.getRDRAM(), this);
+                  g_rbTickNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0).count(); ++g_rbTicks; }
                 continue;
             }
-            ps2xRollbackAtBoundary(*this);
+            { const auto t0 = clock::now(); ps2xRollbackAtBoundary(*this); ++g_rbBoundaries;
+              g_rbBoundaryNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0).count(); }
             g_cadNestedFairness = 0u; g_cadMainNestedYield = 0u; g_cadTickCounter = 0u;   // [rollback] cadence phase = 0 at every boundary
             g_cadBackEdge = 0u; g_cadAdxCtr = 0u; g_cadDp = 0u;
             { std::lock_guard<std::mutex> lk(g_gateM); g_gate.openFrame = g_gate.waitFrame; }
@@ -4407,6 +4413,17 @@ void PS2Runtime::schedBeginBlock(int tid)
 
 void PS2Runtime::yieldGuestExecutionAfterWake()
 {
+    // [fibers] The handoff below waits (2 ms, host cv) for the WOKEN HOST THREAD to take the guest
+    // lock. Under fibers the woken thread is a fiber on this very host thread and cannot run until
+    // the waker parks, so the wait always ran out its 2 ms -- 4 ms per frame at the title, 8 in a
+    // fight: the whole unexplained re-simulation cost, and a tax on ordinary fiber play. Yielding
+    // to the scheduler does what the handoff meant: the wake bumped the signal generation, so the
+    // yield probes the woken fiber and hands it the token if it is now runnable.
+    if (m_fibersEnabled && g_schedIsGuest && g_curFiber && g_curFiber != m_schedFiber)
+    {
+        schedYield(g_schedTid);
+        return;
+    }
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
@@ -4742,6 +4759,7 @@ struct Ps2xRollback
         static uint64_t s_target = 0, s_next = 0, s_hashA = 0, s_hashAgp = 0;
         static std::vector<uint8_t> s_ramA;   // RAM after the first run, for the byte diff that names what the snapshot misses
         static std::chrono::steady_clock::time_point s_tA, s_tB;
+        static uint64_t s_wpNs0[WP_COUNT] = {};   // [waitprof] wait-site ns at the start of the re-run
         static uint32_t s_n = 0;
         const uint64_t frame = g_gate.waitFrame;
         uint8_t *rdram = g_gate.rdram;
@@ -4775,6 +4793,8 @@ struct Ps2xRollback
             g_gate.openFrame = g_gate.waitFrame - 1u;
             s_phase = RunB; s_tB = std::chrono::steady_clock::now();
             g_rollbackUnpaced = true;   // re-simulation: vblanks as fast as the guest consumes them
+            g_rbTicks = g_rbTickNs = g_rbSwitches = g_rbProbes = g_rbIdles = g_rbBoundaries = g_rbBoundaryNs = 0;
+            for (int i = 0; i < WP_COUNT; ++i) s_wpNs0[i] = g_ps2xWaitNs[i].load(std::memory_order_relaxed);   // [waitprof] baseline
             { static const bool s_skip = [](){ const char *v = std::getenv("PS2X_ROLLBACK_RENDERSKIP"); return !(v && v[0] == '0'); }();
               ps2xRenderSkipSet(s_skip); }   // PS2X_ROLLBACK_RENDERSKIP=0 keeps rendering in the re-run (A/B)
             return;
@@ -4788,6 +4808,19 @@ struct Ps2xRollback
             std::fprintf(stderr, "[rollbacktest] #%u frame %llu hashB=%016llx (%.1f ms) -> %s (minus the stream window: %s)\n",
                          s_n, (unsigned long long)frame, (unsigned long long)hashB, msB, hashB == s_hashA ? "MATCH" : "DIFFER",
                          hashBgp == s_hashAgp ? "MATCH" : "DIFFER");
+            std::fprintf(stderr, "[rollbackcost] ticks=%llu (%.1f ms in handlers) switches=%llu probes=%llu idles=%llu boundaries=%llu (%.1f ms)\n",
+                         (unsigned long long)g_rbTicks, g_rbTickNs / 1e6, (unsigned long long)g_rbSwitches, (unsigned long long)g_rbProbes,
+                         (unsigned long long)g_rbIdles, (unsigned long long)g_rbBoundaries, g_rbBoundaryNs / 1e6);
+            if (g_ps2xWaitProfOn)
+            {   // [waitprof] blocking waits during the re-run, per site (PS2X_WAITPROF=1)
+                std::fprintf(stderr, "[rollbackwait]");
+                for (int i = 0; i < WP_COUNT; ++i)
+                {
+                    const uint64_t d = g_ps2xWaitNs[i].load(std::memory_order_relaxed) - s_wpNs0[i];
+                    if (d >= 100000ull) std::fprintf(stderr, " site%d=%.1fms", i, d / 1e6);
+                }
+                std::fprintf(stderr, "\n");
+            }
             if (hashB != s_hashA && s_ramA.size() == 32u * 1024u * 1024u)
             {   // Differing byte ranges (merged when closer than 64 bytes), first 40: the addresses name the
                 // game structure and therefore the host-side state that did not roll back with the rest.

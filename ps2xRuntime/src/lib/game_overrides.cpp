@@ -5237,6 +5237,7 @@ namespace
 
     extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx);   // [rollback] ps2_runtime.cpp
     extern "C" bool ps2xFrameStepOn();                                                        // [rollback] ps2_runtime.cpp
+    extern "C" bool ps2xRenderSkipOn();                                                       // [rollback] ps2_memory.cpp
     void bt3FrameKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // FUN_00100ab8
     {
         // Keep the SE stream fed from the active voices. Effects are produced incrementally so
@@ -5569,6 +5570,7 @@ namespace
         // because per-flip publishing risks partial/extra frames + cadence jitter on the menus.
         static const bool s_dfPub = [](){ const char *v = std::getenv("PS2X_DISPFB_PUBLISH"); return v && v[0] && v[0] != '0'; }();
         if (GsGpuRenderer::enabled() && !s_dfPub)
+        if (!ps2xRenderSkipOn())   // [rollback] a re-simulated frame has nothing to publish
         {
             // Async kick mode: the frame's draws are still in the kick-worker queue, so the
             // publish must be enqueued after them (stream order), not executed here.
