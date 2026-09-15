@@ -4764,6 +4764,45 @@ namespace
     // Walking the menus with this on names the CHARACTER-SELECT state, which is what a direct
     // "jump both players to character select" needs instead of replaying canned button presses.
     // Also logs the guest pc/ra at the moment of the change, to point at the code that sets it.
+    // [matchwatch] PS2X_MATCHWATCH=1 -- print the whole match-setup tuple whenever any part of it
+    // changes. Team Battle and DP Battle share character-select screen 0x28, and stateObj+0x624
+    // (the battle type) has exactly ONE writer in the overlay -- 0x356248, inside the confirm
+    // function we replace -- so setting it to 2 cannot be what is missing when DP comes up playing
+    // like Team. The remaining candidate is the third field the real confirm commits,
+    // duelObj+0x118 -> stateObj+0x630, which the versus menu would have filled in from a sub-row we
+    // never visit. Rather than guess its value: walk to DP Battle by hand once with this on, and
+    // the line printed on confirm IS the answer.
+    //     stateObj = [0x2ff10c]   +0x18 screen  +0x620 mode  +0x624 type  +0x628 ?  +0x630 ?
+    //     duelObj  = [0x3b38e8]   +0x110 mode   +0x114 type  +0x118 ?     +0x13c time limit
+    //     cfgObj   = [0x3b38d8]   +0x3c38/+0x3c3c/+0x3c40  <- where char-select copies the trio
+    //                                                          (0x34b760..0x34b784)
+    static void bt3MatchWatch(uint8_t *rdram)
+    {
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_MATCHWATCH");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (!s_on || !rdram) return;
+        auto ld = [&](uint32_t a) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rdram + (a & PS2_RAM_MASK), 4); return v; };
+        const uint32_t so = ld(0x2ff10cu) & 0x1FFFFFFFu;
+        const uint32_t du = ld(0x3b38e8u) & 0x1FFFFFFFu;
+        const uint32_t cf = ld(0x3b38d8u) & 0x1FFFFFFFu;
+        uint32_t cur[12] = {0};
+        if (so) { cur[0] = ld(so + 0x18u);  cur[1] = ld(so + 0x620u); cur[2] = ld(so + 0x624u);
+                  cur[3] = ld(so + 0x628u); cur[4] = ld(so + 0x630u); }
+        if (du) { cur[5] = ld(du + 0x110u); cur[6] = ld(du + 0x114u); cur[7] = ld(du + 0x118u);
+                  cur[8] = ld(du + 0x13cu); }
+        if (cf) { cur[9] = ld(cf + 0x3c38u); cur[10] = ld(cf + 0x3c3cu); cur[11] = ld(cf + 0x3c40u); }
+        static uint32_t s_prev[12]; static bool s_have = false;
+        if (s_have && std::memcmp(cur, s_prev, sizeof cur) == 0) return;
+        static const char *kName[12] = { "screen", "st.mode", "st.type", "st.628", "st.630",
+                                         "du.110", "du.114", "du.118", "du.time",
+                                         "cf.3c38", "cf.3c3c", "cf.3c40" };
+        std::fprintf(stderr, "[matchwatch] frame %llu |", (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed));
+        for (int i = 0; i < 12; ++i)
+            std::fprintf(stderr, " %s=%u%s", kName[i], cur[i], (s_have && cur[i] != s_prev[i]) ? "*" : "");
+        std::fprintf(stderr, "%s%s\n", du ? "" : "  (no duelObj)", so ? "" : "  (no stateObj)");
+        std::memcpy(s_prev, cur, sizeof cur); s_have = true;
+    }
+
     static void bt3StateWatch(uint8_t *rdram, R5900Context *ctx)
     {
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_STATEWATCH");
@@ -4825,6 +4864,7 @@ namespace
             }
         }
         bt3StateWatch(rdram, ctx);   // [statewatch]
+        bt3MatchWatch(rdram);        // [matchwatch]
         bt3MemWatch(rdram);          // [memwatch]
         bt3MemBlock(rdram);          // [memblock]
         bt3DumpKey(rdram);           // [dumpkey]
