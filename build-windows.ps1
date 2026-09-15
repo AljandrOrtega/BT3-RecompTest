@@ -26,7 +26,15 @@ $LAUNCHER_SRC = Join-Path $ROOT "ps2xRuntime\src\launcher"
 $LAUNCHER_BUILD = Join-Path $BUILD "launcher_qt"
 $PGS_DIR = Join-Path $ROOT "ps2xRuntime\third_party\parallel-gs"
 $MESA_DIR = Join-Path $BUILD "mesa"   # Mesa lavapipe (software Vulkan) for the Windows Vulkan fallback
-$ISO_DEFAULT = "C:\Users\Rexx\Desktop\DragonBall Z - Budokai Tenkaichi 3 (USA) (En,Ja).iso"
+$ISO_DEFAULT = ""
+foreach ($isoDir in @([Environment]::GetFolderPath("Desktop"), (Join-Path $env:USERPROFILE "Downloads"), $ROOT, $PSScriptRoot)) {
+    if ($isoDir -and (Test-Path $isoDir)) {
+        $isoHit = Get-ChildItem $isoDir -Filter "*.iso" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match 'budokai|tenkaichi|dbz|bt3' } |
+                  Select-Object -First 1
+        if ($isoHit) { $ISO_DEFAULT = $isoHit.FullName; break }
+    }
+}
 $QT_VERSION = "6.5.3"
 $QT_HOST = "windows"
 # Qt 6.5.x ships only the msvc2019_64 kit; it is ABI-compatible with MSVC 2022.
@@ -48,16 +56,6 @@ function Test-FileCmd($name) {
     if ($PSVersionTable.PSEdition -eq "Core") { $exe = $name + (if ($IsWindows) { ".exe" } else { "" }) }
     else { $exe = $name + ".exe" }
     return [bool](Get-Command $exe -ErrorAction SilentlyContinue)
-}
-
-# Run a native command line through cmd.exe. This keeps pip/aqtinstall progress
-# and warnings (which they write to stderr) from being surfaced as terminating
-# NativeCommandError records under $ErrorActionPreference = "Stop".
-function Invoke-CmdLine([string]$Line) {
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try { cmd.exe /d /s /c $Line } finally { $ErrorActionPreference = $prev }
-    return $LASTEXITCODE
 }
 
 # ─── VS environment ─────────────────────────────────────────────────────────────
@@ -105,80 +103,37 @@ function Import-VSEnvironment {
 
 # ─── Prerequisites ──────────────────────────────────────────────────────────────
 function Ensure-Prerequisites {
-    Step "Checking prerequisites"
-    $missing = @()
+    # Single source of truth for the toolchain: VS Build Tools 2022 (ClangCL +
+    # Win11 SDK), CMake, Ninja, Python, aqtinstall+pefile, Qt, and the bundled
+    # Mesa lavapipe. Run with -Install so a fresh machine needs no manual setup;
+    # it is a no-op when everything is already present.
+    Step "Installing / verifying dependencies"
+    $depsScript = Join-Path $ROOT "install-deps-windows.ps1"
+    if (-not (Test-Path $depsScript)) { Fail "Dependency installer not found: $depsScript" }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $depsScript -Install
+    if ($LASTEXITCODE -ne 0) { Fail "install-deps-windows.ps1 failed (exit $LASTEXITCODE)" }
 
-    # VS Build Tools
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    $hasVS = $false
-    if (Test-Path $vswhere) {
-        $hasVS = [bool](& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-    }
-    if (-not $hasVS) { $missing += "VS Build Tools 2022 (ClangCL + Win11 SDK)" }
-
-    # CMake (>= 3.21 for DOWNLOAD_EXTRACT_TIMESTAMP)
-    if (Test-FileCmd "cmake") {
-        $cmakeVer = (& cmake --version | Select-Object -First 1) -replace '^cmake version (\d+)\.(\d+).*','$1.$2'
-        if ([version]"$cmakeVer" -lt [version]"3.21") { $missing += "CMake >= 3.21 (found $cmakeVer)" }
-    } else { $missing += "CMake" }
-
-    # Ninja
-    if (-not (Test-FileCmd "ninja")) { $missing += "Ninja" }
-
-    # Python3
-    if (-not (Test-FileCmd "python")) { $missing += "Python 3" }
-
-    if ($missing.Count -gt 0) {
-        Step "Installing missing prerequisites via winget"
-        Write-Host ("Missing: " + ($missing -join ", ")) -ForegroundColor Yellow
-
-        if (-not $hasVS) {
-            Step "Installing VS Build Tools 2022 (this takes several minutes)"
-            $override = "--quiet --wait --norestart " +
-                "--add Microsoft.VisualStudio.Workload.VCTools " +
-                "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang " +
-                "--add Microsoft.VisualStudio.Component.VC.Tools.LLVM " +
-                "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 " +
-                "--add Microsoft.VisualStudio.Component.Windows11SDK.22621 " +
-                "--includeRecommended"
-            winget install -e --id Microsoft.VisualStudio.2022.BuildTools `
-                --accept-source-agreements --accept-package-agreements --override $override
-            if ($LASTEXITCODE -ne 0) { Fail "winget install VS Build Tools failed (exit $LASTEXITCODE)" }
-            Log "VS Build Tools installed"
+    # Tools installed just now may not be on this session's PATH yet.
+    $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links" + [System.IO.Path]::PathSeparator + $env:PATH
+    foreach ($tool in @("cmake", "ninja", "python")) {
+        if (-not (Test-FileCmd $tool)) {
+            Fail "$tool not found after installing dependencies; open a new terminal and re-run build-windows.ps1"
         }
-
-        if (-not (Test-FileCmd "ninja")) {
-            winget install -e --id Ninja-build.Ninja --accept-source-agreements --accept-package-agreements
-            $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links" + [System.IO.Path]::PathSeparator + $env:PATH
-            if (-not (Test-FileCmd "ninja")) { Fail "ninja installed but not on PATH" }
-        }
-    }
-
-    Step "Installing Python packages (aqtinstall, pefile)"
-    $pipRc = Invoke-CmdLine "python -m pip install --quiet --upgrade --disable-pip-version-check --no-warn-script-location aqtinstall pefile 2>nul"
-    if ($pipRc -ne 0) { Fail "pip install failed (exit $pipRc)" }
-    Log "aqtinstall + pefile ready"
-
-    # Qt via aqtinstall (skip if already present)
-    if (-not (Test-Path $QT_ROOT)) {
-        Step "Downloading Qt $QT_VERSION ($QT_HOST, $QT_TARGET) via aqtinstall"
-        $aqtRc = Invoke-CmdLine "python -m aqt install-qt $QT_HOST desktop $QT_VERSION $QT_TARGET --outputdir `"$QT_BASE`" 2>nul"
-        if ($aqtRc -ne 0) { Fail "aqt install-qt failed (exit $aqtRc)" }
-        if (-not (Test-Path $QT_ROOT)) { Fail "Qt not found at $QT_ROOT after install" }
-        Log "Qt installed: $QT_ROOT"
-    } else {
-        Log "Qt found at $QT_ROOT"
     }
 }
 
 # ─── ISO prompt ─────────────────────────────────────────────────────────────────
 if (-not $SkipSetup) {
     if (-not $Iso) {
-        $readIso = Read-Host "BT3 ISO path (Enter = $ISO_DEFAULT)"
-        $Iso = if ($readIso) { $readIso } else { $ISO_DEFAULT }
+        if ($ISO_DEFAULT) {
+            $readIso = Read-Host "BT3 ISO path (Enter = $ISO_DEFAULT)"
+            $Iso = if ($readIso) { $readIso } else { $ISO_DEFAULT }
+        } else {
+            $Iso = Read-Host "BT3 ISO path (e.g. C:\path\to\bt3-usa.iso)"
+        }
     }
-    $Iso = $Iso.Trim('"')
-    if (-not (Test-Path $Iso)) { Fail "ISO not found: $Iso" }
+    $Iso = "$Iso".Trim('"')
+    if (-not $Iso -or -not (Test-Path $Iso)) { Fail "ISO not found: $Iso" }
 }
 
 if (-not $OutDir) {
@@ -454,6 +409,7 @@ if (-not $SkipPackage) {
     Step "Packaging release zip"
     # Invoke packaging (PowerShell 5.1) to produce zip + sha256 and copy to Desktop
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ROOT "package-windows.ps1") -StageDir $STAGE -OutDir $OUT
+    if ($LASTEXITCODE -ne 0) { Fail "Package step failed (exit $LASTEXITCODE)" }
 }
 
 $sw.Stop()

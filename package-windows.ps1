@@ -55,7 +55,7 @@ Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
 $useTar = $false
 $tarExe = Get-Command tar.exe -ErrorAction SilentlyContinue
 if ($tarExe) {
-    $tarVer = & tar.exe --version 2>$null
+    $tarVer = & tar.exe --version
     if ($tarVer -match "bsdtar|libarchive") { $useTar = $true }
 }
 
