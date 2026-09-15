@@ -31,3 +31,11 @@ void     ps2NetSubmitLocal(uint32_t frame, const Ps2xNetInput &in);
 bool     ps2NetGetInput(uint32_t frame, int player, Ps2xNetInput &out);
 void     ps2NetSetChecksum(uint32_t frame, uint64_t hash);
 void     ps2NetFrame(uint32_t frame);
+// [rollback] Rollback netplay (PS2X_NET_ROLLBACK=<window frames>; needs PS2X_FIBERS + frame stepping).
+// A missing remote input is PREDICTED (last known repeated) instead of stalling; when the real one
+// arrives and differs, the frame-boundary controller restores that frame's snapshot and re-simulates.
+uint32_t ps2NetRollbackWindow();                       // 0 = lockstep as before
+// Called by the controller at every frame boundary (frameAbs = the frame about to run). Pumps the
+// network. Returns the absolute frame to roll back to (0 = none), and sets *mustStall when a remote
+// input older than the window is still missing (the controller then waits as lockstep did).
+uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall);

@@ -1,6 +1,8 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_fiber.h"   // [fibers]
+#include <deque>
+#include "runtime/ps2_netplay.h" // [rollback] the netplay controller
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
@@ -4006,7 +4008,8 @@ namespace
     // is game_overrides' vsync pacing brake, which frame-stepping replaces.)
     bool g_rollbackUnpaced = false;   // [rollback] the controller lifts the 60 Hz vblank pacing (re-simulation)
     FrameGate g_gate = []() { FrameGate g; const char *e = std::getenv("PS2X_FRAMESTEP"); const char *r = std::getenv("PS2X_ROLLBACKTEST");
-                              g.on = (e && e[0] && e[0] != '0') || (r && r[0]); return g; }();
+                              const char *n = std::getenv("PS2X_NET_ROLLBACK");
+                              g.on = (e && e[0] && e[0] != '0') || (r && r[0]) || (n && n[0] && n[0] != '0'); return g; }();
     std::mutex g_gateM;
     std::condition_variable g_gateCv;
     // [fibers] Probing state (see schedFiberLoop). File-static for the same header reason.
@@ -4660,6 +4663,7 @@ extern "C" bool  ps2xSimSnapRestore(void *snap, PS2Runtime *rt, uint8_t *rdram);
 extern "C" void  ps2xSimSnapFree(void *snap);
 extern "C" uint64_t ps2xSimSnapFrame(const void *snap);
 extern "C" uint64_t ps2xRamHash(const uint8_t *rdram, uint32_t skipLo, uint32_t skipHi);
+extern "C" const uint8_t *ps2xSimSnapRam(const void *snap);
 extern "C" void *ps2xKernelStateCapture();               // Kernel/Syscalls/Thread.cpp
 extern "C" bool  ps2xKernelStateRestore(void *);
 extern "C" void  ps2xKernelStateFree(void *);
@@ -4732,6 +4736,86 @@ struct Ps2xRollback
         return true;
     }
 
+    // [netplay rollback] PS2X_NET_ROLLBACK=<W>: at every boundary keep a ring of the last W+1 frame
+    // snapshots; ask the transport whether a confirmed remote input contradicted a prediction (then
+    // restore that frame's snapshot and re-simulate up to the current frame, unpaced and without
+    // rendering) or whether a remote input older than W is still missing (then wait, as lockstep
+    // did). Re-simulated boundaries refresh their ring entries with the corrected state.
+    struct RingEntry { uint64_t frame; void *sim; FiberSnap *fib; };
+    static void netAtBoundary(PS2Runtime &rt)
+    {
+        // Not cached: the transport parses PS2X_NET_ROLLBACK when it starts, which is later than the
+        // first frame boundary (ps2NetInit runs inside the frame hook, after the gate).
+        const uint32_t W = ps2NetRollbackWindow();
+        if (!W || !ps2NetActive()) return;
+        static std::deque<RingEntry> ring;
+        static uint64_t resimTarget = 0;          // != 0 while re-simulating up to this frame
+        const uint64_t frame = g_gate.waitFrame;
+        uint8_t *rdram = g_gate.rdram;
+        auto dropEntry = [](RingEntry &e) { ps2xSimSnapFree(e.sim); delete e.fib; };
+        auto captureInto = [&](uint64_t f)
+        {
+            PS2Runtime::GuestExecutionScope lock(&rt);
+            for (auto &e : ring) if (e.frame == f) { dropEntry(e); e.sim = ps2xSimSnapCapture(&rt, rdram); e.fib = captureFibers(rt); return; }
+            ring.push_back(RingEntry{f, ps2xSimSnapCapture(&rt, rdram), captureFibers(rt)});
+            while (!ring.empty() && ring.front().frame + W < f) { dropEntry(ring.front()); ring.pop_front(); }
+        };
+        if (resimTarget)
+        {
+            captureInto(frame);                  // corrected state for this frame
+            if (frame >= resimTarget) { resimTarget = 0; g_rollbackUnpaced = false; ps2xRenderSkipSet(false); }
+            else return;                         // keep re-simulating
+        }
+        bool stall = false;
+        uint32_t rbTo = ps2NetRollbackPoll((uint32_t)frame, &stall);
+        if (stall)
+        {   // prediction depth exhausted: wait for the peer as lockstep did (bounded)
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto deadline = t0 + std::chrono::milliseconds(2000);
+            while (stall && std::chrono::steady_clock::now() < deadline && !rt.isStopRequested())
+            {
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+                rbTo = ps2NetRollbackPoll((uint32_t)frame, &stall);
+                if (rbTo) break;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            static uint32_t s_ns = 0; static double s_msTotal = 0; s_msTotal += ms;
+            if (++s_ns <= 10 || (s_ns % 200) == 0)
+                std::fprintf(stderr, "[netplay] stall #%u at frame %llu: %.1f ms (%.0f ms total)%s\n", s_ns, (unsigned long long)frame, ms, s_msTotal, stall ? " TIMED OUT" : "");
+        }
+        if (rbTo)
+        {
+            RingEntry *e = nullptr;
+            for (auto &x : ring) if (x.frame == rbTo) { e = &x; break; }
+            if (!e) { std::fprintf(stderr, "[netplay] rollback to %u: no snapshot (ring %zu)\n", rbTo, ring.size()); }
+            else
+            {
+                PS2Runtime::GuestExecutionScope lock(&rt);
+                const bool okS = ps2xSimSnapRestore(e->sim, &rt, rdram);
+                const bool okF = restoreFibers(rt, *e->fib);
+                static uint32_t s_n = 0;
+                if (++s_n <= 20 || (s_n % 100) == 0)
+                    std::fprintf(stderr, "[netplay] rollback #%u: frame %llu -> %u (%llu frames) sim=%d fibers=%d\n", s_n,
+                                 (unsigned long long)frame, rbTo, (unsigned long long)(frame - rbTo), (int)okS, (int)okF);
+                if (okS && okF)
+                {
+                    g_gate.openFrame = g_gate.waitFrame - 1u;   // the boot loop opens it for the restored frame
+                    resimTarget = frame; g_rollbackUnpaced = true; ps2xRenderSkipSet(true);
+                    return;
+                }
+            }
+        }
+        captureInto(frame);
+        // Desync detection on CONFIRMED state only: the ring's oldest entry (frame - W) has every input
+        // it depends on known (the stall rule) and was refreshed by any rollback that reached it, so its
+        // RAM hash is comparable across the two machines. Every 60 frames (a 32 MB hash is ~10 ms).
+        if (!ring.empty() && (frame % 60u) == 0u && ring.front().frame + W <= frame)
+        {
+            if (const uint8_t *ram = ps2xSimSnapRam(ring.front().sim))
+                ps2NetSetChecksum((uint32_t)ring.front().frame, ps2xRamHash(ram, 0u, 0u));
+        }
+    }
+
     // [rollbacktest] PS2X_ROLLBACKTEST=<k>[:<start>[:<period>]]: at frame `start` take a snapshot,
     // run k frames, hash RAM; restore, run the same k frames again, hash again; report, and repeat
     // every `period` frames. The instrument for the whole rollback effort: a mismatch's byte diff
@@ -4739,6 +4823,7 @@ struct Ps2xRollback
     // re-simulation cost. The screen shows the rewind.
     static void atBoundary(PS2Runtime &rt)
     {
+        netAtBoundary(rt);
         static const char *s_env = std::getenv("PS2X_ROLLBACKTEST");
         if (!s_env || !s_env[0]) return;
         static uint64_t s_k = 0, s_start = 0, s_period = 0;

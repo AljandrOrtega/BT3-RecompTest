@@ -4712,6 +4712,7 @@ namespace
         return true;
     }
     extern "C" void ps2xSimSnapFree(void *h) { delete static_cast<SimSnap *>(h); }
+    extern "C" const uint8_t *ps2xSimSnapRam(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s && s->ram.size() == PS2_RAM_SIZE ? s->ram.data() : nullptr; }
     extern "C" uint64_t ps2xSimSnapFrame(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s ? s->frame : 0u; }
     extern "C" uint64_t ps2xRamHash(const uint8_t *rdram, uint32_t skipLo, uint32_t skipHi)
     {   // 64-bit FNV-1a over 8-byte words (~10 ms for 32 MB), optionally skipping [skipLo, skipHi)

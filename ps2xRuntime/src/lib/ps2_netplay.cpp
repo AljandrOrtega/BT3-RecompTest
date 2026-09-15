@@ -27,6 +27,8 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <deque>
+#include <cstring>
 
 #if defined(_WIN32)
 #  include <winsock2.h>
@@ -114,6 +116,14 @@ struct Net
     std::atomic<int> battleType{0};
     std::atomic<int> timeLimit{3};   // 3 is the game's default
     std::atomic<int> dpLimit{0};     // 0 = 10 DP                             // bumped per connect, so netjump can reset
+    // [rollback]
+    uint32_t    rbWindow = 0;                                    // PS2X_NET_ROLLBACK=<frames>, 0 = lockstep
+    std::unordered_map<uint32_t, Ps2xNetInput> predicted;        // rel frame -> the remote input we GUESSED with
+    uint32_t    rollbackTo = 0xFFFFFFFFu;                        // earliest rel frame whose real input differed from the guess
+    uint32_t    fakeLagMs = 0;                                   // PS2X_NET_FAKELAG=<ms>: hold received packets (loopback testing)
+    bool        testInput = false;                               // PS2X_NET_TESTINPUT=1: toggle R3 every 15 frames so the peer mispredicts
+    std::deque<std::pair<std::chrono::steady_clock::time_point, NetPkt>> held;
+    std::atomic<uint64_t> predictions{0}, rollbacks{0}, mispredicts{0};
 };
 
 Net g;
@@ -175,8 +185,40 @@ void sendOurs(uint32_t frame)
     g.tx.fetch_add(1, std::memory_order_relaxed);
 }
 
+static bool sameInput(const Ps2xNetInput &a, const Ps2xNetInput &b) { return std::memcmp(&a, &b, sizeof a) == 0; }
+
+// [rollback] A packet's inputs land here (directly, or after the fake lag). A confirmed input for a
+// frame we already ran on a guess either matches (nothing to do) or names the earliest frame to
+// roll back to.
+static void applyInputs(const NetPkt &p)
+{
+    std::lock_guard<std::mutex> lk(g.mtx);
+    for (uint32_t i = 0; i < p.count && i < kMaxInputs; ++i)
+    {
+        const uint32_t f = p.baseFrame + i;
+        const Ps2xNetInput &in = p.inputs[i];
+        if (g.rbWindow)
+        {
+            auto pit = g.predicted.find(f);
+            if (pit != g.predicted.end())
+            {
+                if (!sameInput(pit->second, in)) { if (f < g.rollbackTo) g.rollbackTo = f; g.mispredicts.fetch_add(1, std::memory_order_relaxed); }
+                g.predicted.erase(pit);
+            }
+        }
+        g.remote[f] = in;
+    }
+    if (p.checkFrame) g.peerHash[p.checkFrame] = p.checksum;
+}
+
 void pump()
 {
+    if (g.fakeLagMs)
+    {   // release packets whose artificial delay has passed
+        const auto now = std::chrono::steady_clock::now();
+        while (!g.held.empty() && std::chrono::duration_cast<std::chrono::milliseconds>(now - g.held.front().first).count() >= (long)g.fakeLagMs)
+        { applyInputs(g.held.front().second); g.held.pop_front(); }
+    }
     for (;;)
     {
         NetPkt p{};
@@ -214,10 +256,8 @@ void pump()
             if (g.listening) { if (const char *a = std::getenv("PS2X_NET_AUTOSTART")) ps2NetBeginAutoStart(a); }
         }
         g.rx.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lk(g.mtx);
-        for (uint32_t i = 0; i < p.count && i < kMaxInputs; ++i)
-            g.remote[p.baseFrame + i] = p.inputs[i];
-        if (p.checkFrame) g.peerHash[p.checkFrame] = p.checksum;
+        if (g.fakeLagMs) g.held.emplace_back(std::chrono::steady_clock::now(), p);
+        else applyInputs(p);
     }
 }
 
@@ -232,6 +272,17 @@ uint32_t ps2NetDelay() { return g.delay; }
 // only state, and the frame hook pumps it from the next frame on.
 static bool netStart(const char *conn, int listenPort, int player)
 {
+    {   // [rollback] window and fake lag from the environment
+        const char *w = std::getenv("PS2X_NET_ROLLBACK");
+        g.rbWindow = (w && w[0]) ? (uint32_t)std::atoi(w) : 0u;
+        if (g.rbWindow > 30u) g.rbWindow = 30u;
+        const char *l = std::getenv("PS2X_NET_FAKELAG");
+        g.fakeLagMs = (l && l[0]) ? (uint32_t)std::atoi(l) : 0u;
+        const char *ti = std::getenv("PS2X_NET_TESTINPUT");
+        g.testInput = ti && ti[0] && ti[0] != '0';
+        if (g.rbWindow) std::fprintf(stderr, "[netplay] rollback window %u frames%s\n", g.rbWindow, g.fakeLagMs ? " (with fake lag)" : "");
+        if (g.fakeLagMs) std::fprintf(stderr, "[netplay] fake receive lag %u ms\n", g.fakeLagMs);
+    }
     if (g.active) { std::fprintf(stderr, "[netplay] already connected\n"); return false; }
 #if defined(_WIN32)
     static bool s_wsa = [](){ WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); return true; }();
@@ -395,14 +446,45 @@ static void sendHello()
     g.tx.fetch_add(1, std::memory_order_relaxed);
 }
 
+uint32_t ps2NetRollbackWindow() { return g.rbWindow; }
+
+uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+{
+    *mustStall = false;
+    if (!g.active || !g.connected || !g.rbWindow) return 0u;
+    pump();
+    const uint32_t cur = relFrame(frameAbs);
+    uint32_t rb = 0u;
+    {
+        std::lock_guard<std::mutex> lk(g.mtx);
+        // The prediction depth is exhausted when a frame we RAN ON A GUESS is W or more frames behind
+        // and its real input has still not arrived: stall until it does. (Frames nobody ever guessed
+        // about -- before the delay, or gaps behind us -- do not count.)
+        for (const auto &kv : g.predicted)
+            if (kv.first + g.rbWindow <= cur) { *mustStall = true; break; }
+        if (g.rollbackTo != 0xFFFFFFFFu)
+        {
+            if (g.rollbackTo + g.rbWindow < cur)
+                std::fprintf(stderr, "[netplay] rollback to frame %u wanted at %u: beyond the %u-frame window (DESYNC likely)\n", g.rollbackTo, cur, g.rbWindow);
+            else if (g.rollbackTo < cur) { rb = g.rollbackTo + g.base; g.rollbacks.fetch_add(1, std::memory_order_relaxed); }
+            g.rollbackTo = 0xFFFFFFFFu;
+        }
+        // forget predictions and inputs far behind
+        for (auto it = g.predicted.begin(); it != g.predicted.end();) it = (it->first + 600 < cur) ? g.predicted.erase(it) : ++it;
+    }
+    return rb;
+}
+
 void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
 {
     if (!g.active) return;
     if (!g.connected) { sendHello(); pump(); return; }   // handshake only, no frame numbering yet
     const uint32_t frame = relFrame(frameAbs);
+    Ps2xNetInput use = in;
+    if (g.testInput && ((frame / 15u) & 1u)) use.buttons = static_cast<uint16_t>(use.buttons & ~0x0004u);   // R3 pressed (active low)
     {
         std::lock_guard<std::mutex> lk(g.mtx);
-        g.local[frame + g.delay] = in;      // sampled now, APPLIED delay frames later
+        g.local[frame + g.delay] = use;     // sampled now, APPLIED delay frames later
     }
     sendOurs(frame + g.delay);
     pump();
@@ -427,6 +509,22 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
             if (frame < g.delay) { out = kNeutral; break; }
         }
         if (wantLocal) { out = kNeutral; break; }        // our own gap: never stall on ourselves
+        if (g.rbWindow)
+        {   // [rollback] predict: repeat the newest remote input we know; the boundary controller
+            // stalls only when a missing input is older than the window, and rolls back when the
+            // real input turns out different.
+            std::lock_guard<std::mutex> lk(g.mtx);
+            Ps2xNetInput guess = kNeutral;
+            for (uint32_t back = 1; back <= 64u && back <= frame; ++back)
+            {
+                const auto it = g.remote.find(frame - back);
+                if (it != g.remote.end()) { guess = it->second; break; }
+            }
+            g.predicted[frame] = guess;
+            g.predictions.fetch_add(1, std::memory_order_relaxed);
+            out = guess;
+            break;
+        }
         pump();
         if (std::chrono::steady_clock::now() > deadline)
         {
@@ -486,9 +584,10 @@ void ps2NetFrame(uint32_t frame)
     {
         tStat = now;
         const uint64_t st = g.stalls.exchange(0), ns = g.stallNs.exchange(0);
-        std::fprintf(stderr, "[netplay] frame %u | tx %llu rx %llu | stalls %llu (%.1f ms total) | desyncs %llu | peer %s\n",
+        std::fprintf(stderr, "[netplay] frame %u | tx %llu rx %llu | stalls %llu (%.1f ms total) | desyncs %llu | peer %s | predictions %llu mispredicts %llu rollbacks %llu\n",
                      frame, (unsigned long long)g.tx.load(), (unsigned long long)g.rx.load(),
                      (unsigned long long)st, ns / 1e6, (unsigned long long)g.desyncs.load(),
-                     g.connected ? "connected" : "WAITING");
+                     g.connected ? "connected" : "WAITING",
+                     (unsigned long long)g.predictions.load(), (unsigned long long)g.mispredicts.load(), (unsigned long long)g.rollbacks.load());
     }
 }
