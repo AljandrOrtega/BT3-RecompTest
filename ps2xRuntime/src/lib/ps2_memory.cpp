@@ -511,6 +511,7 @@ extern "C" void ps2xVirtualClockEnable()
 }
 extern "C" void ps2xVirtualClockAdvance(uint64_t ns) { if (g_vclockOn) g_vclockNs += ns; }
 extern "C" uint64_t ps2xVirtualClockGet() { return g_vclockNs; }
+extern "C" bool ps2xVirtualClockOn() { return g_vclockOn; }
 extern "C" void ps2xVirtualClockSet(uint64_t ns) { g_vclockNs = ns; }
 
 // [rollback] The device state PS2Memory keeps outside guest memory: the I/O register file (EE

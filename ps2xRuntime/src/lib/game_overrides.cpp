@@ -1022,6 +1022,21 @@ namespace
     }
     std::mutex g_iopSinkM;
     std::map<uint32_t, IopSink> g_iopSinks;
+    extern "C" bool ps2xFrameStepOn();   // [rollback] ps2_runtime.cpp
+    extern "C" bool ps2xVirtualClockOn();      // [rollback] ps2_memory.cpp
+    extern "C" uint64_t ps2xVirtualClockGet();
+    // [rollback] The sound/CD HLE's notion of "now": the virtual clock in frame-stepped mode (it advances
+    // 1/60 s per delivered vblank and is part of the snapshot), the wall clock otherwise. Every timing
+    // decision the guest can observe through this HLE routes through here, so a rolled-back re-run
+    // makes the same decisions.
+    static std::chrono::steady_clock::time_point ps2xNowSteady()
+    {
+        if (ps2xVirtualClockOn())
+            return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(ps2xVirtualClockGet()));
+        return std::chrono::steady_clock::now();
+    }
+    // Deterministic pacing is on under PS2X_DETSOUND or in frame-stepped mode.
+    static bool ps2xDetPacing() { return detSoundFps() != 0u || ps2xFrameStepOn(); }
 
     bool sndIopEnabled()
     {
@@ -1074,7 +1089,8 @@ namespace
         s.returnedBytes = 0u;
         s.wallClock = false;
         s.ringFullIdle = false;
-        if (runtime)
+        s.frameClock = false;   // [rollback] a new stream re-bases its frame/tick clock
+        if (runtime && !ps2xFrameStepOn())   // [rollback] stepped mode never consults the device's progress
         {
             const auto prog = runtime->audioBackend().streamProgress(id);
             if (prog.known)
@@ -1110,7 +1126,7 @@ namespace
                 // deadlock -- no playback, no returns, no more data, forever. Give the normal
                 // cushion a generous head start, then start with whatever is there.
                 const bool ringFull = queued && sndRd32(rdram, sink + kSinkList0) == 0u;
-                const auto now = std::chrono::steady_clock::now();
+                const auto now = ps2xNowSteady();
                 if (!ringFull)
                 {
                     s.ringFullIdle = false;
@@ -1135,9 +1151,12 @@ namespace
             // the same, so it counts as consumed -- otherwise it is never returned and the ring
             // loses that much capacity permanently.
             playedBytes = (prog.consumedSamples + prog.gapSamples) * 2ull;
-            if (const uint32_t fps = detSoundFps())
-            {   // [detsound] ignore the device's real progress; credit by frames instead
-                const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (const uint32_t fps = ps2xFrameStepOn() ? 60u : detSoundFps())
+            {   // [detsound] ignore the device's real progress; credit by frames instead.
+                // [rollback] In frame-stepped mode the clock is the VSYNC TICK: 60 Hz by construction
+                // (the controller delivers it), independent of the game's 30/60 fps, and part of the
+                // snapshot -- so a rolled-back re-run credits the stream identically.
+                const uint64_t fr = ps2xFrameStepOn() ? ps2_syscalls::GetCurrentVSyncTick() : g_bt3FrameCount.load(std::memory_order_relaxed);
                 if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
                 playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / fps;
             }
@@ -1147,7 +1166,7 @@ namespace
             // Nothing is rendering this stream (PS2X_SNDPLAY off, or an id the DMA path never
             // feeds). Advance on a wall clock at the declared rate so the guest's sound engine
             // still runs instead of wedging on a ring that never drains.
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = ps2xNowSteady();
             if (!s.wallClock)
             {
                 s.wallClock = true;
@@ -1157,9 +1176,9 @@ namespace
             const uint64_t ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - s.wallBase).count());
             playedBytes = s.wallBaseBytes + (ms * sndDeclaredRate() * 2ull) / 1000ull;
-            if (const uint32_t fps = detSoundFps())
+            if (const uint32_t fps = ps2xFrameStepOn() ? 60u : detSoundFps())
             {
-                const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+                const uint64_t fr = ps2xFrameStepOn() ? ps2_syscalls::GetCurrentVSyncTick() : g_bt3FrameCount.load(std::memory_order_relaxed);
                 if (!s.frameClock) { s.frameClock = true; s.frameBase = fr; s.frameBaseBytes = s.returnedBytes; }
                 playedBytes = s.frameBaseBytes + ((fr - s.frameBase) * sndDeclaredRate() * 2ull) / fps;
             }
@@ -1289,9 +1308,10 @@ namespace
             kept = prog.pending;
             // Rebase the play clock. `pending` is audio already counted into the ring we just
             // flushed, so it must not be credited a second time as it drains.
-            s.returnedBytes = prog.known
+            s.returnedBytes = (prog.known && !ps2xFrameStepOn())
                                   ? (prog.consumedSamples + prog.gapSamples + prog.pending) * 2ull
                                   : 0u;
+            s.frameClock = false;   // [rollback] re-base the tick clock after a flush
         }
         s.wallClock = false;
         s.ringFullIdle = false;
@@ -2533,7 +2553,7 @@ namespace
                     {
                         static std::mutex s_m;
                         static std::map<uint32_t, std::chrono::steady_clock::time_point> s_last;
-                        const auto now = std::chrono::steady_clock::now();
+                        const auto now = ps2xNowSteady();
                         std::lock_guard<std::mutex> lk(s_m);
                         auto it = s_last.find(sink);
                         if (it == s_last.end() ||
@@ -2602,7 +2622,7 @@ namespace
         const uint32_t obj = getRegU32(ctx, 4);
         {
             std::lock_guard<std::mutex> lk(g_streamStartM);
-            g_streamStart[obj] = std::chrono::steady_clock::now();
+            g_streamStart[obj] = ps2xNowSteady();
         }
         if (sndIopEnabled())
         {
@@ -2722,7 +2742,7 @@ namespace
                 if (it != g_streamStart.end())
                 {
                     const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - it->second).count();
+                                         ps2xNowSteady() - it->second).count();
                     if (age < s_graceMs)
                         stillPlaying = true;
                 }
@@ -3003,7 +3023,7 @@ namespace
         // different rates on two machines -- measured as the 12 bytes that differ at boot frame 1,
         // all of them stream-position counters. Under PS2X_DETSOUND the pump fires exactly once
         // per guest frame instead, which is identical everywhere.
-        if (detSoundFps())
+        if (ps2xDetPacing())
         {
             const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
             return g_lastCdTickFrame.load(std::memory_order_relaxed) != fr;
@@ -4577,6 +4597,7 @@ namespace
         VU1State v0{}, v1{};
         std::vector<SinkSer> sinks;
         GsRegSer gs{};
+        std::vector<SeVoice> seVoices;   // HLE sound-effect voices (host side of the SE stream)
     };
     static void snapCopy(std::vector<uint8_t> &dst, const uint8_t *src, size_t n) { dst.resize(n); if (n) std::memcpy(dst.data(), src, n); }
     extern "C" void *ps2xSimSnapCapture(PS2Runtime *runtime, uint8_t *rdram)
@@ -4605,6 +4626,7 @@ namespace
             }
         }
         gsRegPack(mem.gs(), s->gs);
+        { std::lock_guard<std::mutex> lk(g_seVoiceM); s->seVoices = g_seVoices; }
         return s;
     }
     extern "C" bool ps2xSimSnapRestore(void *h, PS2Runtime *runtime, uint8_t *rdram)
@@ -4634,6 +4656,7 @@ namespace
             }
         }
         gsRegUnpack(s->gs, mem.gs());
+        { std::lock_guard<std::mutex> lk(g_seVoiceM); g_seVoices = s->seVoices; }
         g_bt3FrameCount.store(s->frame, std::memory_order_relaxed);
         ps2_stubs::ps2RandRestore(s->rand64, s->randCalls);
         return true;
