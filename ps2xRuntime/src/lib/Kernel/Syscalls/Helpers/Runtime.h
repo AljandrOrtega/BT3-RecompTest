@@ -1,3 +1,4 @@
+#include "ps2_waitprof.h"   // [fibers] WP_* wait points used by waitGuestUntil
 struct ThreadExitException final : public std::exception
 {
     const char *what() const noexcept override
@@ -93,14 +94,11 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
         info->waitId = 0;
 
         bool terminated = false;
-        waitWithGuestExecutionReleasedUntilUnlocked(
-            runtime,
-            lock,
-            [&]()
-            {
-                info->cv.wait(lock, [&]()
-                              { return info->suspendCount == 0 || info->terminated.load(); });
-            },
+        // [fibers] Same shape as SuspendThread: the resumer is another guest thread.
+        waitGuestUntil(
+            runtime, lock, info->cv,
+            [&]() { return info->suspendCount == 0 || info->terminated.load(); },
+            WP_SYNC_OTHER,
             [&]()
             {
                 terminated = info->terminated.load();

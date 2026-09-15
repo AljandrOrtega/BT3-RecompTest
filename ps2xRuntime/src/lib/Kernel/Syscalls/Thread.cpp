@@ -739,15 +739,11 @@ namespace ps2_syscalls
             // Block until the target thread actually finishes unwinding and becomes dormant.
             // Drop the thread mutex before reacquiring GuestExecutionScope to avoid lock inversion.
             std::unique_lock<std::mutex> lock(info->m);
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    Ps2xWaitScope wdorm(WP_SYNC_OTHER);
-                    info->cv.wait(lock, [&]()
-                                  { return !info->started && info->status == THS_DORMANT; });
-                });
+            // [fibers] Woken by another guest thread (whoever makes this one dormant).
+            waitGuestUntil(
+                runtime, lock, info->cv,
+                [&]() { return !info->started && info->status == THS_DORMANT; },
+                WP_SYNC_OTHER);
         }
 
         setReturnS32(ctx, KE_OK);
@@ -804,15 +800,12 @@ namespace ps2_syscalls
         {
             std::unique_lock<std::mutex> lock(info->m);
             bool terminated = false;
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    Ps2xWaitScope wsusp(WP_SYNC_OTHER);
-                    info->cv.wait(lock, [&]()
-                                  { return info->suspendCount == 0 || info->terminated.load(); });
-                },
+            // [fibers] ResumeThread is issued by another guest thread, so this must park in the
+            // scheduler rather than block the shared host thread.
+            waitGuestUntil(
+                runtime, lock, info->cv,
+                [&]() { return info->suspendCount == 0 || info->terminated.load(); },
+                WP_SYNC_OTHER,
                 [&]()
                 {
                     terminated = info->terminated.load();

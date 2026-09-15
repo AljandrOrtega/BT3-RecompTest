@@ -713,14 +713,11 @@ namespace ps2_syscalls
 
             info->waiters++;
             waitedWithGuestRelease = true;
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    Ps2xWaitScope wsync(WP_SYNC_OTHER);
-                    info->cv.wait(lock, satisfied);
-                },
+            // [fibers] Event flags are set by other guest threads. `satisfied` only tests the
+            // pattern; the clear-on-wake happens in finishFn, so re-evaluating it is side-effect
+            // free -- which the fiber path requires.
+            waitGuestUntil(
+                runtime, lock, info->cv, satisfied, WP_SYNC_OTHER,
                 [&]()
                 {
                     info->waiters--;
