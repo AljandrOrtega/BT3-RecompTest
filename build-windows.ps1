@@ -25,6 +25,7 @@ $GAME_DIR = Join-Path $ROOT "games\bt3"
 $LAUNCHER_SRC = Join-Path $ROOT "ps2xRuntime\src\launcher"
 $LAUNCHER_BUILD = Join-Path $BUILD "launcher_qt"
 $PGS_DIR = Join-Path $ROOT "ps2xRuntime\third_party\parallel-gs"
+$MESA_DIR = Join-Path $BUILD "mesa"   # Mesa lavapipe (software Vulkan) for the Windows Vulkan fallback
 $ISO_DEFAULT = "C:\Users\Rexx\Desktop\DragonBall Z - Budokai Tenkaichi 3 (USA) (En,Ja).iso"
 $QT_VERSION = "6.5.3"
 $QT_HOST = "windows"
@@ -410,6 +411,22 @@ $fps60 = Join-Path $GAME_DIR "fps60_sites.txt"
 if (Test-Path $fps60) {
     New-Item -ItemType Directory -Force -Path (Join-Path $STAGE "savedata") | Out-Null
     Copy-Item $fps60 (Join-Path $STAGE "savedata\fps60_sites.txt") -Force
+}
+
+# lavapipe (Mesa software Vulkan): bundled so the launcher can run paraLLEl-GS on
+# a software ICD when the vendor Vulkan driver is broken (e.g. the AMD proprietary
+# driver access-violates inside amdvlk64.dll during shader compilation on Polaris).
+# This is the Windows-only Vulkan fallback path.
+$lvpSrc = Join-Path $MESA_DIR "x64"
+if (Test-Path (Join-Path $lvpSrc "vulkan_lvp.dll")) {
+    $lvpDst = Join-Path $STAGE "lavapipe"
+    New-Item -ItemType Directory -Force -Path $lvpDst | Out-Null
+    Copy-Item (Join-Path $lvpSrc "vulkan_lvp.dll") $lvpDst -Force
+    Copy-Item (Join-Path $lvpSrc "lvp_icd.x86_64.json") $lvpDst -Force
+    Log "lavapipe bundled (lavapipe/vulkan_lvp.dll)"
+} else {
+    Write-Warning ("lavapipe not found at " + $lvpSrc +
+                   " -- run install-deps-windows.ps1 -Install; the Windows Vulkan fallback will be unavailable")
 }
 
 # Launcher.bat is no longer produced: the stage is a flat self-contained tree

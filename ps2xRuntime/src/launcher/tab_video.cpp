@@ -122,7 +122,14 @@ VideoTab::VideoTab(QWidget *parent)
         QStringLiteral("paraLLEl-GS (Vulkan)")};
     const int curRenderer = std::min(std::max(s.renderer(), 0), 2);
     root->addWidget(comboRow(QStringLiteral("Renderer"), &m_renderer, renderers, curRenderer));
+#ifdef _WIN32
+    root->addWidget(hintRow(QStringLiteral(
+        "paraLLEl-GS runs on the bundled Mesa lavapipe (software Vulkan) on Windows; "
+        "if it fails, the game falls back to OpenGL. See logs/vulkan-fallback.log. "
+        "Set PS2X_VK_NATIVE=1 to use the system Vulkan driver.")));
+#else
     root->addWidget(hintRow(QStringLiteral("paraLLEl-GS is the default backend. Falls back to OpenGL if Vulkan is unavailable.")));
+#endif
     root->addWidget(toggleRow(QStringLiteral("Cel Outline"), &m_outline, s.outline()));
     m_inkRow = sliderPair(QStringLiteral("Ink Strength"), &m_ink, &m_inkVal, 100, 260,
                           s.inkStrength(), "%d %%");

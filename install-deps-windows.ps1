@@ -91,6 +91,32 @@ if ($pipPresent) {
     }
 }
 
+# Mesa lavapipe (software Vulkan ICD) -- bundled on Windows so the launcher can
+# run paraLLEl-GS when the vendor Vulkan driver is broken (the AMD proprietary
+# driver access-violates inside amdvlk64.dll during shader compilation on
+# Polaris/GCN parts). Fetched here so the Windows build is reproducible.
+$MESA_VERSION = "26.2.0"
+$MESA_DIR = Join-Path $BUILD "mesa"
+$MESA_DLL = Join-Path $MESA_DIR "x64\vulkan_lvp.dll"
+if (Test-Path $MESA_DLL) {
+    Log "Mesa lavapipe found at $MESA_DIR"
+} elseif ($Install) {
+    Step "Downloading Mesa lavapipe $MESA_VERSION"
+    New-Item -ItemType Directory -Force -Path $MESA_DIR | Out-Null
+    $sevenZr = Join-Path $MESA_DIR "7zr.exe"
+    if (-not (Test-Path $sevenZr)) {
+        Invoke-WebRequest "https://www.7-zip.org/a/7zr.exe" -OutFile $sevenZr -UseBasicParsing
+    }
+    $mesaArchive = Join-Path $MESA_DIR "mesa.7z"
+    Invoke-WebRequest "https://github.com/pal1000/mesa-dist-win/releases/download/$MESA_VERSION/mesa3d-$MESA_VERSION-release-msvc.7z" -OutFile $mesaArchive -UseBasicParsing
+    & $sevenZr x $mesaArchive "-o$MESA_DIR" -y | Out-Null
+    Remove-Item $mesaArchive -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $MESA_DLL)) { Fail "lavapipe not found after extraction ($MESA_DLL)" }
+    Log "Mesa lavapipe installed: $MESA_DIR"
+} else {
+    Log "Mesa lavapipe missing (run with -Install to fetch it)"
+}
+
 if (-not $Install) {
     if ($missing.Count -gt 0 -or -not $qtPresent) {
         Write-Host "`nRun '.\install-deps-windows.ps1 -Install' to install missing components." -ForegroundColor Yellow

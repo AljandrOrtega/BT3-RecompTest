@@ -145,6 +145,13 @@ never shipped: the launcher's install wizard extracts it from your own ISO.
 **Windows** (release): open the extracted folder and run `Launcher.exe`; it
 starts `bt3-runner.exe` with the game data.
 
+On Windows, `paraLLEl-GS` runs on a bundled Mesa **lavapipe** (software Vulkan)
+ICD because several vendor Vulkan drivers (notably the AMD proprietary driver on
+Polaris/GCN, `amdvlk64.dll`) access-violate during shader compilation. If the
+runner still dies, the launcher automatically retries once with the OpenGL
+renderer and records it in `logs\vulkan-fallback.log`. Set `PS2X_VK_NATIVE=1`
+to use the system Vulkan driver instead of the bundled lavapipe.
+
 For raw runner runs (no launcher):
 
 ```
