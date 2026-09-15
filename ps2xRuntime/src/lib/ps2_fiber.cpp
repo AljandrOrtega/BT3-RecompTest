@@ -82,11 +82,11 @@ Ps2xFiber *ps2xFiberAdoptCurrent()
     f->entry = true;
 #  if defined(PS2X_FIBER_WIN)
     // Already a fiber if some other component converted this thread; ConvertThreadToFiber fails
-    // with ERROR_ALREADY_FIBERS in that case, and GetCurrentFiber is then the right handle.
+    // with ERROR_ALREADY_FIBER in that case, and GetCurrentFiber is then the right handle.
     f->handle = ConvertThreadToFiber(nullptr);
     if (!f->handle)
     {
-        if (GetLastError() == ERROR_ALREADY_FIBERS) f->handle = GetCurrentFiber();
+        if (GetLastError() == ERROR_ALREADY_FIBER) f->handle = GetCurrentFiber();
         if (!f->handle) { delete f; return nullptr; }
     }
 #  endif
