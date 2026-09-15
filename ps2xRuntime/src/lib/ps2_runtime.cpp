@@ -2298,6 +2298,26 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    {   // [slotprobe] PS2X_SLOTPROBE=<hex addr>[:<hex expected>]: watch one guest word from every guest
+        // branch on every fiber, and name the first branch after which it no longer holds the expected
+        // value (default: the sound callback slot 0x321828 = 0x0026cbc8, which the 2026-09-15 second-
+        // demo crash found with bit 31 set). A guest store shows up as the previous function on this
+        // tid; a host-side write shows up as a change between two unrelated branches.
+        static const uint32_t s_spAddr = [](){ const char *v = std::getenv("PS2X_SLOTPROBE"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+        if (s_spAddr)
+        {
+            static const uint32_t s_spWant = [](){ const char *v = std::getenv("PS2X_SLOTPROBE"); const char *c = v ? std::strchr(v, ':') : nullptr; return c ? (uint32_t)std::strtoul(c + 1, nullptr, 16) : 0x0026cbc8u; }();
+            static std::atomic<int> s_spState{0};   // 0 = waiting for the expected value, 1 = armed, 2 = reported
+            uint32_t cur = 0; std::memcpy(&cur, rdram + (s_spAddr & 0x01FFFFFFu), 4);
+            const int st = s_spState.load(std::memory_order_relaxed);
+            if (st == 0 && cur == s_spWant) s_spState.store(1);
+            else if (st == 1 && cur != s_spWant && s_spState.exchange(2) == 1)
+                std::fprintf(stderr, "[slotprobe] 0x%08x changed 0x%08x -> 0x%08x  seen at branch to 0x%x on tid %d (ra 0x%x, sp 0x%x, main=%d)\n",
+                             s_spAddr, s_spWant, cur, targetPc, g_schedTid,
+                             static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+                             (int)(ctx == &m_cpuContext));
+        }
+    }
     // Central interrupt-tick pump (see rationale in dispatchLoop's constants).
     // MUST live here, not only at dispatchLoop's top: BT3's CDVD driver spins in
     // deeply-nested wait loops (e.g. func_23D0E0 -> ... -> func_27e910) that never
@@ -5028,6 +5048,22 @@ void PS2Runtime::run()
                 }
                 // Scheduler-state dump (when PS2X_SCHED on): shows the deadlock -- which tid holds
                 // the token (m_schedCurrent) and each thread's present/blocked/order/pc.
+                if (m_fibersEnabled)
+                {   // [fiberstack] live host-stack bytes per parked fiber (its saved SP to the top) and the
+                    // high-water seen so far: what a savestate would copy, and how far from the 8 MB limit
+                    // BT3's nesting gets. The running fiber's figure is stale (its last park); fine for a meter.
+                    static std::map<int, size_t> s_hw;
+                    std::lock_guard<std::mutex> lk(m_schedMutex);
+                    std::cerr << "[fiberstack]";
+                    for (auto &kv : m_schedThreads)
+                    {
+                        if (!kv.second || !kv.second->fiber) continue;
+                        const size_t live = ps2xFiberLiveStack(kv.second->fiber, nullptr);
+                        size_t &hw = s_hw[kv.first]; if (live > hw) hw = live;
+                        std::cerr << " tid" << kv.first << "=" << (live >> 10) << "K(max " << (hw >> 10) << "K)";
+                    }
+                    std::cerr << std::endl;
+                }
                 if (m_schedEnabled)
                 {
                     std::lock_guard<std::mutex> lk(m_schedMutex);

@@ -18,6 +18,8 @@
 #    define _XOPEN_SOURCE 700
 #  endif
 #  include <ucontext.h>
+#  include <sys/mman.h>
+#  include <unistd.h>
 #  define PS2X_FIBER_UCTX 1
 #else
 #  define PS2X_FIBER_NONE 1
@@ -27,6 +29,8 @@ struct Ps2xFiber
 {
     uint8_t *stack = nullptr;       // null for the adopted entry fiber: we do not own its stack
     size_t   stackSize = 0;
+    uint8_t *mapping = nullptr;     // ucontext: the whole mmap (guard page + stack); stack = mapping + guard
+    size_t   mappingSize = 0;
     bool     entry = false;
     void   (*fn)(void *) = nullptr;
     void    *arg = nullptr;
@@ -107,12 +111,25 @@ Ps2xFiber *ps2xFiberCreate(void (*fn)(void *), void *arg, size_t stackSize)
     f->handle = CreateFiber(stackSize, &ps2xFiberTrampoline, f);
     if (!f->handle) { delete f; return nullptr; }
 #  elif defined(PS2X_FIBER_UCTX)
-    f->stack = static_cast<uint8_t *>(std::malloc(stackSize));
-    if (!f->stack) { delete f; return nullptr; }
-    // Poison the stack so ps2xFiberLiveStack can find the high-water mark, and so an accidental
-    // read of untouched stack is obvious rather than plausible zeroes.
+    // mmap with a PROT_NONE guard page below the stack. A host thread's stack has one; a malloc'd
+    // fiber stack does not, so an overflow there would silently write into whatever mapping sits
+    // below it (another fiber's stack, guest RAM...) instead of faulting -- the one fiber-specific
+    // way to get a wild write with no trace. With the guard, an overflow is a SIGSEGV whose fault
+    // address is just below the fiber's stack, which is unmistakable.
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t guard = page;
+    stackSize = (stackSize + page - 1u) & ~(page - 1u);
+    f->mappingSize = guard + stackSize;
+    void *m = mmap(nullptr, f->mappingSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) { delete f; return nullptr; }
+    f->mapping = static_cast<uint8_t *>(m);
+    (void)mprotect(f->mapping, guard, PROT_NONE);
+    f->stack = f->mapping + guard;
+    f->stackSize = stackSize;
+    // Poison the stack so the portable ps2xFiberLiveStack fallback can find the high-water mark,
+    // and so an accidental read of untouched stack is obvious rather than plausible zeroes.
     std::memset(f->stack, 0xA5, stackSize);
-    if (getcontext(&f->ctx) != 0) { std::free(f->stack); delete f; return nullptr; }
+    if (getcontext(&f->ctx) != 0) { munmap(f->mapping, f->mappingSize); delete f; return nullptr; }
     f->ctx.uc_stack.ss_sp = f->stack;
     f->ctx.uc_stack.ss_size = stackSize;
     f->ctx.uc_link = nullptr;           // the trampoline never returns
@@ -145,7 +162,7 @@ void ps2xFiberDestroy(Ps2xFiber *f)
 #  if defined(PS2X_FIBER_WIN)
     if (!f->entry && f->handle) DeleteFiber(f->handle);
 #  elif defined(PS2X_FIBER_UCTX)
-    if (f->stack) std::free(f->stack);
+    if (f->mapping) munmap(f->mapping, f->mappingSize);
 #  endif
     delete f;
 #else
