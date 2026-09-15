@@ -24,9 +24,9 @@ function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
 if (-not (Test-Path $STAGE)) { Fail "Stage dir not found: $STAGE (run build-windows.ps1 first)" }
 if (-not ((Test-Path (Join-Path $STAGE "Launcher.exe")) -and
           (Test-Path (Join-Path $STAGE "bt3-runner.exe")) -and
-          (Test-Path (Join-Path $STAGE "Launcher.bat")) -and
+          (Test-Path (Join-Path $STAGE "qt.conf")) -and
           (Test-Path (Join-Path $STAGE "lib")))) {
-    Fail "Stage incomplete (Launcher.exe, bt3-runner.exe, Launcher.bat, lib/ required)"
+    Fail "Stage incomplete (Launcher.exe, bt3-runner.exe, qt.conf, lib/ required)"
 }
 
 # ─── Assemble portable tree ────────────────────────────────────────────────────
@@ -35,25 +35,14 @@ $tmpTree = Join-Path $OUT $TREE_NAME
 Remove-Item -Recurse -Force $tmpTree -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $tmpTree | Out-Null
 
-Copy-Item (Join-Path $STAGE "Launcher.exe") $tmpTree -Force
-Copy-Item (Join-Path $STAGE "bt3-runner.exe") $tmpTree -Force
-Copy-Item (Join-Path $STAGE "Launcher.bat") $tmpTree -Force
-Copy-Item (Join-Path $STAGE "lib") (Join-Path $tmpTree "lib") -Recurse -Force
-if (Test-Path (Join-Path $STAGE "assets")) {
-    Copy-Item (Join-Path $STAGE "assets") (Join-Path $tmpTree "assets") -Recurse -Force
+# The stage is already a flat, self-contained tree: Launcher.exe, bt3-runner.exe,
+# Qt6 + VC runtime DLLs and qt.conf next to the executables, Qt plugins under
+# lib\qt6\plugins, assets flattened. Mirror it verbatim and add the empty save
+# directory the launcher expects.
+Get-ChildItem -Force $STAGE | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $tmpTree $_.Name) -Recurse -Force
 }
-Copy-Item (Join-Path $STAGE "LICENSE") $tmpTree -Force
-if (Test-Path (Join-Path $STAGE "COPYING.LGPLv3")) {
-    Copy-Item (Join-Path $STAGE "COPYING.LGPLv3") $tmpTree -Force
-}
-$saveDst = Join-Path $tmpTree "savedata\BASLUS-21678DBZT3"
-New-Item -ItemType Directory -Force -Path $saveDst | Out-Null
-if (Test-Path (Join-Path $STAGE "savedata\fps60_sites.txt")) {
-    Copy-Item (Join-Path $STAGE "savedata\fps60_sites.txt") (Join-Path $tmpTree "savedata") -Force
-}
-if (Test-Path (Join-Path $STAGE "savedata\settings.toml")) {
-    Copy-Item (Join-Path $STAGE "savedata\settings.toml") (Join-Path $tmpTree "savedata") -Force
-}
+New-Item -ItemType Directory -Force -Path (Join-Path $tmpTree "savedata\BASLUS-21678DBZT3") | Out-Null
 Log "Tree assembled: $tmpTree"
 
 # ─── Create zip ────────────────────────────────────────────────────────────────

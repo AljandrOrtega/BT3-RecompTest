@@ -412,19 +412,9 @@ if (Test-Path $fps60) {
     Copy-Item $fps60 (Join-Path $STAGE "savedata\fps60_sites.txt") -Force
 }
 
-# Launcher.bat wrapper (mirrors entrypoint.sh)
-$batContent = @"
-@echo off
-setlocal
-set "HERE=%~dp0"
-set "PATH=%HERE%lib;%PATH%"
-set "QT_PLUGIN_PATH=%HERE%lib\qt6\plugins"
-set "PS2X_EXEDIR=%HERE%"
-start "" "%HERE%Launcher.exe" %*
-endlocal
-"@
-$batContent | Out-File -FilePath (Join-Path $STAGE "Launcher.bat") -Encoding ASCII
-Log "Launcher.bat written"
+# Launcher.bat is no longer produced: the stage is a flat self-contained tree
+# (Qt6 + VC runtime DLLs and qt.conf live next to the executables), so double
+# click Launcher.exe directly — no wrapper needed.
 
 # ─── PE gate ────────────────────────────────────────────────────────────────────
 Step "Running PE dependency gate"
