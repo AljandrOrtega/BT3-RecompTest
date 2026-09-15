@@ -1,5 +1,6 @@
 #include "ps2_waitprof.h"   // [waitprof]
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_statesync.h"   // [statesync]
 #include "runtime/ps2_gs_pgs.h"   // [pgs]
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -578,6 +579,48 @@ extern "C" bool ps2xMemDeviceRestore(PS2Memory *m, void *h)
     return true;
 }
 extern "C" void ps2xMemDeviceFree(void *h) { delete static_cast<MemDeviceSnap *>(h); }
+// [statesync] portable form
+static void snapWriteTransfers(Ps2xByteW &w, const std::vector<PS2Memory::PendingTransfer> &v)
+{
+    w.u64(v.size());
+    for (const auto &t : v) { w.u8(t.fromScratchpad); w.u32(t.srcAddr); w.u32(t.qwc); w.bytes(t.chainData); }
+}
+static void snapReadTransfers(Ps2xByteR &r, std::vector<PS2Memory::PendingTransfer> &v)
+{
+    const size_t n = r.count(9); v.resize(r.ok ? n : 0);
+    for (auto &t : v) { t.fromScratchpad = r.u8() != 0; t.srcAddr = r.u32(); t.qwc = r.u32(); r.bytes(t.chainData); }
+}
+extern "C" bool ps2xMemDeviceSerialize(const void *h, std::vector<uint8_t> &out)
+{
+    const MemDeviceSnap *s = static_cast<const MemDeviceSnap *>(h);
+    if (!s) return false;
+    Ps2xByteW w(out);
+    w.u32(0x44455631u);   // 'DEV1'
+    w.podUMap(s->io);
+    w.u64(s->t0Last); w.u64(s->t0Frac); for (int i = 0; i < 4; ++i) { w.u64(s->tLast[i]); w.u64(s->tFrac[i]); }
+    w.podVec(s->dmac);
+    w.u8(s->path3Masked); w.u8(s->vif1DirectHl); w.u32(s->vif1ImgQwc);
+    w.u64(s->path3Fifo.size()); for (const auto &f : s->path3Fifo) w.bytes(f);
+    snapWriteTransfers(w, s->gif); snapWriteTransfers(w, s->vif0); snapWriteTransfers(w, s->vif1);
+    w.u64(s->vclock);
+    return true;
+}
+extern "C" void *ps2xMemDeviceDeserialize(const uint8_t *data, size_t n, size_t *used)
+{
+    Ps2xByteR r(data, n);
+    if (r.u32() != 0x44455631u) return nullptr;
+    MemDeviceSnap *s = new MemDeviceSnap();
+    r.podUMap(s->io);
+    s->t0Last = r.u64(); s->t0Frac = r.u64(); for (int i = 0; i < 4; ++i) { s->tLast[i] = r.u64(); s->tFrac[i] = r.u64(); }
+    r.podVec(s->dmac);
+    s->path3Masked = r.u8() != 0; s->vif1DirectHl = r.u8() != 0; s->vif1ImgQwc = r.u32();
+    { const size_t k = r.count(8); s->path3Fifo.resize(r.ok ? k : 0); for (auto &f : s->path3Fifo) r.bytes(f); }
+    snapReadTransfers(r, s->gif); snapReadTransfers(r, s->vif0); snapReadTransfers(r, s->vif1);
+    s->vclock = r.u64();
+    if (!r.ok) { delete s; return nullptr; }
+    if (used) *used = (size_t)(r.p - data);
+    return s;
+}
 
 uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
 {

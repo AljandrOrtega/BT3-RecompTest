@@ -3,6 +3,16 @@
 #include "runtime/ps2_fiber.h"   // [fibers]
 #include <deque>
 #include "runtime/ps2_netplay.h" // [rollback] the netplay controller
+#include "runtime/ps2_statesync.h"   // [statesync] portable snapshot forms
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#include <link.h>
+#endif
+#if defined(PS2X_HAVE_LIBUNWIND)
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
+#include <cxxabi.h>
+#endif
 #include "runtime/ps2_texreplace.h"   // [texreplace]
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
 #include <filesystem>
@@ -811,6 +821,18 @@ extern "C" void ps2xFixupRingDump();   // [fixupring]
 extern "C" void *ps2xGuestWaitBegin();
 extern "C" void ps2xGuestWaitEnd(void *);
 extern "C" void ps2xGuestSleepMs(unsigned ms);   // [fibers] sleep that parks the fiber, not the host thread
+// [statesync] Per-tid scalars that used to live as locals on the fiber stacks and decide when a parked
+// fiber wakes or yields: the dispatch loops' yield-quantum / fairness / same-pc counters (they gate
+// scheduler yields and the spin pump, i.e. the interleaving) and the wait targets of the two
+// clock-relative parks (ps2xGuestSleepMs's virtual deadline, WaitForNextVSyncTick's base tick). A
+// synced peer keeps its own fiber stacks but adopts these with the rest of the scheduler state, so
+// its loops and parked fibers continue on the host's schedule. Nodes never move: callers hold
+// pointers into them.
+struct Ps2xSchedExtra { uint64_t stepCount = 0; uint64_t park[2] = {0u, 0u}; uint64_t fairness = 0; uint32_t samePc = 0; uint32_t lastPc = 0xFFFFFFFFu; };
+static std::mutex g_schedExtraM;
+static std::map<int, Ps2xSchedExtra> g_schedExtra;
+static Ps2xSchedExtra &schedExtraFor(int tid) { std::lock_guard<std::mutex> lk(g_schedExtraM); return g_schedExtra[tid]; }
+extern "C" uint32_t *ps2xSchedU32(int tid, int which) { Ps2xSchedExtra &x = schedExtraFor(tid); return which == 1 ? &x.lastPc : &x.samePc; }
 extern "C" void ps2xSpinPump(uint8_t *, R5900Context *, PS2Runtime *);   // [spinpump] game_overrides.cpp
 
 PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
@@ -3582,9 +3604,11 @@ thread_local uint32_t g_schedLastPc = 0, g_schedLastRa = 0;   // [schedwhy] per 
 extern std::atomic<uint32_t> g_bt3StateLive; // defined below; [eeround2] gate
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 {
-    uint32_t lastPc = std::numeric_limits<uint32_t>::max();
-    uint32_t samePcCount = 0;
-    uint64_t fairnessCounter = 0;
+    // [statesync] runtime-owned (a synced peer adopts them with the scheduler state)
+    Ps2xSchedExtra &schedExtra = schedExtraFor(g_schedIsGuest ? g_schedTid : 1);
+    uint32_t &lastPc = schedExtra.lastPc; lastPc = std::numeric_limits<uint32_t>::max();
+    uint32_t &samePcCount = schedExtra.samePc; samePcCount = 0;
+    uint64_t &fairnessCounter = schedExtra.fairness; fairnessCounter = 0;
     constexpr uint32_t kSamePcYieldInterval = 0x4000u;
     // Simulated preemption: on the real single-core EE a busy-waiting guest
     // thread is preempted by the timer interrupt so other threads (which it is
@@ -3991,6 +4015,7 @@ namespace
         int  kernelTid = 1;   // the kernel's g_currentThreadId (State.h): SleepThread/GetThreadId/ensureCurrentThreadInfo key on it
         uint32_t waitDepth = 0;   // [rollback] guestWaitBegin's released guest-exec depth (a heap scope object would dangle after a restore)
         int waitPoint = -1;       // [schedwhy] the WP_* site this fiber last parked at (printed in [sched-state] as wp=)
+        uint64_t waitArg = 0;     // [statesync] the wait's guest-derived argument (event-flag pattern/mode, sema id): part of the park signature
     };
     // [rollback] The frame gate. In frame-stepped mode tid 1 parks here inside the frame hook and
     // the scheduler hands the boundary to the controller (schedFiberBoot), which is how the HOST
@@ -4016,6 +4041,8 @@ namespace
     int  g_schedProbeCursor = -1;    // last probed tid: round-robin position over the blocked fibers
     bool g_schedProbeArmed = false;  // one probe is due before the next runnable pick
     bool g_schedIdleReturn = false;  // [rollback] schedFiberLoopUntil returned because every fiber was parked (not the stop predicate)
+    uint64_t g_schedSeenGen = 0;     // [statesync] schedYield's probe gate (was function-static): scheduler state, snapshotted
+    uint32_t g_schedSinceProbe = 0;
     // [fibers] SIGNAL GENERATION. A parked fiber's predicate can only become true through a kernel
     // wake (WakeupThread, SignalSema, SetEventFlag, ResumeThread, ReleaseWaitThread, thread exit),
     // a vblank tick, or the frame gate -- every one of those bumps this counter. schedYield used to
@@ -4226,6 +4253,15 @@ extern "C" void ps2xVirtualClockAdvance(uint64_t ns);
 extern "C" bool ps2xVirtualClockOn();
 extern "C" uint64_t ps2xVirtualClockGet();
 extern "C" void ps2xRenderSkipSet(bool on);   // [rollback] ps2_memory.cpp: drop GIF/VIF1 work during a re-run
+extern "C" uint64_t *ps2xSchedStepCount(int tid) { return &schedExtraFor(tid).stepCount; }
+extern "C" uint64_t *ps2xParkSlot(int idx)
+{
+    static thread_local uint64_t s_fallback[2] = {0u, 0u};   // host threads (not scheduled guests) keep a private slot
+    const int i = (idx == 1) ? 1 : 0;
+    if (!g_schedIsGuest) return &s_fallback[i];
+    return &schedExtraFor(g_schedTid).park[i];
+}
+
 void PS2Runtime::schedFiberBoot(int mainTid, int mainPrio, std::function<void()> mainEntry)
 {
     m_schedFiber = ps2xFiberAdoptCurrent();
@@ -4336,8 +4372,10 @@ bool PS2Runtime::guestWaitFn(std::condition_variable &cv, std::unique_lock<std::
         schedFiberPark();
         lk.lock();
     }
+    if (g_schedIsGuest) g_fiberTls[g_schedTid].waitArg = 0u;   // [statesync] consumed: only a stub that sets it carries one
     return true;
 }
+extern "C" void ps2xParkArg(uint64_t arg) { if (g_schedIsGuest) g_fiberTls[g_schedTid].waitArg = arg; }   // [statesync] before a wait
 
 void PS2Runtime::schedYield(int tid)
 {
@@ -4362,10 +4400,9 @@ void PS2Runtime::schedYield(int tid)
             }
             if (!anyBlocked) return;
             {   // only when something could have woken a blocked fiber (see g_schedSignalGen), or every 64 yields
-                static uint64_t s_seenGen = 0; static uint32_t s_since = 0;
                 const uint64_t gen = g_schedSignalGen.load(std::memory_order_relaxed);
-                if (gen == s_seenGen && (++s_since & 63u) != 0u) return;
-                s_seenGen = gen; s_since = 0;
+                if (gen == g_schedSeenGen && (++g_schedSinceProbe & 63u) != 0u) return;
+                g_schedSeenGen = gen; g_schedSinceProbe = 0;
             }
             probeOnly = true;
         }
@@ -4672,6 +4709,73 @@ extern "C" bool  ps2xMemDeviceRestore(PS2Memory *, void *);
 extern "C" void  ps2xMemDeviceFree(void *);
 
 extern std::atomic<uint64_t> g_bt3FrameCount;
+extern "C" R5900Context *ps2xWorkerContext(int tid);                         // [statesync] Kernel/Syscalls/Thread.cpp
+extern "C" int ps2xWorkerContextTids(int *out, int cap);
+extern "C" bool ps2xKernelThreadWait(int tid, int *status, int *waitType, int *waitId);
+
+// [statesync] The executable's GNU build id: a synced state is only meaningful between identical
+// binaries (host call chains, struct layouts, and the recompiled code itself must match).
+static std::string ps2xBuildId()
+{
+    static std::string s_id;
+    if (!s_id.empty()) return s_id;
+#if !defined(_WIN32)
+    dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *out) -> int
+    {
+        std::string &id = *static_cast<std::string *>(out);
+        for (int i = 0; i < info->dlpi_phnum; ++i)
+        {
+            const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_NOTE) continue;
+            const uint8_t *p = reinterpret_cast<const uint8_t *>(info->dlpi_addr + ph.p_vaddr), *e = p + ph.p_memsz;
+            while (p + sizeof(ElfW(Nhdr)) <= e)
+            {
+                const ElfW(Nhdr) *nh = reinterpret_cast<const ElfW(Nhdr) *>(p);
+                const uint8_t *name = p + sizeof(ElfW(Nhdr));
+                const uint8_t *desc = name + ((nh->n_namesz + 3u) & ~3u);
+                if (nh->n_type == NT_GNU_BUILD_ID && nh->n_namesz == 4u && std::memcmp(name, "GNU", 4) == 0 && desc + nh->n_descsz <= e)
+                {
+                    char hex[3];
+                    for (uint32_t k = 0; k < nh->n_descsz; ++k) { std::snprintf(hex, sizeof hex, "%02x", desc[k]); id += hex; }
+                    return 1;
+                }
+                p = desc + ((nh->n_descsz + 3u) & ~3u);
+            }
+        }
+        return 0;   // first object is the executable; keep looking only if it had no note
+    }, &s_id);
+#endif
+    if (s_id.empty()) s_id = "no-build-id";
+    return s_id;
+}
+
+// [rollbacktest] Differing byte ranges between two RAM images (merged when closer than 64 bytes):
+// the addresses name the game structure and therefore the host-side state that did not roll back.
+static void ps2xPrintRamDiff(const uint8_t *a, const uint8_t *b, const char *tag, uint32_t maxRanges)
+{
+    uint32_t ranges = 0, bytes = 0; int64_t start = -1, last = -1;
+    auto flush = [&]()
+    {
+        if (start < 0) return;
+        if (ranges < maxRanges)
+        {
+            char ha[40], hb[40];
+            for (int k = 0; k < 16; ++k) { std::snprintf(ha + 2 * k, 3, "%02x", a[start + k]); std::snprintf(hb + 2 * k, 3, "%02x", b[start + k]); }
+            std::fprintf(stderr, "%s   0x%06llx..0x%06llx (%lld B)  A=%s B=%s\n", tag, (long long)start, (long long)last, (long long)(last - start + 1), ha, hb);
+        }
+        ++ranges;
+    };
+    for (uint32_t i = 0; i < 32u * 1024u * 1024u; ++i)
+    {
+        if (a[i] == b[i]) continue;
+        ++bytes;
+        if (start >= 0 && (int64_t)i - last <= 64) { last = i; continue; }
+        flush();
+        start = i; last = i;
+    }
+    flush();
+    std::fprintf(stderr, "%s %u ranges, %u bytes differ\n", tag, ranges, bytes);
+}
 
 struct Ps2xRollback
 {
@@ -4686,6 +4790,8 @@ struct Ps2xRollback
         size_t stackBytes = 0;
         void *kernel = nullptr;   // ps2xKernelStateCapture
         void *dev = nullptr;      // ps2xMemDeviceCapture
+        std::map<int, Ps2xSchedExtra> extra;   // [statesync] the runtime-owned park scalars
+        uint64_t signalGen = 0, seenGen = 0; uint32_t sinceProbe = 0;
         ~FiberSnap() { if (kernel) ps2xKernelStateFree(kernel); if (dev) ps2xMemDeviceFree(dev); }
     };
     static FiberSnap *captureFibers(PS2Runtime &rt)
@@ -4710,6 +4816,8 @@ struct Ps2xRollback
         s->tls = g_fiberTls; s->gate = g_gate; s->cpu = rt.m_cpuContext;
         s->kernel = ps2xKernelStateCapture();
         s->dev = ps2xMemDeviceCapture(&rt.m_memory);
+        { std::lock_guard<std::mutex> lk2(g_schedExtraM); s->extra = g_schedExtra; }
+        s->signalGen = g_schedSignalGen.load(std::memory_order_relaxed); s->seenGen = g_schedSeenGen; s->sinceProbe = g_schedSinceProbe;
         return s;
     }
     static bool restoreFibers(PS2Runtime &rt, const FiberSnap &s)
@@ -4733,6 +4841,8 @@ struct Ps2xRollback
         g_gate = s.gate; rt.m_cpuContext = s.cpu;
         if (s.kernel && !ps2xKernelStateRestore(s.kernel)) return false;
         if (s.dev && !ps2xMemDeviceRestore(&rt.m_memory, s.dev)) return false;
+        { std::lock_guard<std::mutex> lk2(g_schedExtraM); for (const auto &kv : s.extra) g_schedExtra[kv.first] = kv.second; }   // element-wise: nodes are pointed into
+        g_schedSignalGen.store(s.signalGen, std::memory_order_relaxed); g_schedSeenGen = s.seenGen; g_schedSinceProbe = s.sinceProbe;
         return true;
     }
 
@@ -4742,15 +4852,369 @@ struct Ps2xRollback
     // rendering) or whether a remote input older than W is still missing (then wait, as lockstep
     // did). Re-simulated boundaries refresh their ring entries with the corrected state.
     struct RingEntry { uint64_t frame; void *sim; FiberSnap *fib; };
+    static inline std::deque<RingEntry> s_ring;
+    static inline uint64_t s_resimTarget = 0;   // != 0 while re-simulating up to this frame
+    static void ringClear() { for (auto &e : s_ring) { ps2xSimSnapFree(e.sim); delete e.fib; } s_ring.clear(); }
+
+    // ---- [statesync] ---------------------------------------------------------------------
+    // The portable half of a boundary snapshot: guest memory + devices (SimSnap), kernel records,
+    // device registers, every guest thread's R5900 context, and the scheduler's bookkeeping -- but
+    // NOT the fiber stacks. A peer adopts it in place, keeping its own stacks, which is only sound
+    // when every one of its guest fibers is parked inside the same host call chain as ours: the
+    // recompiled code returns through the host stack, so a fiber resumed with our registers inside
+    // a different chain would run the wrong continuation. Each fiber's chain is therefore hashed
+    // (libunwind over the parked ucontext, return addresses relative to their module) into a park
+    // signature; the peer compares before adopting and otherwise waits for a later boundary.
+    static constexpr uint64_t kFnvP = 1099511628211ull;
+    // A host frame is TRANSPARENT when nothing in it but the guest context decides what happens
+    // after the park: the recompiled functions (every register lives in ctx), the dispatch and
+    // syscall plumbing, the kernel's wait stubs (their finish steps read kernel records) and the
+    // fiber trampolines. Anything else -- an HLE hook that called guest code and keeps a local
+    // derived from the guest state it saw on entry (bt3CdStateEdge's device handle, the stream
+    // tick's counts) -- is OPAQUE: a peer's fiber parked inside it would continue on its own stale
+    // locals over our state. Such a boundary is not comparable; the peer waits for a cleaner one.
+    enum FrameKind { FK_RECOMPILED, FK_TRANSPARENT, FK_OPAQUE, FK_UNKNOWN };
+    struct FrameInfo { FrameKind kind; std::string name; };
+    static const FrameInfo &frameInfo(uint64_t startIp, const char *mangled)
+    {
+        static std::unordered_map<uint64_t, FrameInfo> s_cache;
+        auto it = s_cache.find(startIp);
+        if (it != s_cache.end()) return it->second;
+        FrameInfo fi{FK_UNKNOWN, mangled ? mangled : ""};
+#if defined(PS2X_HAVE_LIBUNWIND)
+        if (mangled && mangled[0])
+        {
+            int status = 0;
+            if (char *dm = abi::__cxa_demangle(mangled, nullptr, nullptr, &status)) { if (status == 0) fi.name = dm; std::free(dm); }
+        }
+#endif
+        const std::string &n = fi.name;
+        auto starts = [&](const char *pfx) { return n.compare(0, std::strlen(pfx), pfx) == 0; };
+        auto has = [&](const char *sub) { return n.find(sub) != std::string::npos; };
+        // recompiled guest code and the syscall thunks: `<anything>_0x<hex>(`
+        {
+            const size_t k = n.find("_0x");
+            if (k != std::string::npos)
+            {
+                size_t j = k + 3; while (j < n.size() && std::isxdigit((unsigned char)n[j])) ++j;
+                if (j > k + 3 && j < n.size() && n[j] == '(') fi.kind = FK_RECOMPILED;
+            }
+        }
+        if (fi.kind == FK_UNKNOWN)
+        {
+            static const char *const kTransparent[] = {
+                "PS2Runtime::dispatchGuestBranch(", "PS2Runtime::dispatchLoop(", "PS2Runtime::handleSyscall(",
+                "ps2_syscalls::dispatchNumericSyscall(", "PS2Runtime::guestWaitFn(", "PS2Runtime::schedYield(",
+                "PS2Runtime::schedAcquire(", "PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope",
+                "waitWhileSuspended(", "waitGuestUntil<", "waitWithGuestExecutionReleasedUntilUnlocked<",
+                "ps2_syscalls::SleepThread(", "ps2_syscalls::WaitSema(", "ps2_syscalls::WaitEventFlag(",
+                "ps2_syscalls::SuspendThread(", "ps2_syscalls::DelayThread(", "ps2_syscalls::TerminateThread(",
+                "ps2_syscalls::ExitThread(", "ps2_syscalls::ExitDeleteThread(", "ps2_syscalls::StartThread(",
+                "ps2_syscalls::WaitVSyncTick(", "ps2_syscalls::WaitForNextVSyncTick(", "ps2_syscalls::iWaitSema(",
+                "ps2xFrameGateWait", "(anonymous namespace)::bt3FrameKick(", "PS2Runtime::schedFiberSpawn(",
+                "ps2xFiber", "__start_context", "ps2xGuestSleepMs", nullptr };
+            for (const char *const *t = kTransparent; *t; ++t) if (starts(*t) || has(*t)) { fi.kind = FK_TRANSPARENT; break; }
+        }
+        if (fi.kind == FK_UNKNOWN && (n.empty() || n == "??")) fi.kind = FK_TRANSPARENT;   // trampolines / libc without symbols
+        if (fi.kind == FK_UNKNOWN) fi.kind = FK_OPAQUE;
+        return s_cache.emplace(startIp, std::move(fi)).first->second;
+    }
+    static uint64_t parkSignature(int tid, const PS2Runtime::SchedThread &st, int *depthOut, std::string *opaque)
+    {
+        uint64_t h = 1469598103934665603ull; int d = 0;
+        // PS2X_SYNCTEST_CHAIN=1: print each fiber's host chain (module-relative return addresses,
+        // for addr2line) the first few times, to see which host frames a park keeps live.
+        static const bool s_chain = [](){ const char *v = std::getenv("PS2X_SYNCTEST_CHAIN"); return v && v[0] && v[0] != '0'; }();
+        static uint32_t s_chainPrints = 0;
+        const bool print = s_chain && s_chainPrints < 64u;
+        if (print) { ++s_chainPrints; std::fprintf(stderr, "[synchain] tid %d frame %llu:", tid, (unsigned long long)g_gate.waitFrame); }
+#if defined(PS2X_HAVE_LIBUNWIND)
+        if (const void *uc = ps2xFiberUContext(st.fiber))
+        {
+            unw_context_t uctx; std::memset(&uctx, 0, sizeof uctx);
+            std::memcpy(&uctx, uc, sizeof(ucontext_t) < sizeof uctx ? sizeof(ucontext_t) : sizeof uctx);   // x86-64: unw_context_t is a ucontext_t
+            unw_cursor_t cur;
+            if (unw_init_local(&cur, &uctx) == 0)
+            {
+                FrameKind prevKind = FK_UNKNOWN;
+                do
+                {
+                    unw_word_t ip = 0;
+                    if (unw_get_reg(&cur, UNW_REG_IP, &ip) != 0) break;
+                    unw_proc_info_t pi{}; const bool havePi = unw_get_proc_info(&cur, &pi) == 0;
+                    uint64_t base = 0;
+                    Dl_info di{};
+                    if (dladdr(reinterpret_cast<void *>(static_cast<uintptr_t>(ip)), &di) && di.dli_fbase) base = (uint64_t)reinterpret_cast<uintptr_t>(di.dli_fbase);
+                    const uint64_t startRel = havePi ? (uint64_t)pi.start_ip - base : 0u;
+                    char nameBuf[512] = {}; unw_word_t off = 0;
+                    if (unw_get_proc_name(&cur, nameBuf, sizeof nameBuf, &off) != 0) nameBuf[0] = 0;
+                    const FrameInfo &fi = frameInfo(havePi ? (uint64_t)pi.start_ip : (uint64_t)ip, nameBuf);
+                    // The dispatcher calls a recompiled target from two sites (hot-call cache hit or
+                    // miss) that continue identically: hash the function, not the site, there.
+                    uint64_t rel = (uint64_t)ip - base;
+                    if (prevKind == FK_RECOMPILED && fi.name.compare(0, 33, "PS2Runtime::dispatchGuestBranch(") == 0 && havePi) rel = startRel;
+                    if (fi.kind == FK_OPAQUE && opaque && opaque->empty()) *opaque = fi.name.substr(0, 60);
+                    if (print) std::fprintf(stderr, " %llx%s", (unsigned long long)((uint64_t)ip - base), fi.kind == FK_OPAQUE ? "!" : "");
+                    h ^= rel; h *= kFnvP; ++d; prevKind = fi.kind;
+                } while (d < 512 && unw_step(&cur) > 0);
+            }
+        }
+#endif
+        // the guest side of the park: which wait site, its argument, and the guest pc/ra it was reached from
+        const auto tl = g_fiberTls.find(tid);
+        const int wp = tl != g_fiberTls.end() ? tl->second.waitPoint : -1;
+        const uint64_t warg = tl != g_fiberTls.end() ? tl->second.waitArg : 0u;
+        h ^= (uint64_t)(uint32_t)wp; h *= kFnvP; h ^= warg; h *= kFnvP; h ^= st.blockPc; h *= kFnvP; h ^= st.blockRa; h *= kFnvP;
+        if (print) std::fprintf(stderr, "  (wp=%d arg=%llx%s%s)\n", wp, (unsigned long long)warg, (opaque && !opaque->empty()) ? " OPAQUE " : "", (opaque && !opaque->empty()) ? opaque->c_str() : "");
+        if (depthOut) *depthOut = d;
+        return h;
+    }
+    struct SigEnt { int32_t tid; uint64_t sig; int32_t depth, wp, kst, kwt, kwid; uint32_t bpc, bra; uint64_t warg; uint8_t opaque; char opaqueName[47]; };
+    static std::vector<SigEnt> mySignatures(PS2Runtime &rt)
+    {
+        std::vector<SigEnt> v;
+        std::lock_guard<std::mutex> lk(rt.m_schedMutex);
+        for (auto &kv : rt.m_schedThreads)
+        {
+            if (!kv.second) continue;
+            PS2Runtime::SchedThread &st = *kv.second;
+            if (!st.present || st.finished || !st.fiber) continue;
+            SigEnt e{}; e.tid = kv.first;
+            std::string op; e.sig = parkSignature(kv.first, st, &e.depth, &op);
+            e.opaque = !op.empty(); std::strncpy(e.opaqueName, op.c_str(), sizeof e.opaqueName - 1u);
+            { const auto tl = g_fiberTls.find(kv.first); e.warg = tl != g_fiberTls.end() ? tl->second.waitArg : 0u; }
+            const auto tl = g_fiberTls.find(kv.first); e.wp = tl != g_fiberTls.end() ? tl->second.waitPoint : -1;
+            int st_ = -1, wt = -1, wid = -1; if (ps2xKernelThreadWait(kv.first, &st_, &wt, &wid)) { e.kst = st_; e.kwt = wt; e.kwid = wid; } else { e.kst = e.kwt = e.kwid = -1; }
+            e.bpc = st.blockPc; e.bra = st.blockRa;
+            v.push_back(e);
+        }
+        return v;
+    }
+    static bool syncCapture(PS2Runtime &rt, std::vector<uint8_t> &out)
+    {
+        PS2Runtime::GuestExecutionScope lock(&rt);
+        uint8_t *rdram = g_gate.rdram;
+        void *sim = ps2xSimSnapCapture(&rt, rdram);
+        void *krn = ps2xKernelStateCapture();
+        void *dev = ps2xMemDeviceCapture(&rt.m_memory);
+        out.clear(); out.reserve(48u << 20);
+        Ps2xByteW w(out);
+        w.raw("BT3SYNC1", 8); w.u32(1u); w.str(ps2xBuildId()); w.u64(g_gate.waitFrame);
+        bool ok = sim && krn && dev;
+        auto section = [&](uint32_t tag, auto &&fn)
+        {
+            w.u32(tag); const size_t lenAt = out.size(); w.u64(0u); const size_t start = out.size();
+            fn();
+            const uint64_t len = out.size() - start; std::memcpy(out.data() + lenAt, &len, sizeof len);
+        };
+        section(0x204d4953u /* 'SIM ' */, [&] { ok = ok && ps2xSimSnapSerialize(sim, out); });
+        section(0x204e524bu /* 'KRN ' */, [&] { ok = ok && ps2xKernelStateSerialize(krn, out); });
+        section(0x20564544u /* 'DEV ' */, [&] { ok = ok && ps2xMemDeviceSerialize(dev, out); });
+        section(0x20555043u /* 'CPU ' */, [&]
+        {
+            w.pod(rt.m_cpuContext);
+            int tids[64]; const int n = ps2xWorkerContextTids(tids, 64);
+            w.u32((uint32_t)n);
+            for (int i = 0; i < n; ++i) { w.pod((int32_t)tids[i]); w.pod(*ps2xWorkerContext(tids[i])); }
+        });
+        section(0x20484353u /* 'SCH ' */, [&]
+        {
+            std::lock_guard<std::mutex> lk(rt.m_schedMutex);
+            w.pod((int32_t)rt.m_schedCurrent); w.u64(rt.m_schedOrderCounter); w.pod((int32_t)g_schedProbeCursor); w.u8(g_schedProbeArmed);
+            w.u64(g_schedSignalGen.load(std::memory_order_relaxed)); w.u64(g_schedSeenGen); w.u32(g_schedSinceProbe);
+            uint32_t n = 0; for (auto &kv : rt.m_schedThreads) if (kv.second) ++n;
+            w.u32(n);
+            for (auto &kv : rt.m_schedThreads)
+            {
+                if (!kv.second) continue;
+                const PS2Runtime::SchedThread &st = *kv.second; const Ps2xSchedExtra &x = schedExtraFor(kv.first);
+                w.pod((int32_t)kv.first); w.pod((int32_t)st.prio); w.u8(st.blocked); w.u8(st.present); w.u8(st.finished); w.u64(st.order);
+                w.pod(x);
+            }
+        });
+        section(0x20474953u /* 'SIG ' */, [&] { w.podVec(mySignatures(rt)); });
+        w.u32(0x444e4553u /* 'SEND' */);
+        ps2xSimSnapFree(sim); ps2xKernelStateFree(krn); ps2xMemDeviceFree(dev);
+        return ok;
+    }
+    static std::string sigLine(const SigEnt &e)
+    {
+        char b[240];
+        std::snprintf(b, sizeof b, "sig=%016llx depth=%d wp=%d arg=%llx kst=%d kwt=%d kwid=%d pc=0x%x ra=0x%x%s%s",
+                      (unsigned long long)e.sig, e.depth, e.wp, (unsigned long long)e.warg, e.kst, e.kwt, e.kwid, e.bpc, e.bra,
+                      e.opaque ? " inside " : "", e.opaque ? e.opaqueName : "");
+        return b;
+    }
+    // Adopt a portable snapshot. Returns false with `why` set: a permanent problem ("build id",
+    // "corrupt") or, most often, "not comparable" -- try again at a later boundary.
+    static bool syncApply(PS2Runtime &rt, const uint8_t *data, size_t n, std::string &why, bool *permanent)
+    {
+        *permanent = true;
+        Ps2xByteR r(data, n);
+        char magic[8] = {}; r.raw(magic, 8);
+        if (std::memcmp(magic, "BT3SYNC1", 8) != 0) { why = "bad magic"; return false; }
+        if (r.u32() != 1u) { why = "version"; return false; }
+        const std::string bid = r.str();
+        if (bid != ps2xBuildId()) { why = "build id differs: theirs " + bid + " ours " + ps2xBuildId(); return false; }
+        const uint64_t frame = r.u64();
+        struct Owned { void *sim = nullptr, *krn = nullptr, *dev = nullptr;
+                       ~Owned() { if (sim) ps2xSimSnapFree(sim); if (krn) ps2xKernelStateFree(krn); if (dev) ps2xMemDeviceFree(dev); } } o;
+        R5900Context cpu{}; std::vector<std::pair<int, R5900Context>> workers;
+        struct SchEnt { int32_t tid, prio; uint8_t blocked, present, finished; uint64_t order; Ps2xSchedExtra extra; };
+        std::vector<SchEnt> sch; int32_t cur = -1; uint64_t orderCounter = 0; int32_t probeCursor = -1; uint8_t probeArmed = 0;
+        uint64_t signalGen = 0, seenGen = 0; uint32_t sinceProbe = 0;
+        std::vector<SigEnt> sigs;
+        bool haveCpu = false, haveSch = false, haveSig = false, done = false;
+        while (r.ok && !done && r.left() >= 4)
+        {
+            const uint32_t tag = r.u32();
+            if (tag == 0x444e4553u) { done = true; break; }
+            const uint64_t len = r.u64();
+            if (!r.ok || len > r.left()) { why = "corrupt (section length)"; return false; }
+            const uint8_t *sp = r.p; Ps2xByteR sub(sp, (size_t)len);
+            switch (tag)
+            {
+            case 0x204d4953u: o.sim = ps2xSimSnapDeserialize(sp, (size_t)len, nullptr); if (!o.sim) { why = "corrupt (sim)"; return false; } break;
+            case 0x204e524bu: o.krn = ps2xKernelStateDeserialize(sp, (size_t)len, nullptr); if (!o.krn) { why = "corrupt (kernel)"; return false; } break;
+            case 0x20564544u: o.dev = ps2xMemDeviceDeserialize(sp, (size_t)len, nullptr); if (!o.dev) { why = "corrupt (device)"; return false; } break;
+            case 0x20555043u:
+            {
+                cpu = sub.pod<R5900Context>(); const uint32_t k = sub.u32();
+                for (uint32_t i = 0; i < k && sub.ok; ++i) { const int32_t tid = sub.pod<int32_t>(); workers.emplace_back(tid, sub.pod<R5900Context>()); }
+                haveCpu = sub.ok; break;
+            }
+            case 0x20484353u:
+            {
+                cur = sub.pod<int32_t>(); orderCounter = sub.u64(); probeCursor = sub.pod<int32_t>(); probeArmed = sub.u8();
+                signalGen = sub.u64(); seenGen = sub.u64(); sinceProbe = sub.u32();
+                const uint32_t k = sub.u32();
+                for (uint32_t i = 0; i < k && sub.ok; ++i)
+                {
+                    SchEnt e{}; e.tid = sub.pod<int32_t>(); e.prio = sub.pod<int32_t>(); e.blocked = sub.u8(); e.present = sub.u8(); e.finished = sub.u8();
+                    e.order = sub.u64(); e.extra = sub.pod<Ps2xSchedExtra>(); sch.push_back(e);
+                }
+                haveSch = sub.ok; break;
+            }
+            case 0x20474953u: sub.podVec(sigs); haveSig = sub.ok; break;
+            default: break;
+            }
+            r.p = sp + len;
+        }
+        if (!done || !o.sim || !o.krn || !o.dev || !haveCpu || !haveSch || !haveSig) { why = "corrupt (sections)"; return false; }
+        *permanent = false;
+        // ---- structural check: every guest fiber parked where theirs is
+        {
+            const std::vector<SigEnt> mine = mySignatures(rt);
+            std::string bad;
+            for (const SigEnt &t : sigs)
+            {
+                const SigEnt *m = nullptr; for (const SigEnt &x : mine) if (x.tid == t.tid) { m = &x; break; }
+                if (!m) { bad += " tid " + std::to_string(t.tid) + ": absent here;"; continue; }
+                if (t.opaque || m->opaque) { bad += " tid " + std::to_string(t.tid) + ": parked inside " + (t.opaque ? t.opaqueName : m->opaqueName) + (t.opaque ? " (theirs);" : " (ours);"); continue; }
+                if (m->sig != t.sig || m->kst != t.kst || m->kwt != t.kwt || m->kwid != t.kwid)
+                    bad += " tid " + std::to_string(t.tid) + ": theirs " + sigLine(t) + " | ours " + sigLine(*m) + ";";
+            }
+            for (const SigEnt &m : mine) { bool found = false; for (const SigEnt &t : sigs) if (t.tid == m.tid) { found = true; break; } if (!found) bad += " tid " + std::to_string(m.tid) + ": absent there;"; }
+            for (const auto &wk : workers) if (!ps2xWorkerContext(wk.first)) bad += " tid " + std::to_string(wk.first) + ": no worker context here;";
+            if (!bad.empty()) { why = "not comparable:" + bad; return false; }
+        }
+        // ---- adopt
+        PS2Runtime::GuestExecutionScope lock(&rt);
+        uint8_t *rdram = g_gate.rdram;
+        if (!ps2xSimSnapRestore(o.sim, &rt, rdram)) { why = "sim restore failed"; return false; }
+        if (!ps2xKernelStateRestore(o.krn)) { why = "kernel restore failed"; return false; }
+        if (!ps2xMemDeviceRestore(&rt.m_memory, o.dev)) { why = "device restore failed"; return false; }
+        rt.m_cpuContext = cpu;
+        for (const auto &wk : workers) if (R5900Context *c = ps2xWorkerContext(wk.first)) *c = wk.second;
+        {
+            std::lock_guard<std::mutex> lk(rt.m_schedMutex);
+            for (const SchEnt &e : sch)
+            {
+                auto it = rt.m_schedThreads.find(e.tid);
+                if (it != rt.m_schedThreads.end() && it->second)
+                { PS2Runtime::SchedThread &st = *it->second; st.prio = e.prio; st.blocked = e.blocked != 0; st.present = e.present != 0; st.finished = e.finished != 0; st.order = e.order; }
+                schedExtraFor(e.tid) = e.extra;
+            }
+            rt.m_schedCurrent = cur; rt.m_schedOrderCounter = orderCounter;
+            g_schedProbeCursor = probeCursor; g_schedProbeArmed = probeArmed != 0;
+            g_schedSignalGen.store(signalGen, std::memory_order_relaxed); g_schedSeenGen = seenGen; g_schedSinceProbe = sinceProbe;
+        }
+        { std::lock_guard<std::mutex> lk(g_gateM); g_gate.waitFrame = frame; g_gate.openFrame = frame - 1u; }   // closed until the controller opens it
+        return true;
+    }
+    // Host: publish this boundary and wait for the joiner; joiner: adopt when comparable. Returns
+    // true when the boundary should carry on as a synced one (inputs from here), false to skip it.
+    static bool syncStep(PS2Runtime &rt)
+    {
+        static const char *s_path = [](){ const char *v = std::getenv("PS2X_NET_SYNCFILE"); return (v && v[0]) ? v : "/tmp/bt3_netsync.bin"; }();
+        using clock = std::chrono::steady_clock;
+        if (ps2NetSyncIsHost())
+        {
+            std::vector<uint8_t> blob;
+            const auto t0 = clock::now();
+            if (!syncCapture(rt, blob)) { std::fprintf(stderr, "[statesync] host: capture failed\n"); ps2NetDisconnect("state sync capture failed"); return false; }
+            const std::string tmp = std::string(s_path) + ".tmp";
+            std::FILE *f = std::fopen(tmp.c_str(), "wb");
+            const bool wrote = f && std::fwrite(blob.data(), 1, blob.size(), f) == blob.size();
+            if (f) std::fclose(f);
+            if (!wrote || std::rename(tmp.c_str(), s_path) != 0)
+            { std::fprintf(stderr, "[statesync] host: cannot write %s\n", s_path); ps2NetDisconnect("state sync write failed"); return false; }
+            const double msCap = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+            std::fprintf(stderr, "[statesync] host: frame %llu, %zu bytes -> %s (%.1f ms); waiting for the joiner\n",
+                         (unsigned long long)g_gate.waitFrame, blob.size(), s_path, msCap);
+            ps2NetSyncOffer((uint32_t)g_gate.waitFrame, blob.size(), s_path);
+            const bool ok = ps2NetSyncWaitDone(180000u);
+            const double sWait = std::chrono::duration<double>(clock::now() - t0).count();
+            if (!ok) { std::fprintf(stderr, "[statesync] host: no acknowledgement after %.1f s\n", sWait); if (ps2NetActive()) ps2NetDisconnect("state sync timed out"); return false; }
+            ringClear();
+            std::fprintf(stderr, "[statesync] host: joiner adopted frame %llu (%.1f s)\n", (unsigned long long)g_gate.waitFrame, sWait);
+            return true;
+        }
+        uint32_t f = 0; uint64_t bytes = 0; char path[128] = {};
+        if (!ps2NetSyncOffered(&f, &bytes, path, sizeof path)) return false;   // nothing offered yet: keep stepping our own game
+        static std::vector<uint8_t> s_blob; static uint32_t s_blobFrame = 0xFFFFFFFFu; static uint32_t s_tries = 0;
+        static clock::time_point s_t0;
+        if (s_blobFrame != f)
+        {
+            std::FILE *in = std::fopen(path, "rb");
+            std::vector<uint8_t> b;
+            if (in) { std::fseek(in, 0, SEEK_END); const long sz = std::ftell(in); std::fseek(in, 0, SEEK_SET);
+                      if (sz > 0) { b.resize((size_t)sz); if (std::fread(b.data(), 1, b.size(), in) != b.size()) b.clear(); } std::fclose(in); }
+            if (b.size() != bytes) { std::fprintf(stderr, "[statesync] joiner: %s has %zu bytes, offered %llu -- waiting\n", path, b.size(), (unsigned long long)bytes); return false; }
+            s_blob.swap(b); s_blobFrame = f; s_tries = 0; s_t0 = clock::now();
+            std::fprintf(stderr, "[statesync] joiner: offer for frame %u (%zu bytes) at our frame %llu\n", f, s_blob.size(), (unsigned long long)g_gate.waitFrame);
+        }
+        g_rollbackUnpaced = true;   // catch up to a comparable boundary as fast as the guest runs
+        std::string why; bool permanent = false;
+        const auto t0 = clock::now();
+        if (syncApply(rt, s_blob.data(), s_blob.size(), why, &permanent))
+        {
+            const double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+            ringClear(); g_rollbackUnpaced = false;
+            ps2NetSyncApplied(f);
+            std::fprintf(stderr, "[statesync] joiner: adopted frame %u after %u boundaries (%.1f s, apply %.1f ms)\n",
+                         f, s_tries + 1u, std::chrono::duration<double>(clock::now() - s_t0).count(), ms);
+            s_blob.clear(); s_blob.shrink_to_fit();
+            return true;
+        }
+        ++s_tries;
+        if (permanent) { std::fprintf(stderr, "[statesync] joiner: cannot adopt: %s\n", why.c_str()); g_rollbackUnpaced = false; ps2NetDisconnect("state sync failed"); return false; }
+        if (s_tries <= 3u || (s_tries % 120u) == 0u)
+            std::fprintf(stderr, "[statesync] joiner: frame %llu %s\n", (unsigned long long)g_gate.waitFrame, why.c_str());
+        if (s_tries > 3600u) { std::fprintf(stderr, "[statesync] joiner: no comparable boundary in %u frames\n", s_tries); g_rollbackUnpaced = false; ps2NetDisconnect("state sync: no comparable boundary"); }
+        return false;
+    }
+
     static void netAtBoundary(PS2Runtime &rt)
     {
         // Not cached: the transport parses PS2X_NET_ROLLBACK when it starts, which is later than the
         // first frame boundary (ps2NetInit runs inside the frame hook, after the gate).
         const uint32_t W = ps2NetRollbackWindow();
         if (!W || !ps2NetActive()) return;
-        static std::deque<RingEntry> ring;
-        static uint64_t resimTarget = 0;          // != 0 while re-simulating up to this frame
-        const uint64_t frame = g_gate.waitFrame;
+        if (ps2NetSyncPending() && !syncStep(rt)) return;   // [statesync] before any frame numbering
+        std::deque<RingEntry> &ring = s_ring;
+        uint64_t &resimTarget = s_resimTarget;
+        const uint64_t frame = g_gate.waitFrame;   // read after the sync step: an adopted state moves it
         uint8_t *rdram = g_gate.rdram;
         auto dropEntry = [](RingEntry &e) { ps2xSimSnapFree(e.sim); delete e.fib; };
         auto captureInto = [&](uint64_t f)
@@ -4841,6 +5305,18 @@ struct Ps2xRollback
         enum { Idle, RunA, RunB };
         static int s_phase = Idle;
         static void *s_sim = nullptr; static FiberSnap *s_fib = nullptr;
+        // [statesync] PS2X_SYNCTEST=1: the same round trip through the PORTABLE snapshot (no fiber
+        // stacks): capture at `start`, run k frames, adopt the blob in place as a peer would (only
+        // at a structurally comparable boundary), run k frames again, compare. A MATCH here is what
+        // makes a cross-process sync sound.
+        static const bool s_portable = [](){ const char *v = std::getenv("PS2X_SYNCTEST"); return v && v[0] && v[0] != '0'; }();
+        static std::vector<uint8_t> s_blob;
+        // PS2X_SYNCTEST_TRACE=1: keep RAM at every boundary of the first run and compare the re-run
+        // boundary by boundary, reporting the FIRST divergent frame and its bytes (the cause, not the
+        // accumulated symptom that the final diff shows).
+        static const bool s_trace = [](){ const char *v = std::getenv("PS2X_SYNCTEST_TRACE"); return v && v[0] && v[0] != '0'; }();
+        static std::vector<std::pair<uint64_t, std::vector<uint8_t>>> s_traceA;
+        static bool s_traceReported = false;
         static uint64_t s_target = 0, s_next = 0, s_hashA = 0, s_hashAgp = 0;
         static std::vector<uint8_t> s_ramA;   // RAM after the first run, for the byte diff that names what the snapshot misses
         static std::chrono::steady_clock::time_point s_tA, s_tB;
@@ -4853,6 +5329,15 @@ struct Ps2xRollback
         {
             if (frame < s_next) return;
             PS2Runtime::GuestExecutionScope lock(&rt);   // no host service thread runs guest code under the copy
+            if (s_portable)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!syncCapture(rt, s_blob)) { std::fprintf(stderr, "[synctest] capture failed\n"); s_next = frame + s_period; return; }
+                s_target = frame + s_k; s_phase = RunA; s_tA = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[synctest] #%u portable snapshot at frame %llu (%zu bytes, %.1f ms), running %llu frames\n",
+                             s_n, (unsigned long long)frame, s_blob.size(), std::chrono::duration<double, std::milli>(s_tA - t0).count(), (unsigned long long)s_k);
+                return;
+            }
             s_sim = ps2xSimSnapCapture(&rt, rdram);
             s_fib = captureFibers(rt);
             s_target = frame + s_k; s_phase = RunA; s_tA = std::chrono::steady_clock::now();
@@ -4860,16 +5345,49 @@ struct Ps2xRollback
                          s_n, (unsigned long long)frame, s_fib->stackBytes, (unsigned long long)s_k);
             return;
         }
+        if (s_trace && frame < s_target)
+        {
+            if (s_phase == RunA) s_traceA.emplace_back(frame, std::vector<uint8_t>(rdram, rdram + 32u * 1024u * 1024u));
+            else if (s_phase == RunB && !s_traceReported)
+                for (const auto &e : s_traceA)
+                    if (e.first == frame && std::memcmp(e.second.data(), rdram, 32u * 1024u * 1024u) != 0)
+                    {
+                        s_traceReported = true;
+                        std::fprintf(stderr, "[synctrace] first divergence at boundary %llu (%llu frames after the restore)\n",
+                                     (unsigned long long)frame, (unsigned long long)(frame - (s_target - s_k)));
+                        ps2xPrintRamDiff(e.second.data(), rdram, "[synctrace]", 24u);
+                        break;
+                    }
+        }
         if (frame < s_target) return;
         if (s_phase == RunA)
         {
             PS2Runtime::GuestExecutionScope lock(&rt);
             const double msA = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_tA).count();
-            s_hashA = ps2xRamHash(rdram, 0u, 0u);
-            s_hashAgp = ps2xRamHash(rdram, 0x2c0000u, 0x300000u);   // minus the sound-stream window (host-paced audio)
-            s_ramA.assign(rdram, rdram + 32u * 1024u * 1024u);
-            const bool okS = ps2xSimSnapRestore(s_sim, &rt, rdram);
-            const bool okF = restoreFibers(rt, *s_fib);
+            bool okS = false, okF = false;
+            if (s_portable)
+            {   // adopt in place, as a peer would -- only at a comparable boundary, else try the next one
+                std::string why; bool permanent = false;
+                const uint64_t hA = ps2xRamHash(rdram, 0u, 0u);
+                const uint64_t hAgp = ps2xRamHash(rdram, 0x2c0000u, 0x300000u);
+                std::vector<uint8_t> ramA(rdram, rdram + 32u * 1024u * 1024u);
+                if (!syncApply(rt, s_blob.data(), s_blob.size(), why, &permanent))
+                {
+                    static uint32_t s_nc = 0;
+                    if (++s_nc <= 5 || (s_nc % 60) == 0) std::fprintf(stderr, "[synctest] frame %llu: %s\n", (unsigned long long)frame, why.c_str());
+                    if (permanent || frame > s_target + 600u) { std::fprintf(stderr, "[synctest] giving up this round\n"); s_phase = Idle; s_next = frame + s_period; }
+                    return;   // retry at the next boundary
+                }
+                s_hashA = hA; s_hashAgp = hAgp; s_ramA.swap(ramA); s_target = frame; okS = okF = true;
+            }
+            else
+            {
+                s_hashA = ps2xRamHash(rdram, 0u, 0u);
+                s_hashAgp = ps2xRamHash(rdram, 0x2c0000u, 0x300000u);   // minus the sound-stream window (host-paced audio)
+                s_ramA.assign(rdram, rdram + 32u * 1024u * 1024u);
+                okS = ps2xSimSnapRestore(s_sim, &rt, rdram);
+                okF = restoreFibers(rt, *s_fib);
+            }
             std::fprintf(stderr, "[rollbacktest] #%u frame %llu hashA=%016llx (%.1f ms for %llu frames); restore sim=%d fibers=%d -> back at frame %llu\n",
                          s_n, (unsigned long long)frame, (unsigned long long)s_hashA, msA, (unsigned long long)s_k, (int)okS, (int)okF,
                          (unsigned long long)g_gate.waitFrame);
@@ -4906,34 +5424,11 @@ struct Ps2xRollback
                 }
                 std::fprintf(stderr, "\n");
             }
-            if (hashB != s_hashA && s_ramA.size() == 32u * 1024u * 1024u)
-            {   // Differing byte ranges (merged when closer than 64 bytes), first 40: the addresses name the
-                // game structure and therefore the host-side state that did not roll back with the rest.
-                const uint8_t *a = s_ramA.data(); const uint8_t *b = rdram;
-                uint32_t ranges = 0, bytes = 0; int64_t start = -1, last = -1;
-                for (uint32_t i = 0; i < 32u * 1024u * 1024u; ++i)
-                {
-                    if (a[i] == b[i]) continue;
-                    ++bytes;
-                    if (start >= 0 && (int64_t)i - last <= 64) { last = i; continue; }
-                    if (start >= 0)
-                    {
-                        if (ranges < 40)
-                        {
-                            char ha[40], hb[40];
-                            for (int k = 0; k < 16; ++k) { std::snprintf(ha + 2 * k, 3, "%02x", a[start + k]); std::snprintf(hb + 2 * k, 3, "%02x", b[start + k]); }
-                            std::fprintf(stderr, "[rollbackdiff]   0x%06llx..0x%06llx (%lld B)  A=%s B=%s\n",
-                                         (long long)start, (long long)last, (long long)(last - start + 1), ha, hb);
-                        }
-                        ++ranges;
-                    }
-                    start = i; last = i;
-                }
-                if (start >= 0) { if (ranges < 40) std::fprintf(stderr, "[rollbackdiff]   0x%06llx..0x%06llx (%lld B)\n", (long long)start, (long long)last, (long long)(last - start + 1)); ++ranges; }
-                std::fprintf(stderr, "[rollbackdiff] %u ranges, %u bytes differ\n", ranges, bytes);
-            }
+            if (hashB != s_hashA && s_ramA.size() == 32u * 1024u * 1024u) ps2xPrintRamDiff(s_ramA.data(), rdram, "[rollbackdiff]", 40u);
             s_ramA.clear(); s_ramA.shrink_to_fit();
-            ps2xSimSnapFree(s_sim); s_sim = nullptr; delete s_fib; s_fib = nullptr;
+            if (s_trace && !s_traceReported && hashB != s_hashA) std::fprintf(stderr, "[synctrace] no boundary differed before the end: the last frame itself diverged\n");
+            s_traceA.clear(); s_traceReported = false;
+            if (s_sim) { ps2xSimSnapFree(s_sim); s_sim = nullptr; } if (s_fib) { delete s_fib; s_fib = nullptr; }
             g_rollbackUnpaced = false;
             ps2xRenderSkipSet(false);
             s_phase = Idle; s_next = frame + s_period; ++s_n;
@@ -4967,12 +5462,13 @@ extern "C" void ps2xGuestSleepMs(unsigned ms)
     // ticks instead of after a wall-clock interval that spans a different number of ticks paced
     // (play) and unpaced (re-simulation) -- the last one-tick divergence the self-test showed.
     const bool virt = ps2xVirtualClockOn();
-    const uint64_t vdeadline = ps2xVirtualClockGet() + (uint64_t)ms * 1000000ull;
+    uint64_t *vdeadline = ps2xParkSlot(0);   // [statesync] runtime-owned: a synced peer adopts the host's deadline
+    *vdeadline = ps2xVirtualClockGet() + (uint64_t)ms * 1000000ull;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
     bool parkedOnce = false;               // even 0 ms parks once, so one probe pass happens
     std::unique_lock<std::mutex> lk(s_m);
     auto pred = [&]() { if (!parkedOnce) { parkedOnce = true; return false; }
-                        return virt ? (ps2xVirtualClockGet() >= vdeadline) : (std::chrono::steady_clock::now() >= deadline); };
+                        return virt ? (ps2xVirtualClockGet() >= *vdeadline) : (std::chrono::steady_clock::now() >= deadline); };
     rt->guestWaitT(s_cv, lk, pred, WP_SCHED_YIELD);   // [rollback] pred lives on this stack
 }
 void PS2Runtime::run()

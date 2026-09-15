@@ -556,6 +556,22 @@ target_include_directories(ps2_runtime PUBLIC
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
 
+# [statesync] libunwind: the netplay state sync unwinds each parked guest fiber's host call chain into a
+# structural signature (the peer only adopts a state at a matching park). Optional: without it the
+# signature falls back to the wait point + guest pc/ra, which is weaker.
+if(UNIX AND NOT APPLE)
+    find_library(PS2X_UNWIND_LIB unwind)
+    find_path(PS2X_UNWIND_INC libunwind.h)
+    if(PS2X_UNWIND_LIB AND PS2X_UNWIND_INC)
+        target_link_libraries(ps2_runtime PUBLIC ${PS2X_UNWIND_LIB} ${CMAKE_DL_LIBS})
+        target_include_directories(ps2_runtime PRIVATE ${PS2X_UNWIND_INC})
+        set_source_files_properties(src/lib/ps2_runtime.cpp PROPERTIES COMPILE_DEFINITIONS PS2X_HAVE_LIBUNWIND=1)
+        message(STATUS "[statesync] libunwind: ${PS2X_UNWIND_LIB}")
+    else()
+        message(STATUS "[statesync] libunwind not found: park signatures use the wait point only")
+    endif()
+endif()
+
 # [pgs] optional paraLLEl-GS backend (Vulkan compute GS, LGPLv3+): built in when the checkout is present.
 # ps2xRuntime/third_party/parallel-gs is a git-ignored symlink/checkout of https://github.com/Arntzen-Software/parallel-gs
 set(PS2X_PGS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parallel-gs" CACHE PATH "paraLLEl-GS checkout (with its Granite submodule)")

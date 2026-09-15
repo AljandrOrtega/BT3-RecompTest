@@ -52,6 +52,10 @@ size_t ps2xFiberSnapshotSize(const Ps2xFiber *f);
 bool ps2xFiberSnapshot(const Ps2xFiber *f, void *buf, size_t size);
 bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size);
 
+// [statesync] The parked fiber's saved register context (a ucontext_t on the ucontext backend, else
+// null), for unwinding its host call chain into a structural signature.
+const void *ps2xFiberUContext(const Ps2xFiber *f);
+
 // PS2X_FIBERTEST=1: ping-pong two fibers at startup and report. Proves the primitive works on this
 // toolchain before anything depends on it.
 void ps2xFiberSelfTest();

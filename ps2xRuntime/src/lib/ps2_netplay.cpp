@@ -17,6 +17,7 @@
 //   PS2X_NET_PLAYER=1|2      which player is local    PS2X_NET_DELAY=<frames>  default 4
 //   PS2X_NET_TIMEOUT=<ms>    stall limit, default 2000
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -70,7 +71,9 @@ struct NetPkt
     // battleType is 2. Carved out of pad0, so the wire format and version are unchanged and a
     // peer that predates this field sends 0 -- which is a valid budget, not garbage.
     uint8_t      dpLimit;
-    uint8_t      pad0[1];
+    // [statesync] 0 = inputs; 1 = SYNC OFFER (host -> joiner: baseFrame = the frame, checksum = the blob's
+    // bytes, the inputs area carries the file path); 2 = SYNC DONE (joiner -> host: baseFrame = the frame).
+    uint8_t      kind;
     uint32_t     checkFrame;    // frame the checksum belongs to (0 = none)
     uint64_t     checksum;      // gameplay-state hash, for desync detection
     Ps2xNetInput inputs[kMaxInputs];
@@ -124,6 +127,11 @@ struct Net
     bool        testInput = false;                               // PS2X_NET_TESTINPUT=1: toggle R3 every 15 frames so the peer mispredicts
     std::deque<std::pair<std::chrono::steady_clock::time_point, NetPkt>> held;
     std::atomic<uint64_t> predictions{0}, rollbacks{0}, mispredicts{0};
+    // [statesync]
+    bool        syncOn = false;        // PS2X_NET_SYNC=1
+    bool        synced = true;         // false from connect until the state sync completes (when syncOn)
+    bool        syncOffered = false, syncDone = false;
+    uint32_t    syncFrame = 0; uint64_t syncBytes = 0; char syncPath[96] = {};
 };
 
 Net g;
@@ -211,6 +219,35 @@ static void applyInputs(const NetPkt &p)
     if (p.checkFrame) g.peerHash[p.checkFrame] = p.checksum;
 }
 
+// [statesync] control packets: no inputs, the header fields carry the payload
+static void sendSyncCtl(uint8_t kind, uint32_t frame, uint64_t bytes, const char *path)
+{
+    if (!g.peerKnown || g.sock == INVALID_SOCKET) return;
+    NetPkt p{}; p.magic = kMagic; p.version = kVersion; p.player = static_cast<uint8_t>(g.localPlayer);
+    p.kind = kind; p.baseFrame = frame; p.checksum = bytes; p.count = 0u;
+    p.battleType = static_cast<uint8_t>(g.battleType.load(std::memory_order_relaxed));
+    p.timeLimit  = static_cast<uint8_t>(g.timeLimit.load(std::memory_order_relaxed));
+    p.dpLimit    = static_cast<uint8_t>(g.dpLimit.load(std::memory_order_relaxed));
+    size_t bytesOut = sizeof(NetPkt) - sizeof(Ps2xNetInput) * kMaxInputs;
+    if (path && path[0])
+    {
+        const size_t room = sizeof(NetPkt) - offsetof(NetPkt, inputs);
+        std::strncpy(reinterpret_cast<char *>(&p.inputs[0]), path, room - 1u);
+        bytesOut = sizeof(NetPkt);
+    }
+    ::sendto(g.sock, reinterpret_cast<const char *>(&p), static_cast<int>(bytesOut), 0,
+             reinterpret_cast<sockaddr *>(&g.peer), sizeof g.peer);
+    g.tx.fetch_add(1, std::memory_order_relaxed);
+}
+static void sendSyncDone(uint32_t frame) { for (int i = 0; i < 3; ++i) sendSyncCtl(2u, frame, 0u, nullptr); }
+static void syncResetTables(uint32_t base)
+{   // both sides restart input numbering at the adopted frame
+    std::lock_guard<std::mutex> lk(g.mtx);
+    g.local.clear(); g.remote.clear(); g.predicted.clear(); g.peerHash.clear(); g.ourHash.clear(); g.held.clear();
+    g.base = base; g.needBase = false; g.rollbackTo = 0xFFFFFFFFu; g.checkFrame = 0; g.checkValue = 0; g.lastSent = 0;
+    g.synced = true;
+}
+
 void pump()
 {
     if (g.fakeLagMs)
@@ -252,10 +289,29 @@ void pump()
         if (!g.connected)
         {
             g.connected = true; ++g.session;
+            if (g.syncOn) { g.synced = false; g.syncOffered = false; g.syncDone = false; }   // [statesync] inputs wait for the state
             // host drives; the joiner just follows the inputs it receives
             if (g.listening) { if (const char *a = std::getenv("PS2X_NET_AUTOSTART")) ps2NetBeginAutoStart(a); }
         }
         g.rx.fetch_add(1, std::memory_order_relaxed);
+        if (p.kind == 1u)
+        {   // [statesync] the host's offer (the joiner adopts it at a comparable boundary; an offer for a
+            // frame we already adopted means our DONE was lost: answer again)
+            if (!g.listening)
+            {
+                g.syncFrame = p.baseFrame; g.syncBytes = p.checksum;
+                const size_t room = sizeof(NetPkt) - offsetof(NetPkt, inputs);
+                std::memcpy(g.syncPath, &p.inputs[0], room < sizeof g.syncPath ? room : sizeof g.syncPath); g.syncPath[sizeof g.syncPath - 1] = 0;
+                g.syncOffered = true;
+                if (g.synced && g.base == p.baseFrame) sendSyncDone(p.baseFrame);
+            }
+            continue;
+        }
+        if (p.kind == 2u)
+        {
+            if (g.listening && p.baseFrame == g.syncFrame) g.syncDone = true;
+            continue;
+        }
         if (g.fakeLagMs) g.held.emplace_back(std::chrono::steady_clock::now(), p);
         else applyInputs(p);
     }
@@ -281,6 +337,11 @@ static bool netStart(const char *conn, int listenPort, int player)
         const char *ti = std::getenv("PS2X_NET_TESTINPUT");
         g.testInput = ti && ti[0] && ti[0] != '0';
         if (g.rbWindow) std::fprintf(stderr, "[netplay] rollback window %u frames%s\n", g.rbWindow, g.fakeLagMs ? " (with fake lag)" : "");
+        const char *sy = std::getenv("PS2X_NET_SYNC");
+        g.syncOn = sy && sy[0] && sy[0] != '0' && g.rbWindow != 0u;   // [statesync] needs the frame-boundary controller
+        g.synced = !g.syncOn;
+        if (sy && sy[0] && sy[0] != '0' && !g.rbWindow) std::fprintf(stderr, "[netplay] PS2X_NET_SYNC needs PS2X_NET_ROLLBACK: ignored\n");
+        if (g.syncOn) std::fprintf(stderr, "[netplay] state sync at connect (%s)\n", g.listening ? "host publishes" : "joiner adopts");
         if (g.fakeLagMs) std::fprintf(stderr, "[netplay] fake receive lag %u ms\n", g.fakeLagMs);
     }
     if (g.active) { std::fprintf(stderr, "[netplay] already connected\n"); return false; }
@@ -346,6 +407,7 @@ void ps2NetDisconnect(const char *why)
     g.active = false; g.connected = false; g.peerKnown = false; g.listening = false;
     g.local.clear(); g.remote.clear(); g.peerHash.clear(); g.ourHash.clear();
     g.needBase = true; g.base = 0; g.checkFrame = 0; g.checkValue = 0;
+    g.synced = !g.syncOn; g.syncOffered = false; g.syncDone = false;   // [statesync]
     std::fprintf(stderr, "[netplay] disconnected (%s) -- local pads restored\n", why ? why : "requested");
 }
 
@@ -399,7 +461,7 @@ void ps2NetBeginAutoStart(const char *path)
 
 bool ps2NetAutoInput(Ps2xNetInput &out)
 {
-    if (!g_autoRunning) return false;
+    if (!g_autoRunning || !g.synced) return false;   // [statesync] the canned sequence starts once the state is shared
     if (g_autoPos >= g_auto.size())
     { g_autoRunning = false; std::fprintf(stderr, "[netplay] auto-start: sequence finished\n"); return false; }
     out = g_auto[g_autoPos++];
@@ -451,7 +513,7 @@ uint32_t ps2NetRollbackWindow() { return g.rbWindow; }
 uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
 {
     *mustStall = false;
-    if (!g.active || !g.connected || !g.rbWindow) return 0u;
+    if (!g.active || !g.connected || !g.rbWindow || !g.synced) return 0u;   // [statesync] no frame numbering before the state is shared
     pump();
     const uint32_t cur = relFrame(frameAbs);
     uint32_t rb = 0u;
@@ -478,7 +540,7 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
 void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
 {
     if (!g.active) return;
-    if (!g.connected) { sendHello(); pump(); return; }   // handshake only, no frame numbering yet
+    if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
     const uint32_t frame = relFrame(frameAbs);
     Ps2xNetInput use = in;
     if (g.testInput && ((frame / 15u) & 1u)) use.buttons = static_cast<uint16_t>(use.buttons & ~0x0004u);   // R3 pressed (active low)
@@ -492,7 +554,7 @@ void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
 
 bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
 {
-    if (!g.active || !g.connected) return false;   // pre-connection: leave the pads alone
+    if (!g.active || !g.connected || !g.synced) return false;   // pre-connection / pre-sync: leave the pads alone
     const uint32_t frame = relFrame(frameAbs);
     const bool wantLocal = (player == g.localPlayer);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(g.timeoutMs);
@@ -590,4 +652,47 @@ void ps2NetFrame(uint32_t frame)
                      g.connected ? "connected" : "WAITING",
                      (unsigned long long)g.predictions.load(), (unsigned long long)g.mispredicts.load(), (unsigned long long)g.rollbacks.load());
     }
+}
+
+// ---- [statesync] ------------------------------------------------------------------------
+bool ps2NetSyncPending() { return g.active && g.connected && g.syncOn && !g.synced; }
+bool ps2NetSyncIsHost()  { return g.listening; }
+void ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path)
+{
+    g.syncFrame = frameAbs; g.syncBytes = bytes; g.syncDone = false;
+    std::strncpy(g.syncPath, path ? path : "", sizeof g.syncPath - 1u); g.syncPath[sizeof g.syncPath - 1u] = 0;
+    sendSyncCtl(1u, frameAbs, bytes, g.syncPath);
+}
+bool ps2NetSyncWaitDone(uint32_t timeoutMs)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    auto lastOffer = t0;
+    for (;;)
+    {
+        pump();
+        if (!g.active || !g.connected) return false;
+        if (g.syncDone) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() > (long)timeoutMs) return false;
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastOffer).count() >= 200)   // UDP: repeat the offer
+        { lastOffer = now; sendSyncCtl(1u, g.syncFrame, g.syncBytes, g.syncPath); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    syncResetTables(g.syncFrame);
+    std::fprintf(stderr, "[netplay] frame base = %u (state sync)\n", g.syncFrame);
+    return true;
+}
+bool ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes, char *path, size_t pathCap)
+{
+    pump();
+    if (!g.syncOffered) return false;
+    *frameAbs = g.syncFrame; *bytes = g.syncBytes;
+    if (path && pathCap) { std::strncpy(path, g.syncPath, pathCap - 1u); path[pathCap - 1u] = 0; }
+    return true;
+}
+void ps2NetSyncApplied(uint32_t frameAbs)
+{
+    syncResetTables(frameAbs);
+    sendSyncDone(frameAbs);
+    std::fprintf(stderr, "[netplay] frame base = %u (state sync)\n", frameAbs);
 }

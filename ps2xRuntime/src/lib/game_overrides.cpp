@@ -1,4 +1,5 @@
 #include "ps2_waitprof.h"   // [waitprof]
+#include "runtime/ps2_statesync.h"   // [statesync]
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -4712,6 +4713,66 @@ namespace
         return true;
     }
     extern "C" void ps2xSimSnapFree(void *h) { delete static_cast<SimSnap *>(h); }
+    // [statesync] Portable form of the simulation snapshot (same binary on both ends: PODs go raw;
+    // the sound HLE's time points are on the virtual clock in stepped mode, so they travel as ns).
+    extern "C" bool ps2xSimSnapSerialize(const void *h, std::vector<uint8_t> &out)
+    {
+        const SimSnap *s = static_cast<const SimSnap *>(h);
+        if (!s) return false;
+        Ps2xByteW w(out);
+        w.u32(0x53494d31u);   // 'SIM1'
+        w.u64(s->frame); w.u64(s->rand64); w.u32(s->randCalls);
+        w.bytes(s->ram); w.bytes(s->sp); w.bytes(s->iop); w.bytes(s->vu0d); w.bytes(s->vu1d); w.bytes(s->vram); w.bytes(s->vu0c); w.bytes(s->vu1c);
+        w.pod(s->v0); w.pod(s->v1);
+        w.podVec(s->sinks);
+        w.pod(s->gs);
+        w.u64(s->seVoices.size());
+        for (const SeVoice &v : s->seVoices) { w.u32(v.serial); w.podVec(v.pcm); w.u64(v.pos); }
+        w.u64(s->sinksFull.size());
+        for (const auto &kv : s->sinksFull)
+        {
+            const IopSink &v = kv.second;
+            w.u32(kv.first); w.u32(v.streamId); w.u64(v.returnedBytes); w.u64(v.heldBytes); w.u8(v.wallClock); w.tp(v.wallBase);
+            w.u64(v.wallBaseBytes); w.u8(v.ringFullIdle); w.tp(v.ringFullSince); w.u8(v.frameClock); w.u64(v.frameBase); w.u64(v.frameBaseBytes);
+        }
+        w.u64(s->rings.size());
+        for (const auto &kv : s->rings) { w.u32(kv.first); w.podVec(kv.second.bufs); w.u64(kv.second.next); }
+        w.u32(s->pairSink[0]); w.u32(s->pairSink[1]); w.u64(s->pairReturns[0]); w.u64(s->pairReturns[1]);
+        w.u64(s->streamStart.size()); for (const auto &kv : s->streamStart) { w.u32(kv.first); w.tp(kv.second); }
+        w.u64(s->rateLast.size());    for (const auto &kv : s->rateLast)    { w.u32(kv.first); w.tp(kv.second); }
+        w.u64(s->seTickBase); w.u64(s->seTickCarry);
+        w.u32(0x53494d45u);   // 'SIME'
+        return true;
+    }
+    extern "C" void *ps2xSimSnapDeserialize(const uint8_t *data, size_t n, size_t *used)
+    {
+        Ps2xByteR r(data, n);
+        if (r.u32() != 0x53494d31u) return nullptr;
+        SimSnap *s = new SimSnap();
+        s->frame = r.u64(); s->rand64 = r.u64(); s->randCalls = r.u32();
+        r.bytes(s->ram); r.bytes(s->sp); r.bytes(s->iop); r.bytes(s->vu0d); r.bytes(s->vu1d); r.bytes(s->vram); r.bytes(s->vu0c); r.bytes(s->vu1c);
+        s->v0 = r.pod<VU1State>(); s->v1 = r.pod<VU1State>();
+        r.podVec(s->sinks);
+        s->gs = r.pod<GsRegSer>();
+        { const size_t k = r.count(4); s->seVoices.resize(r.ok ? k : 0);
+          for (SeVoice &v : s->seVoices) { v.serial = r.u32(); r.podVec(v.pcm); v.pos = (size_t)r.u64(); } }
+        { const size_t k = r.count(8);
+          for (size_t i = 0; i < k && r.ok; ++i)
+          {
+              const uint32_t key = r.u32(); IopSink &v = s->sinksFull[key];
+              v.streamId = r.u32(); v.returnedBytes = r.u64(); v.heldBytes = r.u64(); v.wallClock = r.u8() != 0; v.wallBase = r.tp();
+              v.wallBaseBytes = r.u64(); v.ringFullIdle = r.u8() != 0; v.ringFullSince = r.tp(); v.frameClock = r.u8() != 0; v.frameBase = r.u64(); v.frameBaseBytes = r.u64();
+          } }
+        { const size_t k = r.count(8);
+          for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); SinkRing &ring = s->rings[key]; r.podVec(ring.bufs); ring.next = (size_t)r.u64(); } }
+        s->pairSink[0] = r.u32(); s->pairSink[1] = r.u32(); s->pairReturns[0] = r.u64(); s->pairReturns[1] = r.u64();
+        { const size_t k = r.count(12); for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); s->streamStart[key] = r.tp(); } }
+        { const size_t k = r.count(12); for (size_t i = 0; i < k && r.ok; ++i) { const uint32_t key = r.u32(); s->rateLast[key] = r.tp(); } }
+        s->seTickBase = r.u64(); s->seTickCarry = r.u64();
+        if (r.u32() != 0x53494d45u || !r.ok || s->ram.size() != PS2_RAM_SIZE) { delete s; return nullptr; }
+        if (used) *used = (size_t)(r.p - data);
+        return s;
+    }
     extern "C" const uint8_t *ps2xSimSnapRam(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s && s->ram.size() == PS2_RAM_SIZE ? s->ram.data() : nullptr; }
     extern "C" uint64_t ps2xSimSnapFrame(const void *h) { const SimSnap *s = static_cast<const SimSnap *>(h); return s ? s->frame : 0u; }
     extern "C" uint64_t ps2xRamHash(const uint8_t *rdram, uint32_t skipLo, uint32_t skipHi)

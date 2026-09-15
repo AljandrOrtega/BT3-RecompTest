@@ -39,3 +39,12 @@ uint32_t ps2NetRollbackWindow();                       // 0 = lockstep as before
 // network. Returns the absolute frame to roll back to (0 = none), and sets *mustStall when a remote
 // input older than the window is still missing (the controller then waits as lockstep did).
 uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall);
+// [statesync] State sync at connect (PS2X_NET_SYNC=1; needs the rollback controller). The host publishes
+// its frame-boundary state (a file for now: PS2X_NET_SYNCFILE, visible to both), the joiner adopts it at
+// a structurally comparable boundary and acknowledges; inputs are exchanged from that frame on.
+bool     ps2NetSyncPending();                                   // connected, sync on, state not yet adopted
+bool     ps2NetSyncIsHost();
+void     ps2NetSyncOffer(uint32_t frameAbs, uint64_t bytes, const char *path);   // host: announce the blob
+bool     ps2NetSyncWaitDone(uint32_t timeoutMs);                 // host: pump until the joiner's DONE; sets the frame base
+bool     ps2NetSyncOffered(uint32_t *frameAbs, uint64_t *bytes, char *path, size_t pathCap);   // joiner: an offer arrived
+void     ps2NetSyncApplied(uint32_t frameAbs);                   // joiner: state adopted; sets the base, sends DONE

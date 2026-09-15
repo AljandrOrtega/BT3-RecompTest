@@ -9,6 +9,7 @@
 
 extern "C" void ps2xSchedSignal();   // [fibers] ps2_runtime.cpp
 extern "C" bool ps2xFrameStepOn();   // [rollback] ps2_runtime.cpp
+extern "C" uint64_t *ps2xParkSlot(int idx);   // [statesync] ps2_runtime.cpp: the parked fiber's runtime-owned wait target
 namespace ps2_syscalls
 {
     namespace interrupt_state
@@ -595,13 +596,18 @@ namespace ps2_syscalls
         std::unique_lock<std::mutex> lock(g_vsync_flag_mutex);
         uint64_t current = g_vsync_tick_counter;
         uint64_t result = current;
+        // [statesync] The tick this wait is measured from lives in a runtime-owned slot, not in the
+        // closure: a synced peer adopts the host's slot along with the host's tick counter, so the
+        // parked fiber wakes on the same vblank as the host's did.
+        uint64_t *target = ps2xParkSlot(1);
+        *target = current;
         // [fibers] Host-driven (the vblank worker signals it), but it must still PARK the fiber: a raw
         // cv wait blocks the shared host thread, so no other guest fiber ran during the frame wait --
         // which under threads (token released) is where the loader and sound threads got most of
         // their time. The predicate only reads the counter, so re-checking it per probe is free.
         waitGuestUntil(
             runtime, lock, g_vsync_cv,
-            [current, runtime]() { return g_vsync_tick_counter > current || (runtime != nullptr && runtime->isStopRequested()); },
+            [target, runtime]() { return g_vsync_tick_counter > *target || (runtime != nullptr && runtime->isStopRequested()); },
             WP_SYNC_OTHER,
             [&]() { result = g_vsync_tick_counter; });
         return result;

@@ -204,6 +204,15 @@ size_t ps2xFiberLiveStack(const Ps2xFiber *f, const uint8_t **outBase)
 }
 
 // [rollback] blob = [ucontext_t][uint64_t liveSize][live stack bytes, lowest address first].
+const void *ps2xFiberUContext(const Ps2xFiber *f)
+{
+#if defined(PS2X_FIBER_UCTX)
+    return (f && !f->entry) ? static_cast<const void *>(&f->ctx) : nullptr;
+#else
+    (void)f; return nullptr;
+#endif
+}
+
 size_t ps2xFiberSnapshotSize(const Ps2xFiber *f)
 {
 #if defined(PS2X_FIBER_UCTX)

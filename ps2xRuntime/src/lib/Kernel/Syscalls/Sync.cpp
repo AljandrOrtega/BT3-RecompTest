@@ -1,3 +1,5 @@
+#include <cstdint>
+extern "C" void ps2xParkArg(uint64_t arg);   // [statesync] ps2_runtime.cpp: the wait's guest-derived argument, for the park signature
 #include "ps2_waitprof.h"   // [waitprof]
 #include "Common.h"
 #include "Sync.h"
@@ -330,6 +332,7 @@ namespace ps2_syscalls
             }
 
             sema->waiters++;
+            ps2xParkArg((uint64_t)sid);   // [statesync]
             // [fibers] A semaphore is signalled by another GUEST thread, so the same reasoning as
             // SleepThread applies: under PS2X_FIBERS the signaller shares this host thread. The
             // predicate only TESTS count > 0 -- the decrement happens in finishFn below -- so it is
@@ -718,6 +721,7 @@ namespace ps2_syscalls
 
             info->waiters++;
             waitedWithGuestRelease = true;
+            ps2xParkArg(((uint64_t)mode << 32) | waitBits);   // [statesync] the pattern this park depends on
             // [fibers] Event flags are set by other guest threads. `satisfied` only tests the
             // pattern; the clear-on-wake happens in finishFn, so re-evaluating it is side-effect
             // free -- which the fiber path requires.

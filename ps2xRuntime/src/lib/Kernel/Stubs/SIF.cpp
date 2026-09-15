@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "runtime/ps2_statesync.h"   // [statesync]
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
 
@@ -1143,7 +1144,7 @@ extern "C" void *ps2xSifStateCapture()
       s->cmdHandlers = ps2_stubs::g_sifCmdHandlers; s->cmdBuffer = ps2_stubs::g_sifCmdBuffer; s->sysCmdBuffer = ps2_stubs::g_sifSysCmdBuffer;
       s->cmdInitialized = ps2_stubs::g_sifCmdInitialized; }
     { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifHeapMutex); s->heap = ps2_stubs::g_sifHeapAllocations;
-    }
+      s->heapNext = g_iopHeapNext; }   // [statesync] the bump cursor, so a synced peer allocates the same IOP addresses
     return s;
 }
 extern "C" bool ps2xSifStateRestore(void *h)
@@ -1155,7 +1156,29 @@ extern "C" bool ps2xSifStateRestore(void *h)
       ps2_stubs::g_sifCmdHandlers = s->cmdHandlers; ps2_stubs::g_sifCmdBuffer = s->cmdBuffer; ps2_stubs::g_sifSysCmdBuffer = s->sysCmdBuffer;
       ps2_stubs::g_sifCmdInitialized = s->cmdInitialized; }
     { std::lock_guard<std::mutex> lk(ps2_stubs::g_sifHeapMutex); ps2_stubs::g_sifHeapAllocations = s->heap;
-    }
+      if (s->heapNext) g_iopHeapNext = s->heapNext; }
     return true;
 }
 extern "C" void ps2xSifStateFree(void *h) { delete static_cast<SifSnap *>(h); }
+// [statesync] portable form
+extern "C" bool ps2xSifStateSerialize(const void *h, std::vector<uint8_t> &out)
+{
+    const SifSnap *s = static_cast<const SifSnap *>(h);
+    if (!s) return false;
+    Ps2xByteW w(out);
+    w.u32(0x53494631u);   // 'SIF1'
+    w.u32(s->nextDmaId); w.u32(s->cmdBuffer); w.u32(s->sysCmdBuffer); w.u32(s->heapNext); w.u8(s->cmdInitialized);
+    w.podUMap(s->regs); w.podUMap(s->sregs); w.podUMap(s->cmdHandlers); w.podMap(s->heap);
+    return true;
+}
+extern "C" void *ps2xSifStateDeserialize(const uint8_t *data, size_t n, size_t *used)
+{
+    Ps2xByteR r(data, n);
+    if (r.u32() != 0x53494631u) return nullptr;
+    SifSnap *s = new SifSnap();
+    s->nextDmaId = r.u32(); s->cmdBuffer = r.u32(); s->sysCmdBuffer = r.u32(); s->heapNext = r.u32(); s->cmdInitialized = r.u8() != 0;
+    r.podUMap(s->regs); r.podUMap(s->sregs); r.podUMap(s->cmdHandlers); r.podMap(s->heap);
+    if (!r.ok) { delete s; return nullptr; }
+    if (used) *used = (size_t)(r.p - data);
+    return s;
+}
