@@ -87,6 +87,14 @@ OS_COMPONENTS = {
     "wldap32.dll",
     "wtsapi32.dll",
     "dbghelp.dll",
+    # Video capture (AVICAP32), authorization (AUTHZ), DNS, DirectWrite
+    "avicap32.dll",
+    "authz.dll",
+    "dnsapi.dll",
+    "dwrite.dll",
+    # ODBC driver manager (ships with Windows; Qt SQL plugin imports it)
+    "odbc32.dll",
+    "odbcint.dll",
 }
 OS_COMPONENTS = {name.lower() for name in OS_COMPONENTS}
 

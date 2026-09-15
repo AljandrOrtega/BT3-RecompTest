@@ -493,8 +493,13 @@ elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
 endif()
 
+set(RUNNER_RESOURCES "")
+if(WIN32)
+    set(RUNNER_RESOURCES "${CMAKE_CURRENT_SOURCE_DIR}/bt3.rc")
+endif()
 add_executable(ps2EntryRunner
     ${RUNNER_SRC_FILES}
+    ${RUNNER_RESOURCES}
 )
 
 # The overlay's single 20MB TU and its register file must not be unity-batched
