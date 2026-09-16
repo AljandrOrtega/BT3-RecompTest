@@ -24,6 +24,7 @@ void ps2AddrWatchEnable(const char *hex);
 void ps2StoreTraceEnable(const char *spec);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
 extern std::atomic<uint32_t> g_bt3StateLive;    // [fightgate] BT3's top-level state, as seen by the status probe (ps2_runtime.cpp)
+extern std::atomic<uint64_t> g_vu1PairCount;    // [fightgate] VU1 instruction pairs run by the fight's programs (ps2_vu1.cpp)
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
 // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
 std::atomic<bool> g_ps2xFrameGateHeavy{false};
@@ -5585,7 +5586,20 @@ namespace
             // PS2X_FRAMEGATE_FIGHT=0 restores the load-only rule.
             static const bool s_fightGate = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FIGHT"); return !(v && v[0] == '0'); }();
             const uint32_t stLive = g_bt3StateLive.load(std::memory_order_relaxed);
-            const bool inFight = s_fightGate && (stLive == 0x27u || stLive == 0x28u || stLive == 0x2du);
+            const bool fightState = (stLive == 0x27u || stLive == 0x2du);
+            // The FIGHT-LOAD shares state 0x27 with the fight, and gating it halved the loader (its CD
+            // pump is per frame): 13 s at 29 fps instead of 6 s at 60 (2026-09-17). What separates them
+            // is the guest's own render work: a loading/minigame frame runs none of the fight's VU1
+            // programs (vu1pairs = 0), a fight frame runs ~3M pairs. Latch "the fight is rendering" on
+            // the first frame with real VU1 work and hold it for the rest of the fight state.
+            static uint64_t s_lastPairs = 0; static bool s_fightRendering = false;
+            {
+                const uint64_t pairs = g_vu1PairCount.load(std::memory_order_relaxed);
+                const uint64_t delta = pairs - s_lastPairs; s_lastPairs = pairs;
+                if (!fightState) s_fightRendering = false;
+                else if (delta > 200000ull) s_fightRendering = true;
+            }
+            const bool inFight = s_fightGate && fightState && s_fightRendering;
             g_ps2xFrameGateHeavy.store(s_gate && heavy && PS2Memory::asyncKickEnabled(), std::memory_order_relaxed);   // [syncrelax]
             // [rollback] in frame-stepped mode the controller paces vblanks; a host sleep here would only starve them
             if (s_gate && (heavy || inFight) && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
