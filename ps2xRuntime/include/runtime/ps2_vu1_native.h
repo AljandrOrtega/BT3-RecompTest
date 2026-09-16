@@ -23,7 +23,7 @@ class PS2Memory;
 // leave VU1State and data memory exactly as the generic code would (VERIFY compares both),
 // including the incidental end-of-run registers.
 //
-// PS2X_VUNATIVE=1 enables (default off until the gates pass); PS2X_VUJIT_VERIFY=1 and
+// PS2X_VUNATIVE=0 disables (default on since 2026-09-17); PS2X_VUJIT_VERIFY=1 and
 // PS2X_GIFCMP=1 then validate the kernel against the interpreter on every kick.
 namespace vu1native
 {

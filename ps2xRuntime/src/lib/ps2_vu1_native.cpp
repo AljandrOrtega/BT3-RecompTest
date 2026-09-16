@@ -464,7 +464,9 @@ namespace vu1native
 
     bool enabled()
     {
-        static const bool s_on = [](){ const char *v = std::getenv("PS2X_VUNATIVE"); return v && v[0] && v[0] != '0'; }();
+        // Default ON since 2026-09-17: gate 11.92M kicks / 0 mismatches, user-validated in a heavy-map
+        // splitscreen fight. PS2X_VUNATIVE=0 restores the generic recompiled programs.
+        static const bool s_on = [](){ const char *v = std::getenv("PS2X_VUNATIVE"); return !(v && v[0] == '0'); }();
         return s_on;
     }
 
