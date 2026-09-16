@@ -2,8 +2,7 @@
 #include "ps2_host_backend.h"
 
 #if defined(PS2X_HAVE_SDL2)
-#define SDL_MAIN_HANDLED
-#include <SDL.h>
+#include "ps2_host_sdl.h"
 #endif
 
 #include <algorithm>
