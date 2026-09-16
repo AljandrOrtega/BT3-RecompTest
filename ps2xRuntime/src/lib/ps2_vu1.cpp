@@ -1165,7 +1165,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                         if (!s_bound) { s_bound = true; vu1native::Ctx c; c.clipWait = &g_clipWait; c.pendingClip = &g_pendingClip; c.pairCount = &g_vu1PairCount; vu1native::bind(c); }
                         vu1native::setGeneric(s_jitProg->hash, s_jitProg->fn);
                         s_runFn = k;
-                        std::fprintf(stderr, "[vunative] program %016llx runs the native kernel\n", (unsigned long long)s_jitProg->hash);
+                        static thread_local uint64_t s_said[8] = {}; bool said = false;   // once per program, not per upload
+                        for (uint64_t &h : s_said) { if (h == s_jitProg->hash) { said = true; break; } if (!h) { h = s_jitProg->hash; break; } }
+                        if (!said) std::fprintf(stderr, "[vunative] program %016llx runs the native kernel\n", (unsigned long long)s_jitProg->hash);
                     }
             }
         }

@@ -230,6 +230,99 @@ namespace vu1native
             if (g_ctx.pairCount) g_ctx.pairCount->fetch_add(cyc + 4u, std::memory_order_relaxed);
             vu.xgkickImpl(2u, vuData, dataSize, gs, memory);   // XGKICK vi02
         }
+        // ---- 925edd7c: single-pass two-bone skinned tristrip ---------------------------------
+        // Listing: work/vu1dis_925edd7c.txt. Model: work/rig/vu1ref_925edd7c.py. Header at TOP:
+        // [0] A+D giftag, [1] TEX0, [2..3] unused, [4] geometry tag (x = count); vertices from
+        // TOP+5: P (w = weight), unused, T. Output at TOP+5+252: header + count*3 of
+        // [ST*Q, vf09 (colour left by the setup pass), FTOI4]. No ADC marking (the FCAND branch
+        // only skips a NOP). Entries 0x80 / 0x318 (the B 0x80 stub).
+        constexpr uint64_t kHash925edd7c = 0x7e8efb7575b22f69ull;
+        Fn g_generic925edd7c = nullptr;
+
+        void kernel925edd7c(VU1Interpreter &vu, VU1State &st, uint8_t *vuData, uint32_t dataSize,
+                            GS &gs, PS2Memory *memory, uint32_t maxCycles)
+        {
+            const uint32_t entryPc = st.pc;
+            const uint32_t top = st.top & 0x3FFu;
+            const uint32_t countRaw = *reinterpret_cast<const uint32_t *>(vuData + (((top + 4u) * 16u) & (dataSize - 1u)));
+            const int32_t count = (int32_t)(countRaw & 0x7FFFu);
+            if ((entryPc != 0x80u && entryPc != 0x318u) || count <= 0 || dataSize < 16384u)
+            {
+                g_generic925edd7c(vu, st, vuData, dataSize, gs, memory, maxCycles);
+                return;
+            }
+            __m128 A[4], B[4], E[4], F[4];
+            for (int i = 0; i < 4; ++i)
+            {
+                A[i] = ldq(vuData, dataSize, 0u + i);  B[i] = ldq(vuData, dataSize, 4u + i);
+                E[i] = ldq(vuData, dataSize, 11u + i); F[i] = ldq(vuData, dataSize, 15u + i);
+            }
+            const __m128 vf30 = vf(st, 30), vf31 = vf(st, 31), vf09 = vf(st, 9);
+            const __m128 h0 = ldq(vuData, dataSize, top + 0u), h1 = ldq(vuData, dataSize, top + 1u),
+                         h4 = ldq(vuData, dataSize, top + 4u);
+            const int16_t vi03Hdr = i16((int32_t)top + 5);
+            const int16_t vi02 = i16(vi03Hdr + 252);
+            int16_t vi07 = i16(vi02 + 3);
+            int16_t vi03 = vi03Hdr;
+            stq(vuData, dataSize, (uint16_t)vi02 + 0u, h0); stq(vuData, dataSize, (uint16_t)vi02 + 1u, h1); stq(vuData, dataSize, (uint16_t)vi02 + 2u, h4);
+
+            uint32_t clip = (*g_ctx.clipWait > 0u) ? *g_ctx.pendingClip : st.clip;
+            uint64_t cyc = (entryPc == 0x318u ? 2u : 0u) + 24u;
+            __m128 acc = _mm_setzero_ps();
+            __m128 P = ldq(vuData, dataSize, (uint16_t)vi03), N = _mm_setzero_ps(), T, vf28, vf29, vf20 = _mm_setzero_ps(), vf24 = _mm_setzero_ps(), vf25 = _mm_setzero_ps(), vf22 = _mm_setzero_ps();
+            __m128i vf29i;
+            float q = st.q;
+            int vi01 = 0;
+            vf28 = _mm_sub_ps(P, vf30); vf29 = _mm_sub_ps(P, vf31);
+            vf28 = xformAcc(A, vf28, acc);
+            for (int32_t v = 0; v < count; ++v)
+            {
+                N = ldq(vuData, dataSize, (uint16_t)vi03 + 1u);                     // LQ vf21 (unused)
+                vf29 = xformAcc(B, vf29, acc);
+                vf20 = _mm_sub_ps(vf28, vf29);
+                vf20 = _mm_mul_ps(vf20, bc(P, 3));
+                vf20 = _mm_add_ps(vf29, vf20);
+                vf24 = xformAcc(E, vf20, acc);
+                vf25 = xformAcc(F, vf20, acc);
+                {
+                    alignas(16) float t[4]; _mm_store_ps(t, vf24);
+                    const float den = t[3];
+                    q = (den != 0.0f) ? vuClampFloat(1.0f / den) : FLT_MAX;
+                }
+                T = ldq(vuData, dataSize, (uint16_t)vi03 + 2u);
+                clip = ((clip << 6) | clipFlags(vf25)) & 0xFFFFFFu;
+                const __m128 qv = _mm_set1_ps(q);
+                vf24 = _mm_mul_ps(vf24, qv);
+                vf22 = xyzOf(T, _mm_mul_ps(T, qv));
+                vi01 = (clip & 0x3FFFFu) != 0u ? 1 : 0;
+                stq(vuData, dataSize, (uint16_t)vi07 + 0u, vf22);                   // SQ vf22, 0(vi07)
+                vi03 = i16(vi03 + 3);
+                vf29i = ftoi4(vf24);
+                P = ldq(vuData, dataSize, (uint16_t)vi03);                          // LQ vf19 (next / stale)
+                vf28 = _mm_sub_ps(P, vf30);
+                stqi(vuData, dataSize, (uint16_t)vi07 + 2u, vf29i);                 // SQ vf29, 2(vi07)
+                vf29 = _mm_sub_ps(P, vf31);
+                acc = _mm_mul_ps(A[0], bc(vf28, 0));
+                acc = _mm_add_ps(acc, _mm_mul_ps(A[1], bc(vf28, 1)));
+                vi07 = i16(vi07 + 3);
+                acc = _mm_add_ps(acc, _mm_mul_ps(A[2], bc(vf28, 2)));
+                stq(vuData, dataSize, (uint16_t)(int16_t)(vi07 - 2), vf09);         // SQ vf09, -2(vi07)
+                vf28 = _mm_add_ps(acc, _mm_mul_ps(A[3], _mm_set1_ps(1.0f)));
+                cyc += (v + 1 < count) ? 56u : 59u;
+            }
+            for (int i = 0; i < 4; ++i) { setvf(st, 1 + i, A[i]); setvf(st, 5 + i, B[i]); }
+            setvf(st, 19, P); setvf(st, 20, vf20); setvf(st, 21, N); setvf(st, 22, vf22);
+            setvf(st, 24, vf24); setvf(st, 25, vf25); setvf(st, 26, h0); setvf(st, 27, h1);   // the header LQIs survive the loop here
+            setvf(st, 28, vf28); setvf(st, 29, vf29);
+            _mm_storeu_ps(st.acc, acc);
+            st.vi[1] = vi01; st.vi[2] = vi02; st.vi[3] = vi03; st.vi[7] = vi07;
+            st.vi[10] = 0; st.vi[11] = 0x7FFF;
+            st.q = q; st.pendingQ = q; st.qWait = 0u;
+            st.clip = clip; *g_ctx.pendingClip = clip; *g_ctx.clipWait = 0u;
+            st.pc = 0x318u; st.ebit = true;
+            if (g_ctx.pairCount) g_ctx.pairCount->fetch_add(cyc, std::memory_order_relaxed);
+            vu.xgkickImpl(2u, vuData, dataSize, gs, memory);
+        }
     } // namespace
 
     void bind(const Ctx &ctx) { g_ctx = ctx; }
@@ -243,11 +336,13 @@ namespace vu1native
     Fn lookup(uint64_t hash)
     {
         if (hash == kHash3b5dfe97) return &kernel3b5dfe97;
+        if (hash == kHash925edd7c) return &kernel925edd7c;
         return nullptr;
     }
 
     void setGeneric(uint64_t hash, Fn generic)
     {
         if (hash == kHash3b5dfe97) g_generic3b5dfe97 = generic;
+        if (hash == kHash925edd7c) g_generic925edd7c = generic;
     }
 }
