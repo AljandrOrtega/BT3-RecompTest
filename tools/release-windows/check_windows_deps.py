@@ -77,6 +77,7 @@ OS_COMPONENTS = {
     "userenv.dll",
     "wtsapi32.dll",
     "cfgmgr32.dll",
+    "d2d1.dll",
     "d3d11.dll",
     "d3d9.dll",
     "dxgi.dll",

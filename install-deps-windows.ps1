@@ -36,6 +36,16 @@ function Test-FileCmd($name) {
     return [bool](Get-Command $exe -ErrorAction SilentlyContinue)
 }
 
+# Run a native command line through cmd.exe so pip/aqtinstall progress and
+# warnings written to stderr do not become terminating NativeCommandError
+# records under $ErrorActionPreference = "Stop".
+function Invoke-CmdLine([string]$Line) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { cmd.exe /d /s /c $Line } finally { $ErrorActionPreference = $prev }
+    return $LASTEXITCODE
+}
+
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 
 Step "Checking prerequisites"
@@ -72,8 +82,8 @@ if ($missing.Count -gt 0) {
 $pipPresent = $false
 if (Test-FileCmd "python") {
     Step "Installing Python packages (aqtinstall, pefile)"
-    python -m pip install --quiet --upgrade aqtinstall pefile 2>$null
-    if ($LASTEXITCODE -ne 0) { Fail "pip install failed" }
+    $pipRc = Invoke-CmdLine "python -m pip install --quiet --upgrade --disable-pip-version-check --no-warn-script-location aqtinstall pefile 2>nul"
+    if ($pipRc -ne 0) { Fail "pip install failed (exit $pipRc)" }
     $pipPresent = $true
     Log "aqtinstall + pefile ready"
 }
@@ -84,8 +94,8 @@ if ($pipPresent) {
         Log "Qt found at $QT_ROOT"
     } else {
         Step "Downloading Qt $QT_VERSION ($QT_HOST, $QT_TARGET) via aqtinstall"
-        python -m aqt install-qt $QT_HOST desktop $QT_VERSION $QT_TARGET --outputdir $QT_BASE
-        if ($LASTEXITCODE -ne 0) { Fail "aqt install-qt failed (exit $LASTEXITCODE)" }
+        $aqtRc = Invoke-CmdLine "python -m aqt install-qt $QT_HOST desktop $QT_VERSION $QT_TARGET --outputdir `"$QT_BASE`" 2>nul"
+        if ($aqtRc -ne 0) { Fail "aqt install-qt failed (exit $aqtRc)" }
         if (-not (Test-Path $QT_ROOT)) { Fail "Qt not found at $QT_ROOT after install" }
         Log "Qt installed: $QT_ROOT"
     }

@@ -11,6 +11,7 @@
 namespace texpack
 {
 const char *const kUrl = "https://pixeldrain.com/api/file/5UzM4yox";
+const char *const kPageUrl = "https://pixeldrain.com/u/5UzM4yox";
 const char *const kFileName = "Texture-4k.7z";
 const char *const kSha256 = "9d2d225d281545b08b3a8f4f02f2ebf79c8a6d61d62b84fea7db0fb5b569ed6f";
 
