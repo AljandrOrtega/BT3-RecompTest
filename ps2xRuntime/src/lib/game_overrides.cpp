@@ -23,6 +23,7 @@ void ps2HalfStepNoteLogic(uint64_t frame);
 void ps2AddrWatchEnable(const char *hex);
 void ps2StoreTraceEnable(const char *spec);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
+extern std::atomic<uint32_t> g_bt3StateLive;    // [fightgate] BT3's top-level state, as seen by the status probe (ps2_runtime.cpp)
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
 // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
 std::atomic<bool> g_ps2xFrameGateHeavy{false};
@@ -5571,10 +5572,23 @@ namespace
             // PS2X_FRAMEGATE_FORCEHEAVY=1 (dev): treat every frame as heavy on a fast box, to exercise the gated +
             // relaxed-pacing path that slow machines take (the vblank period itself stays real).
             static const bool s_forceHeavy = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCEHEAVY"); return v && v[0] && v[0] != '0'; }();
-            const bool heavy = s_forceHeavy || g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
+            // PS2X_FRAMEGATE_FORCELIGHT=1 (dev): the opposite -- treat every frame as light, to reproduce on a
+            // slow box what a fast one does when the render fits in a vsync.
+            static const bool s_forceLight = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FORCELIGHT"); return v && v[0] && v[0] != '0'; }();
+            const bool heavy = s_forceHeavy || (!s_forceLight && g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs);
+            // [fightgate] The heavy test alone ties GAME SPEED to host performance: a machine whose render
+            // fits in one vsync (a 3070 Ti, 2026-09-17, right after the native VU1 kernels lightened the
+            // worker) is never "heavy", so the fight loop runs every vblank -- 40-60 fps of game logic,
+            // i.e. fast-forward, exactly the async failure described above, now on the fast machines. The
+            // console's 30 in fights is a property of the FIGHT, not of the load, so gate on the state:
+            // 0x27 (fight), 0x28 (team/DP battle), 0x2d (in-fight). Menus (0x04) stay ungated at 60.
+            // PS2X_FRAMEGATE_FIGHT=0 restores the load-only rule.
+            static const bool s_fightGate = [](){ const char *v = std::getenv("PS2X_FRAMEGATE_FIGHT"); return !(v && v[0] == '0'); }();
+            const uint32_t stLive = g_bt3StateLive.load(std::memory_order_relaxed);
+            const bool inFight = s_fightGate && (stLive == 0x27u || stLive == 0x28u || stLive == 0x2du);
             g_ps2xFrameGateHeavy.store(s_gate && heavy && PS2Memory::asyncKickEnabled(), std::memory_order_relaxed);   // [syncrelax]
             // [rollback] in frame-stepped mode the controller paces vblanks; a host sleep here would only starve them
-            if (s_gate && heavy && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
+            if (s_gate && (heavy || inFight) && PS2Memory::asyncKickEnabled() && !ps2xFrameStepOn())
             {
                 static uint64_t s_lastTick = 0;
                 // [fps60gate] The 2-tick target IS a 30 fps lock: two vsyncs at 60 Hz = 33.3 ms. That is
