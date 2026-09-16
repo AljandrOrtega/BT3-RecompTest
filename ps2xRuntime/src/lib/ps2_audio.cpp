@@ -27,6 +27,22 @@ namespace ps2_vag
 // the frame stalls of the 4K FMV override upload without crackling.
 static constexpr size_t kStreamChunkFrames = 2048;
 
+// Mono streams (voice rings, the HLE SE mix) top up in smaller steps where the backend allows it:
+// 512-frame chunks, four deep, so the device still holds the same 2048 frames but a feed happens
+// every ~23 ms instead of every ~93 ms. That matters for the SE mix, whose producer only refills
+// once our ring drops below its 3072-sample target: with 2048-frame chunks the refills came
+// every 93-126 ms, straddling the 100 ms "one-shot idle" rule below, which then padded silence
+// INTO a sound that was still playing (the crackle on the memory-card prompt). raylib has
+// exactly two sub-buffers, so it keeps the old geometry.
+static uint32_t monoChunkFrames()
+{
+    return ps2x_audio::supportsDepth() ? 512u : static_cast<uint32_t>(kStreamChunkFrames);
+}
+static uint32_t monoDepth()
+{
+    return ps2x_audio::supportsDepth() ? 4u : 2u;
+}
+
 struct PS2AudioBackend::Impl
 {
     struct DeviceProgress
@@ -295,9 +311,14 @@ void PS2AudioBackend::onStreamPcm(uint32_t streamId, const int16_t *samples, uin
     {
         static std::atomic<uint32_t> n{0};
         const uint32_t k = n.fetch_add(1);
-        if (k < 6u || (k % 100u) == 0u)
-            std::fprintf(stderr, "[sndplay] recv #%u stream=%u samples=%u rate=%u backlog=%zu\n",
-                         k + 1u, streamId, sampleCount, st.sampleRate, st.ring.size());
+        static const bool s_diag = [](){ const char *v = std::getenv("PS2X_SNDDIAG"); return v && v[0] && v[0] != '0'; }();
+        if (k < 6u || (k % 100u) == 0u || s_diag)
+        {
+            static const auto s_t0 = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[sndplay] t=%.3fs recv #%u stream=%u samples=%u rate=%u backlog=%zu started=%d\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count(),
+                         k + 1u, streamId, sampleCount, st.sampleRate, st.ring.size(), st.started ? 1 : 0);
+        }
     }
 
     // Accept everything here. Trimming is done in serviceStreams instead, because dropping
@@ -436,6 +457,23 @@ void PS2AudioBackend::serviceStreams()
     }
     if (!m_audioReady)
         return;
+
+    {   // [snddiag] PS2X_SNDDIAG=1: this is the only feeder, once per present. A gap between
+        // calls longer than the device's slack (2 chunks) is an underrun by construction, so
+        // name the gaps: a crackle that lines up with one is a render-thread stall, not audio.
+        static const bool s_diag = [](){ const char *v = std::getenv("PS2X_SNDDIAG"); return v && v[0] && v[0] != '0'; }();
+        if (s_diag)
+        {
+            static auto s_t0 = std::chrono::steady_clock::now();
+            static auto s_last = s_t0;
+            const auto now = std::chrono::steady_clock::now();
+            const double gapMs = std::chrono::duration<double, std::milli>(now - s_last).count();
+            if (gapMs > 25.0)
+                std::fprintf(stderr, "[snddiag] t=%.3fs serviceStreams gap %.1f ms\n",
+                             std::chrono::duration<double>(now - s_t0).count(), gapMs);
+            s_last = now;
+        }
+    }
 
     std::lock_guard<std::mutex> lock(m_streamMutex);
 
@@ -715,17 +753,21 @@ void PS2AudioBackend::serviceStreams()
             return 1u;
         }();
 
+        const size_t chunkFrames = monoChunkFrames();
         if (!st.opened)
         {
             // The host refills a stream in fixed-size sub-buffers. Feeding fewer frames than
             // a whole sub-buffer leaves the remainder unfilled, which is heard as rapid
             // dropouts (~10/sec) that sound like pause/unpause stutter. The sub-buffer size
             // is pinned at open and we always hand over exactly that many frames.
-            m_impl->streams[id] = ps2x_audio::openStream(st.sampleRate, s_channels, kStreamChunkFrames);
+            const uint32_t depth = monoDepth();
+            m_impl->streams[id] = ps2x_audio::openStream(st.sampleRate, s_channels,
+                                                         static_cast<uint32_t>(chunkFrames), depth);
             st.opened = true;
             m_impl->deviceProgress[id] = {};
-            std::fprintf(stderr, "[sndplay] opened stream=%u rate=%u channels=%u\n",
-                         id, st.sampleRate, s_channels);
+            m_impl->deviceProgress[id].primingSlots = depth;   // every sub-buffer starts empty
+            std::fprintf(stderr, "[sndplay] opened stream=%u rate=%u channels=%u chunk=%zu x%u\n",
+                         id, st.sampleRate, s_channels, chunkFrames, depth);
         }
         const ps2x_audio::Stream s = m_impl->streams[id];
 
@@ -751,10 +793,10 @@ void PS2AudioBackend::serviceStreams()
             }
             return 100;
         }();
-        if (!st.ring.empty() && (st.ring.size() % (kStreamChunkFrames * s_channels)) != 0u &&
+        if (!st.ring.empty() && (st.ring.size() % (chunkFrames * s_channels)) != 0u &&
             ps2xStreamIdleMs(id) >= s_idleMs)
         {
-            const size_t chunk = kStreamChunkFrames * s_channels;
+            const size_t chunk = chunkFrames * s_channels;
             const size_t padded = ((st.ring.size() + chunk - 1u) / chunk) * chunk;
             static std::atomic<uint32_t> p{0};
             const uint32_t k = p.fetch_add(1);
@@ -786,7 +828,7 @@ void PS2AudioBackend::serviceStreams()
             // The idle case is the one-shot above: the sound is already complete, so the
             // cushion has no underrun to protect against and waiting for it means silence.
             const bool complete = ps2xStreamIdleMs(id) >= s_idleMs;
-            const size_t need = (st.forceStart || complete) ? kStreamChunkFrames * s_channels
+            const size_t need = (st.forceStart || complete) ? chunkFrames * s_channels
                                                             : s_cushion * s_channels;
             if (st.ring.size() < need)
                 continue;
@@ -802,7 +844,7 @@ void PS2AudioBackend::serviceStreams()
         {
             // Only ever hand over a COMPLETE sub-buffer; a short feed is what causes the
             // stutter. If we do not have a full one yet, leave it for the next frame.
-            const size_t chunk = kStreamChunkFrames * s_channels;
+            const size_t chunk = chunkFrames * s_channels;
             if (st.ring.size() < chunk)
                 break;
             auto &dev = m_impl->deviceProgress[id];
@@ -826,12 +868,12 @@ void PS2AudioBackend::serviceStreams()
                 std::vector<int16_t> scaled(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
                 for (auto &v : scaled) v = static_cast<int16_t>(v * sfxVol);
                 // updateStream counts FRAMES, not samples.
-                ps2x_audio::updateStream(s, scaled.data(), static_cast<uint32_t>(kStreamChunkFrames));
+                ps2x_audio::updateStream(s, scaled.data(), static_cast<uint32_t>(chunkFrames));
             }
             else
             {
                 // updateStream counts FRAMES, not samples.
-                ps2x_audio::updateStream(s, st.ring.data(), static_cast<uint32_t>(kStreamChunkFrames));
+                ps2x_audio::updateStream(s, st.ring.data(), static_cast<uint32_t>(chunkFrames));
             }
             st.ring.erase(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
             st.fed += chunk;

@@ -1859,7 +1859,15 @@ namespace
             {
                 const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
                 if (prog.pending >= kSeTargetPending)
+                {
+                    // The target IS this stream's whole cushion -- nothing more is produced until
+                    // the device drains some -- so tell the backend to start with it. Without this
+                    // it waited for the 100 ms "one-shot idle" rule to fire, which also padded the
+                    // partial chunk with silence: the click on the memory-card prompt sound.
+                    if (prog.known && !prog.started)
+                        runtime->audioBackend().requestStreamStart(kSeStreamId);
                     return;
+                }
             }
             int32_t acc[kSeChunk];
             std::memset(acc, 0, sizeof(acc));
@@ -1898,7 +1906,12 @@ namespace
             {
                 if (!ps2xAudioFeedOn()) continue;
                 const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
-                if (prog.known && prog.pending >= kSeTargetPending) continue;
+                if (prog.known && prog.pending >= kSeTargetPending)
+                {
+                    if (!prog.started)
+                        runtime->audioBackend().requestStreamStart(kSeStreamId);   // same as the wall-clock path
+                    continue;
+                }
             }
             runtime->audioBackend().onStreamPcm(kSeStreamId, out,
                                                 static_cast<uint32_t>(used), kSeMixRate);

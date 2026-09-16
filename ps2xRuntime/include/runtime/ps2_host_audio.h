@@ -25,7 +25,12 @@ namespace ps2x_audio
     bool ready();
 
     using Stream = uint32_t;   // 0 = none
-    Stream openStream(uint32_t sampleRate, uint32_t channels, uint32_t chunkFrames);
+    // `depth` = number of sub-buffers (raylib has exactly 2 and ignores anything else; the SDL
+    // backend honours it: processed <=> fewer than depth-1 chunks still queued). A finer chunk
+    // with a deeper queue keeps the same audio in the device but tops it up in smaller steps,
+    // which is what a producer paced by our queue level needs -- see the SE stream.
+    bool supportsDepth();
+    Stream openStream(uint32_t sampleRate, uint32_t channels, uint32_t chunkFrames, uint32_t depth = 2);
     void closeStream(Stream s);
     void playStream(Stream s);
     void stopStream(Stream s);

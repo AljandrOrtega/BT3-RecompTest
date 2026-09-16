@@ -101,10 +101,18 @@ namespace ps2x_audio
             struct SStream
             {
                 SDL_AudioStream *cvt = nullptr;
-                uint32_t rate = 0, channels = 0, chunk = 0;
+                uint32_t rate = 0, channels = 0, chunk = 0, depth = 2;
                 double queuedIn = 0.0;   // input frames handed over and not yet pulled by the device
                 bool playing = false;
+                // [snddiag] device callbacks that found this stream short (silence went out).
+                uint32_t underruns = 0, underrunFrames = 0, reported = 0;
+                bool lastGotFull = false;
             };
+            // [snddiag] PS2X_SNDDIAG=1: report every underrun from the feed side (never printf
+            // on the device thread), with the time since the device opened.
+            bool s_diag = false;
+            Uint64 s_t0 = 0;
+            double nowS() { return double(SDL_GetPerformanceCounter() - s_t0) / double(SDL_GetPerformanceFrequency()); }
             struct SSound
             {
                 SDL_AudioStream *cvt = nullptr;
@@ -115,19 +123,23 @@ namespace ps2x_audio
             uint32_t s_devRate = 48000;
             std::vector<float> s_tmp;
 
-            void mix(float *out, int frames, SDL_AudioStream *cvt, double *queuedIn, uint32_t inRate)
+            // Returns device frames actually mixed.
+            int mix(float *out, int frames, SDL_AudioStream *cvt, double *queuedIn, uint32_t inRate)
             {
                 const int bytes = frames * 2 * int(sizeof(float));
                 if (int(s_tmp.size()) < frames * 2) s_tmp.resize(size_t(frames) * 2);
                 const int got = SDL_AudioStreamGet(cvt, s_tmp.data(), bytes);
-                if (got <= 0) return;
-                const int n = got / int(sizeof(float));
+                const int n = got > 0 ? got / int(sizeof(float)) : 0;
                 for (int i = 0; i < n; ++i) out[i] += s_tmp[size_t(i)];
                 if (queuedIn)
                 {
                     *queuedIn -= double(n / 2) * double(inRate) / double(s_devRate);
-                    if (*queuedIn < 0.0) *queuedIn = 0.0;
+                    // Dry: the resampler keeps a few frames it will not emit until flushed, so
+                    // the running estimate never quite reaches zero on its own. Snap it.
+                    if (*queuedIn < 0.0 || (n / 2 < frames && SDL_AudioStreamAvailable(cvt) == 0))
+                        *queuedIn = 0.0;
                 }
+                return n / 2;
             }
 
             void SDLCALL callback(void *, Uint8 *buf, int len)
@@ -137,7 +149,17 @@ namespace ps2x_audio
                 std::memset(buf, 0, size_t(len));
                 for (auto &e : s_streams)
                     if (e.second.playing)
-                        mix(out, frames, e.second.cvt, &e.second.queuedIn, e.second.rate);
+                    {
+                        // An idle stream is silence by design; count the moment it RUNS dry (a
+                        // short pull, or the first empty one after audio), not every idle callback.
+                        const int got = mix(out, frames, e.second.cvt, &e.second.queuedIn, e.second.rate);
+                        if (got < frames && (got > 0 || e.second.lastGotFull))
+                        {
+                            ++e.second.underruns;
+                            e.second.underrunFrames += uint32_t(frames - got);
+                        }
+                        e.second.lastGotFull = got >= frames;
+                    }
                 for (auto &e : s_sounds)
                     mix(out, frames, e.second.cvt, nullptr, 0);
                 for (int i = 0; i < frames * 2; ++i) out[i] = std::clamp(out[i], -1.0f, 1.0f);
@@ -175,6 +197,8 @@ namespace ps2x_audio
                     return false;
                 }
                 s_devRate = static_cast<uint32_t>(have.freq);
+                s_diag = [](){ const char *v = std::getenv("PS2X_SNDDIAG"); return v && v[0] && v[0] != '0'; }();
+                s_t0 = SDL_GetPerformanceCounter();
                 std::fprintf(stderr, "[hostaudio] SDL2 %d.%d.%d audio: driver=%s rate=%u period=%u frames (PS2X_HOSTAUDIO=raylib restores miniaudio)\n",
                              SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL,
                              SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", s_devRate, unsigned(have.samples));
@@ -200,9 +224,10 @@ namespace ps2x_audio
                 ~Lock() { SDL_UnlockAudioDevice(s_dev); }
             };
 
-            Stream openStream(uint32_t rate, uint32_t ch, uint32_t chunk)
+            Stream openStream(uint32_t rate, uint32_t ch, uint32_t chunk, uint32_t depth)
             {
                 if (rate == 0 || ch == 0 || ch > 2) return 0;
+                if (depth < 2) depth = 2;
                 SDL_AudioStream *cvt = SDL_NewAudioStream(AUDIO_S16SYS, static_cast<Uint8>(ch), int(rate),
                                                           AUDIO_F32SYS, 2, int(s_devRate));
                 if (!cvt)
@@ -212,7 +237,9 @@ namespace ps2x_audio
                 }
                 const Stream h = s_nextHandle++;
                 Lock lk;
-                s_streams[h] = SStream{cvt, rate, ch, chunk, 0.0, false};
+                SStream s;
+                s.cvt = cvt; s.rate = rate; s.channels = ch; s.chunk = chunk; s.depth = depth;
+                s_streams[h] = s;
                 return h;
             }
 
@@ -229,38 +256,77 @@ namespace ps2x_audio
                 SDL_FreeAudioStream(cvt);
             }
 
+            void setPlayingDiag(Stream h, bool on, double queued);
             void setPlaying(Stream h, bool on)
             {
-                Lock lk;
-                auto it = s_streams.find(h);
-                if (it == s_streams.end()) return;
-                it->second.playing = on;
-                if (!on)
+                double queued = 0.0;
                 {
-                    SDL_AudioStreamClear(it->second.cvt);
-                    it->second.queuedIn = 0.0;
+                    Lock lk;
+                    auto it = s_streams.find(h);
+                    if (it == s_streams.end()) return;
+                    queued = it->second.queuedIn;
+                    it->second.playing = on;
+                    if (!on)
+                    {
+                        SDL_AudioStreamClear(it->second.cvt);
+                        it->second.queuedIn = 0.0;
+                    }
                 }
+                setPlayingDiag(h, on, queued);
             }
 
             bool processed(Stream h)
             {
-                Lock lk;
-                auto it = s_streams.find(h);
-                if (it == s_streams.end()) return false;
-                // Two sub-buffers of `chunk`: one is free once at most a chunk is still queued.
-                // The slack absorbs the resampler's rounding so a drained chunk reads as drained.
-                const SStream &s = it->second;
-                return s.queuedIn <= double(s.chunk) + double(s.chunk) / 64.0;
+                bool ok = false; uint32_t under = 0, underFrames = 0; double queued = 0.0;
+                {
+                    Lock lk;
+                    auto it = s_streams.find(h);
+                    if (it == s_streams.end()) return false;
+                    // `depth` sub-buffers of `chunk`: one is free once at most depth-1 chunks are
+                    // still queued. The slack absorbs the resampler's rounding so a drained chunk
+                    // reads as drained.
+                    SStream &s = it->second;
+                    ok = s.queuedIn <= double(s.chunk) * double(s.depth - 1) + double(s.chunk) / 64.0;
+                    queued = s.queuedIn;
+                    // [snddiag] polled every frame while a stream is started: report underruns as
+                    // they happen instead of at the next feed.
+                    if (s_diag && s.playing && s.underruns != s.reported)
+                    {
+                        under = s.underruns; underFrames = s.underrunFrames; s.reported = s.underruns;
+                    }
+                }
+                if (under)
+                    std::fprintf(stderr, "[snddiag] t=%.3fs stream=%u underrun #%u (%u silent device frames total) queued=%.0f\n",
+                                 nowS(), h, under, underFrames, queued);
+                return ok;
             }
 
             void update(Stream h, const int16_t *frames, uint32_t frameCount)
             {
-                Lock lk;
-                auto it = s_streams.find(h);
-                if (it == s_streams.end()) return;
-                SStream &s = it->second;
-                SDL_AudioStreamPut(s.cvt, frames, int(frameCount * s.channels * sizeof(int16_t)));
-                s.queuedIn += double(frameCount);
+                uint32_t under = 0, underFrames = 0; double queued = 0.0;
+                {
+                    Lock lk;
+                    auto it = s_streams.find(h);
+                    if (it == s_streams.end()) return;
+                    SStream &s = it->second;
+                    queued = s.queuedIn;
+                    SDL_AudioStreamPut(s.cvt, frames, int(frameCount * s.channels * sizeof(int16_t)));
+                    s.queuedIn += double(frameCount);
+                    if (s_diag && s.underruns != s.reported)
+                    {
+                        under = s.underruns; underFrames = s.underrunFrames; s.reported = s.underruns;
+                    }
+                }
+                if (under)
+                    std::fprintf(stderr, "[snddiag] t=%.3fs stream=%u UNDERRUN #%u (%u device frames of silence so far); queued before this feed=%.0f in-frames\n",
+                                 nowS(), h, under, underFrames, queued);
+            }
+
+            void setPlayingDiag(Stream h, bool on, double queued)
+            {
+                if (s_diag)
+                    std::fprintf(stderr, "[snddiag] t=%.3fs stream=%u %s (queued=%.0f in-frames)\n", nowS(), h,
+                                 on ? "PLAY" : "STOP", queued);
             }
 
             Sound playSound(const int16_t *pcm, size_t count, uint32_t rate, float pitch, float volume)
@@ -281,6 +347,9 @@ namespace ps2x_audio
                     SDL_AudioStreamPut(cvt, pcm, int(count * sizeof(int16_t)));
                 SDL_AudioStreamFlush(cvt);   // one-shot: push the resampler's tail out too
                 const Sound h = s_nextHandle++;
+                if (s_diag)
+                    std::fprintf(stderr, "[snddiag] t=%.3fs sound=%u one-shot %zu samples @%u Hz pitch=%.3f vol=%.2f\n",
+                                 nowS(), h, count, rate, double(pitch), double(volume));
                 Lock lk;
                 s_sounds[h] = SSound{cvt};
                 return h;
@@ -340,12 +409,22 @@ namespace ps2x_audio
 
     bool ready() { return s_ready; }
 
-    Stream openStream(uint32_t sampleRate, uint32_t channels, uint32_t chunkFrames)
+    bool supportsDepth()
+    {
+#if defined(PS2X_HAVE_SDL2)
+        return s_ready && s_backend == Backend::Sdl2;
+#else
+        return false;
+#endif
+    }
+
+    Stream openStream(uint32_t sampleRate, uint32_t channels, uint32_t chunkFrames, uint32_t depth)
     {
         if (!s_ready) return 0;
 #if defined(PS2X_HAVE_SDL2)
-        if (s_backend == Backend::Sdl2) return sdl::openStream(sampleRate, channels, chunkFrames);
+        if (s_backend == Backend::Sdl2) return sdl::openStream(sampleRate, channels, chunkFrames, depth);
 #endif
+        (void)depth;   // raylib: always two sub-buffers
 #if !defined(PLATFORM_VITA)
         return rl::openStream(sampleRate, channels, chunkFrames);
 #else
