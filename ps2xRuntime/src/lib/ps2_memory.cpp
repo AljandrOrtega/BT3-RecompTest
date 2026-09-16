@@ -2513,30 +2513,42 @@ void PS2Memory::stage2Loop()
 #endif
     uint64_t accNs = 0;
     uint64_t nItems = 0, nPkts = 0, busyNs = 0; size_t maxDepth = 0; auto tStat = std::chrono::steady_clock::now();
+    std::deque<Stage2Item> s2batch;                                        // [s2batch] the run taken from m_s2q
+    std::chrono::steady_clock::time_point tLast = tStat;                    // [s2batch] last clock read (busy accounting)
     static const bool s_stat = [](){ const char *v = std::getenv("PS2X_VU1PIPESTAT"); const char *e = std::getenv("PS2X_EEPROF");
                                      return (v && v[0] && v[0] != '0') || (e && e[0] && e[0] != '0'); }();
     for (;;)
     {
-        Stage2Item it; uint32_t merged = 1u;
+        // [s2batch] Take EVERYTHING queued under one lock and walk it in order. The loop used to pop one
+        // item (usually one packet) per wake: a mutex, a condvar check, two clock reads and an atomic per
+        // packet, at ~490k packets/s -- about half of this thread's busy time on the i5-12400 (2026-09-17,
+        // busy 553 ms/s at 1.1 us/packet, queue backing up to 3474). Processing order and every signal
+        // (pending count, drain wake, frame accounting) are unchanged. PS2X_S2BATCH=0 = one item per wake.
+        static const bool s_batch = [](){ const char *v = std::getenv("PS2X_S2BATCH"); return !(v && v[0] == '0'); }();
+        if (s2batch.empty())
         {
             std::unique_lock<std::mutex> lk(m_s2Mtx);
             { Ps2xWaitScope w(WP_STAGE2_IDLE); m_s2Cv.wait(lk, [this]() { return !m_s2q.empty() || m_kickStop; }); }
             if (m_s2q.empty()) return;   // stop
             if (m_s2q.size() > maxDepth) maxDepth = m_s2q.size();
-            it = std::move(m_s2q.front()); m_s2q.pop_front();
+            if (s_batch) s2batch.swap(m_s2q);
+            else { s2batch.push_back(std::move(m_s2q.front())); m_s2q.pop_front(); }
+            tLast = std::chrono::steady_clock::now();
+        }
+        Stage2Item it = std::move(s2batch.front()); s2batch.pop_front(); uint32_t merged = 1u;
+        {
             static const bool s_coal = ps2x_pgs::enabled() && ps2x_pgs::coalesce();
             if (s_coal && it.kind == 0u)
             {   // [pgs] every item holds one arbiter flush (usually ONE packet); merge the run of queued packet items so
                 // the backend gets one gif_transfer per path run instead of one per packet
-                while (!m_s2q.empty() && m_s2q.front().kind == 0u && it.pkts.size() < 4096u)
+                while (!s2batch.empty() && s2batch.front().kind == 0u && it.pkts.size() < 4096u)
                 {
-                    auto &nx = m_s2q.front();
+                    auto &nx = s2batch.front();
                     it.pkts.insert(it.pkts.end(), std::make_move_iterator(nx.pkts.begin()), std::make_move_iterator(nx.pkts.end()));
-                    m_s2q.pop_front(); ++merged;
+                    s2batch.pop_front(); ++merged;
                 }
             }
         }
-        const auto t0 = std::chrono::steady_clock::now();
         switch (it.kind)
         {
         case 0u:
@@ -2567,8 +2579,13 @@ void PS2Memory::stage2Loop()
             else if (it.chan == 2u) m_asyncChanBusy[2].fetch_sub(1, std::memory_order_release);
             break;
         }
-        const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-        accNs += ns; busyNs += ns; nItems += merged;
+        nItems += merged;
+        if (it.kind != 0u || s2batch.empty())
+        {   // [s2batch] one clock read per frame boundary / end of run instead of two per packet
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - tLast).count();
+            tLast = now; accNs += ns; busyNs += ns;
+        }
         if (it.kind == 1u) { g_stage2FrameNs.store(accNs, std::memory_order_relaxed); accNs = 0; }
         if (m_s2Pending.fetch_sub(merged, std::memory_order_acq_rel) == merged)
         {   // idle: wake a drain
