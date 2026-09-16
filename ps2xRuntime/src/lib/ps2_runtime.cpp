@@ -37,10 +37,11 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 
-#if defined(__linux__)
-#include "runtime/pad_evdev_linux.h"
 #include "runtime/ps2_host_audio.h"
 #include "runtime/ps2_host_pad.h"
+
+#if defined(__linux__)
+#include "runtime/pad_evdev_linux.h"
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
