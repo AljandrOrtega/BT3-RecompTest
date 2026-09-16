@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-std::atomic<int> g_ps2StepCensus{0};
+Ps2ArmedAtomic<int> g_ps2StepCensus{0};   // [tracearm]
 extern std::atomic<uint64_t> g_bt3FrameCount;
 
 namespace

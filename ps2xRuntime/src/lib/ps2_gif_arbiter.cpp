@@ -54,19 +54,29 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);   // the copy stays OUTSIDE the lock
+    pkt.size = sizeBytes;
+    Lane &ln = lane();
     CountedLock lk(m_qMtx, m_lockWaits, m_lockWaitNs);
-    m_queue.push_back(std::move(pkt));
+    pkt.offset = static_cast<uint32_t>(ln.arena.size());   // [gifarena] append, no per-packet block
+    ln.arena.insert(ln.arena.end(), data, data + sizeBytes);
+    ln.queue.push_back(pkt);
+    ln.pending.store(static_cast<uint32_t>(ln.queue.size()), std::memory_order_relaxed);
 }
 
-void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
+static thread_local bool t_gifWorkerLane = false;   // [giflane]
+void GifArbiter::markWorkerThread() { t_gifWorkerLane = true; }
+GifArbiter::Lane &GifArbiter::lane() { return m_lanes[t_gifWorkerLane ? 1 : 0]; }
+uint32_t GifArbiter::pending() const { return m_lanes[t_gifWorkerLane ? 1 : 0].pending.load(std::memory_order_relaxed); }
+
+void GifArbiter::takeQueue(GifArbiterBatch &out)
 {   // [vu1pipe] the ordering drain() applies, without processing
     static const bool s_sort = [](){ const char *v = std::getenv("PS2X_GIF_SORT"); return v && v[0] && v[0] != '0'; }();
     static const bool s_stat = [](){ const char *v = std::getenv("PS2X_GIFLOCKSTAT"); return !(v && v[0] == '0'); }();
+    Lane &ln = lane();
+    std::vector<GifArbiterPacket> &q = ln.queue;
     CountedLock lk(m_qMtx, m_lockWaits, m_lockWaitNs);
     if (s_sort)
-        std::stable_sort(m_queue.begin(), m_queue.end(),
+        std::stable_sort(q.begin(), q.end(),
                          [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                          {
                              if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
@@ -78,8 +88,16 @@ void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
                              }
                              return pathPriority(a.pathId) < pathPriority(b.pathId);
                          });
-    out.swap(m_queue);
-    m_queue.clear();
+    out.pkts.swap(q);
+    q.clear();
+    if (!out.pkts.empty())
+    {   // [gifarena] the arena is final now: resolve the views, then hand the buffer over by move
+        std::vector<uint8_t> arena;
+        arena.swap(ln.arena);
+        for (GifArbiterPacket &p : out.pkts) p.data = arena.data() + p.offset;
+        out.arenas.push_back(std::move(arena));
+    }
+    ln.pending.store(0u, std::memory_order_relaxed);
     if (s_stat)
     {
         static auto s_t0 = std::chrono::steady_clock::now(); static uint64_t s_w0 = 0, s_n0 = 0;
@@ -95,32 +113,32 @@ void GifArbiter::takeQueue(std::vector<GifArbiterPacket> &out)
 }
 void GifArbiter::process(const GifArbiterPacket &pkt)
 {
-    if (!m_processFn || pkt.data.empty()) return;
+    if (!m_processFn || !pkt.data || pkt.size == 0u) return;
     if (ps2x_pgs::enabled())
     {   // [pgs] the paraLLEl-GS backend consumes the same packet, on its own path index. Pack mode: OUR parse first, so the
         // VRAM and palettes its replacement hook hashes already include this packet's uploads.
         if (ps2x_pgs::packMode())
         {
             g_gifArbCurPath = static_cast<uint8_t>(pkt.pathId);
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            m_processFn(pkt.data, pkt.size);
             g_gifArbCurPath = 0;
-            ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), pkt.data.size());
+            ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data, pkt.size);
             return;
         }
-        const bool consumed = ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data.data(), pkt.data.size());
+        const bool consumed = ps2x_pgs::gifTransfer(static_cast<uint8_t>(pkt.pathId), pkt.data, pkt.size);
         if (consumed && ps2x_pgs::exclusive()) return;   // not consumed (backend unavailable): our parse takes it
     }
     g_gifArbCurPath = static_cast<uint8_t>(pkt.pathId);
-    m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+    m_processFn(pkt.data, pkt.size);
     g_gifArbCurPath = 0;
 }
 void GifArbiter::drain()
 {
     if (!m_processFn)
         return;
-    std::vector<GifArbiterPacket> q;
-    takeQueue(q);
-    for (const auto &pkt : q) process(pkt);
+    GifArbiterBatch b;
+    takeQueue(b);
+    for (const auto &pkt : b.pkts) process(pkt);
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

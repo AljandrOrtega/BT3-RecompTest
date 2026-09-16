@@ -77,8 +77,9 @@ static inline void ps2xWatchStore(uint32_t address, const void *bytes, uint32_t 
 
 // Guest write-watch controls (defined in ps2_runtime.cpp; hooked into ps2TraceGuestWrite).
 // The PS2X_ZEROTAG probe below arms them at DMA time on a zero-matrix packet's address.
-extern std::atomic<uint32_t> g_ps2WatchLo;
-extern std::atomic<uint32_t> g_ps2WatchHi;
+#include "runtime/ps2_armed_atomic.h"   // [tracearm]
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchLo;
+extern Ps2ArmedAtomic<uint32_t> g_ps2WatchHi;
 extern std::atomic<uint32_t> g_ps2WatchAll;
 
 namespace
@@ -2492,8 +2493,8 @@ void PS2Memory::stage2FlushArbiter()
 {
     if (!m_gifArbiter) return;
     Stage2Item it; it.kind = 0u;
-    m_gifArbiter->takeQueue(it.pkts);
-    if (!it.pkts.empty()) stage2Push(std::move(it));
+    m_gifArbiter->takeQueue(it.batch);
+    if (!it.batch.empty()) stage2Push(std::move(it));
 }
 void PS2Memory::arbiterDrainOrHandoff()
 {   // the four drain sites: on the worker with the pipeline on, hand the packets to stage 2; otherwise drain in place
@@ -2541,10 +2542,11 @@ void PS2Memory::stage2Loop()
             if (s_coal && it.kind == 0u)
             {   // [pgs] every item holds one arbiter flush (usually ONE packet); merge the run of queued packet items so
                 // the backend gets one gif_transfer per path run instead of one per packet
-                while (!s2batch.empty() && s2batch.front().kind == 0u && it.pkts.size() < 4096u)
+                while (!s2batch.empty() && s2batch.front().kind == 0u && it.batch.pkts.size() < 4096u)
                 {
                     auto &nx = s2batch.front();
-                    it.pkts.insert(it.pkts.end(), std::make_move_iterator(nx.pkts.begin()), std::make_move_iterator(nx.pkts.end()));
+                    it.batch.pkts.insert(it.batch.pkts.end(), nx.batch.pkts.begin(), nx.batch.pkts.end());
+                    for (auto &ar : nx.batch.arenas) it.batch.arenas.push_back(std::move(ar));   // [gifarena] keep the views alive
                     s2batch.pop_front(); ++merged;
                 }
             }
@@ -2556,19 +2558,19 @@ void PS2Memory::stage2Loop()
             {   // [pgs] one gif_transfer per run of same-path packets, then our own parse with the per-packet hook quiet
                 static std::vector<uint8_t> s_run; uint8_t runPath = 0;
                 auto flush = [&]() { if (!s_run.empty()) { ps2x_pgs::gifTransfer(runPath, s_run.data(), s_run.size()); s_run.clear(); } };
-                for (const auto &pkt : it.pkts)
+                for (const auto &pkt : it.batch.pkts)
                 {
                     const uint8_t pth = static_cast<uint8_t>(pkt.pathId);
                     if (pth != runPath) { flush(); runPath = pth; }
-                    s_run.insert(s_run.end(), pkt.data.begin(), pkt.data.end());
+                    s_run.insert(s_run.end(), pkt.data, pkt.data + pkt.size);
                 }
                 flush();
                 ps2x_pgs::setSuppressed(true);
-                for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+                for (const auto &pkt : it.batch.pkts) m_gifArbiter->process(pkt);
                 ps2x_pgs::setSuppressed(false);
             }
-            else for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
-            nPkts += it.pkts.size(); break;
+            else for (const auto &pkt : it.batch.pkts) m_gifArbiter->process(pkt);
+            nPkts += it.batch.pkts.size(); break;
         case 1u:
             ps2GpuRenderer().swapFrame();
             { std::lock_guard<std::mutex> lk(m_kickMtx); if (m_kickFramesQueued > 0u) --m_kickFramesQueued; m_kickDoneCv.notify_all(); }
@@ -2608,6 +2610,7 @@ void PS2Memory::kickWorkerLoop()
 {
     ps2xEeProfAddCurrentThread("KickWorker");   // [eeprof]
     t_onKickWorker = true;   // [vu1pipe]
+    GifArbiter::markWorkerThread();   // [giflane]
     for (;;)
     {
         KickJob job;
@@ -3193,7 +3196,20 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         m_gifPacketCallback(data, sizeBytes);
 
     if (m_gifArbiter && drainImmediately)
-        arbiterDrainOrHandoff();
+    {
+        // [gifarena] On the kick worker with the pipeline on, hand packets to stage 2 in runs rather than one
+        // per kick: every hand-off is a lock, a queue push and a wake, ~300k/s in a fight. The run is
+        // flushed at PS2X_S2FLUSH packets (default 32; =1 restores per-packet), and always at the job end and
+        // the other drain sites, so stream order and the drain's "both stages idle" are unchanged; only the
+        // granularity stage 2 sees changes (bounded latency: 32 packets is a fraction of one kick job).
+        static const uint32_t s_flushN = [](){ const char *v = std::getenv("PS2X_S2FLUSH"); const long n = (v && v[0]) ? std::strtol(v, nullptr, 10) : 32L; return n >= 1 ? (uint32_t)n : 1u; }();
+        if (vu1PipeEnabled() && t_onKickWorker && s_flushN > 1u)
+        {
+            if (m_gifArbiter->pending() >= s_flushN) stage2FlushArbiter();
+        }
+        else
+            arbiterDrainOrHandoff();
+    }
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)

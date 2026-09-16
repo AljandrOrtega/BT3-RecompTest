@@ -330,7 +330,7 @@ public:
     // [vu1pipe] second stage of the kick pipeline (PS2X_VU1PIPE=1): the kick worker keeps VIF unpack + VU1 execution
     // and hands every GIF packet, frame swap, register apply and end-of-job marker to this thread IN STREAM ORDER;
     // it owns the GS state, VRAM and the draw list exactly as the worker did. Drains cover both stages.
-    struct Stage2Item { uint8_t kind = 0; uint8_t chan = 0; std::vector<GifArbiterPacket> pkts; std::function<void()> fn; };   // kind 0 packets, 1 swap, 2 apply, 3 job end
+    struct Stage2Item { uint8_t kind = 0; uint8_t chan = 0; GifArbiterBatch batch; std::function<void()> fn; };   // kind 0 packets, 1 swap, 2 apply, 3 job end
     static bool vu1PipeEnabled();
     void stage2Push(Stage2Item &&item);
     void stage2FlushArbiter();
