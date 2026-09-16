@@ -323,6 +323,141 @@ namespace vu1native
             if (g_ctx.pairCount) g_ctx.pairCount->fetch_add(cyc, std::memory_order_relaxed);
             vu.xgkickImpl(2u, vuData, dataSize, gs, memory);
         }
+        // ---- 1627a6cb: tristrip with per-triangle clip test, trivial reject, software clipper ---
+        // Listing: work/vu1dis_1627a6cb.txt. Model: work/rig/vu1ref_1627a6cb.py. Batch at TOP:
+        // [0] NOP-register giftag (eop) + [1] its qw = a 32-byte packet kicked BEFORE the loop; [2]
+        // geometry tag (x = count); vertices from TOP+3: P, colour (float RGBA), T. Output at
+        // TOP+3+218: [0..1] that packet, [2] the tag, then [ST*Q, FTOI0(colour), FTOI4(M1*P*Q)] per
+        // vertex. Per vertex vf25 = M1*P (last term * P.w) and vf24 = M2*P; a three-deep history
+        // (vf22, vf23, vf24) gets three CLIPs per iteration so each triangle is tested; from the
+        // third vertex, vi04 = f[v-2]+f[v-1]+f[v] > 0 -> six FCOR tests: the whole triangle outside
+        // one plane -> ADC on this vertex; otherwise the real Sutherland-Hodgman clipper (BAL 0x3c0).
+        // The clipper is NOT translated (2.4% of batches in the fight): the kernel snapshots the
+        // entry state and the output region first and, when a triangle needs it, restores both and
+        // runs the generic code for the whole batch. The first kick is deferred so that nothing is
+        // emitted twice; its bytes (TOP+0..1) are not touched by the loop.
+        constexpr uint64_t kHash1627a6cb = 0x0b7f264e0237b48eull;
+        Fn g_generic1627a6cb = nullptr;
+        constexpr uint32_t kFcorMasks[6] = { 0xff7df7u, 0xffbefbu, 0xffdf7du, 0xffefbeu, 0xfdf7dfu, 0xfefbefu };
+
+        inline __m128 xformW(const __m128 *r, __m128 v, __m128 &acc)
+        {   // MULAx ACC,r0,v.x ; MADDAy ; MADDAz ; MADDw out, r3, v.w (this program's form)
+            acc = _mm_mul_ps(r[0], bc(v, 0));
+            acc = _mm_add_ps(acc, _mm_mul_ps(r[1], bc(v, 1)));
+            acc = _mm_add_ps(acc, _mm_mul_ps(r[2], bc(v, 2)));
+            return _mm_add_ps(acc, _mm_mul_ps(r[3], bc(v, 3)));
+        }
+
+        void kernel1627a6cb(VU1Interpreter &vu, VU1State &st, uint8_t *vuData, uint32_t dataSize,
+                            GS &gs, PS2Memory *memory, uint32_t maxCycles)
+        {
+            const uint32_t entryPc = st.pc;
+            const uint32_t top = st.top & 0x3FFu;
+            const uint32_t countRaw = *reinterpret_cast<const uint32_t *>(vuData + (((top + 2u) * 16u) & (dataSize - 1u)));
+            const int32_t count = (int32_t)(countRaw & 0x7FFFu);
+            if ((entryPc != 0xa8u && entryPc != 0x228u) || count <= 0 || count > 300 || dataSize < 16384u)
+            {
+                g_generic1627a6cb(vu, st, vuData, dataSize, gs, memory, maxCycles);
+                return;
+            }
+            __m128 M1[4], M2[4];
+            for (int i = 0; i < 4; ++i) { M1[i] = ldq(vuData, dataSize, 0u + i); M2[i] = ldq(vuData, dataSize, 4u + i); }
+            const __m128 h0 = ldq(vuData, dataSize, top + 0u), h1 = ldq(vuData, dataSize, top + 1u), h2 = ldq(vuData, dataSize, top + 2u);
+            const int16_t vi01 = i16((int32_t)top + 2);
+            const int16_t vi03Base = i16(vi01 + 1);                  // vertices
+            const int16_t vi02Old = i16(vi03Base + 218);             // output: the NOP packet, then the tag
+            // Snapshot for the clipper fallback: the entry state, the pipeline globals and the region
+            // the loop writes ([vi02Old, vi02Old + 3 + 3*count) qw, wrapped).
+            const VU1State entry = st;
+            const uint32_t cw0 = *g_ctx.clipWait, cp0 = *g_ctx.pendingClip;
+            const uint32_t regionQw = 3u + 3u * (uint32_t)count;
+            alignas(16) uint8_t backup[(3u + 3u * 300u) * 16u];
+            for (uint32_t i = 0; i < regionQw; ++i)
+                std::memcpy(backup + i * 16u, vuData + ((((uint16_t)vi02Old + i) * 16u) & (dataSize - 1u)), 16);
+
+            const __m128 vf00 = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+            const float vf28w = st.vf[28][3];                        // MULq.xyz never writes vf28.w
+            __m128 acc = _mm_setzero_ps();
+            __m128 P = ldq(vuData, dataSize, (uint16_t)vi03Base);
+            __m128 vf25 = xformW(M1, P, acc);
+            float q; { alignas(16) float t[4]; _mm_store_ps(t, vf25); q = (t[3] != 0.0f) ? vuClampFloat(1.0f / t[3]) : FLT_MAX; }
+            float qPending = q; uint32_t qWait = 0u;                 // the prologue DIV commits long before use
+            stq(vuData, dataSize, (uint16_t)vi02Old + 0u, h0); stq(vuData, dataSize, (uint16_t)vi02Old + 1u, h1); stq(vuData, dataSize, (uint16_t)vi02Old + 2u, h2);
+            int16_t vi07 = i16(vi02Old + 4);
+            int16_t vi03 = vi03Base;
+            int16_t vi04 = -2, vi05 = -2, vi06 = -2, vi01r = 0;
+            __m128 vf22 = vf00, vf23 = vf00, vf24 = vf00, vf19 = h2, vf21 = vf00, vf20 = P, vf26 = vf00, vf27 = vf00, vf28 = vf(st, 28);
+            __m128i vf27i = _mm_setzero_si128();
+            uint32_t clip = (cw0 > 0u) ? cp0 : st.clip;
+            uint64_t cyc = (entryPc == 0x228u ? 2u : 0u) + 24u;
+            bool needClipper = false;
+            for (int32_t v = 0; v < count; ++v)
+            {
+                vf22 = vf23; vf23 = vf24;
+                vf24 = xformW(M2, vf20, acc);
+                vf19 = ldq(vuData, dataSize, (uint16_t)vi03 + 2u);   // T
+                vf21 = ldq(vuData, dataSize, (uint16_t)vi03 + 1u);   // colour
+                const __m128 Pn = ldq(vuData, dataSize, (uint16_t)vi03 + 3u);
+                clip = ((clip << 6) | clipFlags(vf22)) & 0xFFFFFFu;
+                clip = ((clip << 6) | clipFlags(vf23)) & 0xFFFFFFu;
+                vi04 = vi05; vi05 = vi06;
+                const __m128 qv = _mm_set1_ps(q);
+                vf25 = _mm_mul_ps(vf25, qv);                                       // MULq.xyzw vf25
+                vf28 = xyzOf(vf28, _mm_mul_ps(vf19, qv));                          // MULq.xyz vf28 = T*Q
+                clip = ((clip << 6) | clipFlags(vf24)) & 0xFFFFFFu;
+                vi03 = i16(vi03 + 3); vi07 = i16(vi07 + 3);
+                __m128 vf25n = xformW(M1, Pn, acc);                                // next vertex's screen pos
+                vf27i = ftoi4(vf25);
+                vi04 = i16(vi04 + vi05);
+                stq(vuData, dataSize, (uint16_t)(int16_t)(vi07 - 4), vf28);        // SQ vf28, -4(vi07)
+                const __m128i vf26i = ftoi(vf21);
+                vi01r = (clip & 0x3Fu) != 0u ? 1 : 0;                              // FCAND 0x3f
+                vi06 = vi01r;
+                vi04 = i16(vi04 + vi06);
+                stqi(vuData, dataSize, (uint16_t)(int16_t)(vi07 - 2), vf27i);      // SQ vf27, -2(vi07)
+                stqi(vuData, dataSize, (uint16_t)(int16_t)(vi07 - 3), vf26i);      // SQ vf26, -3(vi07) (delay slot)
+                if (vi04 > 0)
+                {
+                    bool reject = false;
+                    for (uint32_t m : kFcorMasks) if (((clip | m) & 0xFFFFFFu) == 0xFFFFFFu) { reject = true; break; }
+                    if (!reject) { needClipper = true; break; }
+                    const uint32_t adc = 0x8000u;                                  // ISW.w vi13, -2(vi07)
+                    std::memcpy(vuData + ((((uint16_t)(int16_t)(vi07 - 2)) * 16u + 12u) & (dataSize - 1u)), &adc, 4);
+                    cyc += 5u;   // 0x238..0x3b8 with one FCOR hit ~ approximate
+                }
+                vf26 = _mm_castsi128_ps(vf26i); vf27 = _mm_castsi128_ps(vf27i);
+                vf25 = vf25n; vf20 = Pn;
+                // DIV Q, vf00w, vf25w in the loop branch's delay slot (0x208): the next vertex's Q.
+                { alignas(16) float t[4]; _mm_store_ps(t, vf25); qPending = (t[3] != 0.0f) ? vuClampFloat(1.0f / t[3]) : FLT_MAX; }
+                if (v + 1 < count) { q = qPending; cyc += 19u; }                   // 7 cycles later the MULq reads it
+                else { qWait = 4u; cyc += 22u; }                                   // run ends 3 pairs after the DIV
+            }
+            if (needClipper)
+            {   // Restore and let the generic code do the whole batch, clipper included.
+                st = entry;
+                *g_ctx.clipWait = cw0; *g_ctx.pendingClip = cp0;
+                for (uint32_t i = 0; i < regionQw; ++i)
+                    std::memcpy(vuData + ((((uint16_t)vi02Old + i) * 16u) & (dataSize - 1u)), backup + i * 16u, 16);
+                g_generic1627a6cb(vu, st, vuData, dataSize, gs, memory, maxCycles);
+                return;
+            }
+            // End-of-run state as the recompiled loop leaves it.
+            setvf(st, 19, vf19); setvf(st, 20, vf20); setvf(st, 21, vf21); setvf(st, 22, vf22); setvf(st, 23, vf23); setvf(st, 24, vf24);
+            setvf(st, 25, vf25); setvf(st, 26, vf26); setvf(st, 27, vf27); setvf(st, 28, vf28);
+            setvf(st, 17, h0); setvf(st, 18, h1);
+            _mm_storeu_ps(st.acc, acc);
+            st.vi[1] = vi01r; st.vi[2] = i16(vi02Old + 2); st.vi[3] = vi03; st.vi[4] = vi04; st.vi[5] = vi05; st.vi[6] = vi06;
+            st.vi[7] = vi07; st.vi[10] = 0; st.vi[11] = 0x7FFF; st.vi[13] = (int16_t)0x8000;
+            st.q = q; st.pendingQ = qPending; st.qWait = qWait;
+            st.clip = clip; *g_ctx.pendingClip = clip; *g_ctx.clipWait = 0u;
+            st.pc = 0x228u; st.ebit = true;
+            if (g_ctx.pairCount) g_ctx.pairCount->fetch_add(cyc + 4u, std::memory_order_relaxed);
+            // The two kicks, in program order: the NOP packet (deferred from before the loop), then the strip.
+            st.vi[2] = vi02Old;
+            vu.xgkickImpl(2u, vuData, dataSize, gs, memory);
+            st.vi[2] = i16(vi02Old + 2);
+            vu.xgkickImpl(2u, vuData, dataSize, gs, memory);
+        }
     } // namespace
 
     void bind(const Ctx &ctx) { g_ctx = ctx; }
@@ -337,6 +472,7 @@ namespace vu1native
     {
         if (hash == kHash3b5dfe97) return &kernel3b5dfe97;
         if (hash == kHash925edd7c) return &kernel925edd7c;
+        if (hash == kHash1627a6cb) return &kernel1627a6cb;
         return nullptr;
     }
 
@@ -344,5 +480,6 @@ namespace vu1native
     {
         if (hash == kHash3b5dfe97) g_generic3b5dfe97 = generic;
         if (hash == kHash925edd7c) g_generic925edd7c = generic;
+        if (hash == kHash1627a6cb) g_generic1627a6cb = generic;
     }
 }
