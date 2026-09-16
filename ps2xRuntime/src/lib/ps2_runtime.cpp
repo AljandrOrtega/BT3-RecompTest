@@ -39,6 +39,8 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
+#include "runtime/ps2_host_audio.h"
+#include "runtime/ps2_host_pad.h"
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -1170,11 +1172,12 @@ PS2Runtime::~PS2Runtime()
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
 #else
-        if (IsAudioDeviceReady())
+        if (ps2x_audio::ready())
         {
-            CloseAudioDevice();
+            ps2x_audio::shutdown();
             m_audioBackend.setAudioReady(false);
         }
+        ps2x_pad::shutdown();
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
         {
@@ -1332,8 +1335,11 @@ bool PS2Runtime::initialize(const char *title)
                 }
             }
         }
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        // [hostio] audio and gamepads go through the host layers (SDL2 by default, raylib on
+        // PS2X_HOSTAUDIO=raylib / PS2X_HOSTPAD=raylib); the window and keyboard stay raylib's.
+        ps2x_audio::init();
+        m_audioBackend.setAudioReady(ps2x_audio::ready());
+        ps2x_pad::init();
 #endif
         SetTargetFPS(60);
         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
@@ -6441,12 +6447,10 @@ void PS2Runtime::run()
             if (s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; pgsTexPtr = &s_pgsTex; }
         }
 
-#if defined(__linux__)
-        // Refresh the native evdev reader for any Linux gamepad that GLFW cannot map.
+        // Refresh the host gamepad layer (SDL2 poll + hotplug, or the evdev reader under raylib).
         { const auto _t = std::chrono::steady_clock::now();
-          ps2_stubs::PadEvdevLinux::instance().update();
+          ps2x_pad::update();
           extern double g_fpPad; g_fpPad += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }
-#endif
         { const auto _t = std::chrono::steady_clock::now();
           if (gpuMode) ps2GpuRenderer().serviceBlockingBarriers();   // [barblock]
           extern double g_fpSbb; g_fpSbb += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count(); }

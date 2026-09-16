@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Pad.h"
 #include "runtime/pad_config.h"
+#include "runtime/ps2_host_pad.h"
 
 #include <atomic>
 #include <map>
@@ -32,7 +33,7 @@ namespace ps2_stubs
         {
             for (int g = 0; g < 8; ++g)
             {
-                if (IsGamepadAvailable(g))
+                if (ps2x_pad::available(g))
                 {
                     return g;
                 }
@@ -664,7 +665,7 @@ namespace ps2_stubs
             {
                 const int gamepad = firstAvailableGamepad();
                 const bool gamepadStartPressed =
-                    (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+                    (gamepad >= 0) && ps2x_pad::buttonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
                 const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
                                            IsKeyDown(KEY_ENTER) || gamepadStartPressed);
                 if (startPressed)

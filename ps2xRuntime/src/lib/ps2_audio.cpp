@@ -1,6 +1,6 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
-#include "ps2_host_backend.h"
+#include "runtime/ps2_host_audio.h"
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -14,76 +14,17 @@ float PS2AudioBackend::s_masterVolume = 1.0f;
 float PS2AudioBackend::s_musicVolume = 1.0f;
 float PS2AudioBackend::s_sfxVolume = 1.0f;
 
-namespace
-{
-    std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
-    {
-        const uint32_t dataSize = static_cast<uint32_t>(sampleCount * 2);
-        const uint32_t fileSize = 36 + dataSize;
-        std::vector<uint8_t> wav(8 + fileSize);
-
-        uint8_t *p = wav.data();
-        p[0] = 'R';
-        p[1] = 'I';
-        p[2] = 'F';
-        p[3] = 'F';
-        p[4] = static_cast<uint8_t>(fileSize);
-        p[5] = static_cast<uint8_t>(fileSize >> 8);
-        p[6] = static_cast<uint8_t>(fileSize >> 16);
-        p[7] = static_cast<uint8_t>(fileSize >> 24);
-        p[8] = 'W';
-        p[9] = 'A';
-        p[10] = 'V';
-        p[11] = 'E';
-        p[12] = 'f';
-        p[13] = 'm';
-        p[14] = 't';
-        p[15] = ' ';
-        p[16] = 16;
-        p[17] = 0;
-        p[18] = 0;
-        p[19] = 0;
-        p[20] = 1;
-        p[21] = 0;
-        p[22] = 1;
-        p[23] = 0;
-        p[24] = static_cast<uint8_t>(sampleRate);
-        p[25] = static_cast<uint8_t>(sampleRate >> 8);
-        p[26] = static_cast<uint8_t>(sampleRate >> 16);
-        p[27] = static_cast<uint8_t>(sampleRate >> 24);
-        const uint32_t byteRate = sampleRate * 2;
-        p[28] = static_cast<uint8_t>(byteRate);
-        p[29] = static_cast<uint8_t>(byteRate >> 8);
-        p[30] = static_cast<uint8_t>(byteRate >> 16);
-        p[31] = static_cast<uint8_t>(byteRate >> 24);
-        p[32] = 2;
-        p[33] = 0;
-        p[34] = 16;
-        p[35] = 0;
-        p[36] = 'd';
-        p[37] = 'a';
-        p[38] = 't';
-        p[39] = 'a';
-        p[40] = static_cast<uint8_t>(dataSize);
-        p[41] = static_cast<uint8_t>(dataSize >> 8);
-        p[42] = static_cast<uint8_t>(dataSize >> 16);
-        p[43] = static_cast<uint8_t>(dataSize >> 24);
-        std::memcpy(p + 44, pcm, dataSize);
-        return wav;
-    }
-}
-
 namespace ps2_vag
 {
     bool decode(const uint8_t *data, uint32_t sizeBytes,
                 std::vector<int16_t> &outPcm, uint32_t &outSampleRate);
 }
 
-// Frames per raylib AudioStream sub-buffer. Feeds are aligned to this exactly (see
-// serviceStreams): a partial feed leaves the rest of the sub-buffer unfilled and is heard as
-// rapid pause/unpause stutter. 2048 frames: at 24kHz this is ~170ms; raylib double-buffers, so
-// it gives ~340ms of slack. At 48kHz (the opening movie's rate) it is ~42ms / ~85ms slack --
-// enough to ride out the frame stalls of the 4K FMV override upload without crackling.
+// Frames per host stream sub-buffer. Feeds are aligned to this exactly (see serviceStreams): a
+// partial feed leaves the rest of the sub-buffer unfilled and is heard as rapid pause/unpause
+// stutter. 2048 frames: at 24kHz this is ~170ms; the stream double-buffers, so it gives ~340ms
+// of slack. At 48kHz (the opening movie's rate) it is ~42ms / ~85ms slack -- enough to ride out
+// the frame stalls of the 4K FMV override upload without crackling.
 static constexpr size_t kStreamChunkFrames = 2048;
 
 struct PS2AudioBackend::Impl
@@ -96,13 +37,13 @@ struct PS2AudioBackend::Impl
     };
     struct TrackedSound
     {
-        Sound snd;
+        ps2x_audio::Sound snd;
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
-    // Open raylib AudioStreams for the streaming-PCM path, keyed by streamId.
-    std::unordered_map<uint32_t, AudioStream> streams;
-    // PCM that is still inside raylib/Core Audio rather than in StreamState::ring.
+    // Open host streams for the streaming-PCM path, keyed by streamId.
+    std::unordered_map<uint32_t, ps2x_audio::Stream> streams;
+    // PCM that is still inside the host device rather than in StreamState::ring.
     std::unordered_map<uint32_t, DeviceProgress> deviceProgress;
 };
 
@@ -589,23 +530,21 @@ void PS2AudioBackend::serviceStreams()
         {
             std::fprintf(stderr, "[sndplay] t=%.1fs pair rate %u -> %u, reopening device\n", tNow,
                          s_pairOpenRate, L.sampleRate);
-            StopAudioStream(pairIt->second);
-            UnloadAudioStream(pairIt->second);
+            ps2x_audio::closeStream(pairIt->second);
             m_impl->streams.erase(pairIt);
             L.started = R.started = false;
             L.opened = R.opened = false;
         }
         if (m_impl->streams.find(kPairKey) == m_impl->streams.end())
         {
-            SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
-            m_impl->streams[kPairKey] = LoadAudioStream(L.sampleRate, 16, 2);
+            m_impl->streams[kPairKey] = ps2x_audio::openStream(L.sampleRate, 2, kStreamChunkFrames);
             L.opened = R.opened = true;
             m_impl->deviceProgress[kLeftId] = {};
             m_impl->deviceProgress[kRightId] = {};
             s_pairOpenRate = L.sampleRate;
             std::fprintf(stderr, "[sndplay] t=%.1fs opened STEREO PAIR (streams 0+1) rate=%u\n", tNow, L.sampleRate);
         }
-        AudioStream &s = m_impl->streams[kPairKey];
+        const ps2x_audio::Stream s = m_impl->streams[kPairKey];
 
         // Both sides must have a full sub-buffer; the pair advances in lockstep or not at all.
         if (!L.started)
@@ -649,7 +588,7 @@ void PS2AudioBackend::serviceStreams()
                 const long n = v && v[0] ? std::strtol(v, nullptr, 10) : 0; return (n > 0 && n <= 8) ? size_t(n) : size_t(4); }();
             if (have >= kStreamChunkFrames * s_cushion || forced || stalled)
             {
-                PlayAudioStream(s);
+                ps2x_audio::playStream(s);
                 L.started = R.started = true;
                 std::fprintf(stderr, "[bgmtime] t=%.1fs pair STARTED with %zu frames (rate=%u)\n", tNow, have, L.sampleRate);
                 if (forced)
@@ -688,10 +627,10 @@ void PS2AudioBackend::serviceStreams()
         {
             const float musicVol = s_masterVolume * s_musicVolume;
             std::vector<int16_t> inter(kStreamChunkFrames * 2u);
-            while (IsAudioStreamProcessed(s) &&
+            while (ps2x_audio::streamProcessed(s) &&
                    std::min(L.ring.size(), R.ring.size()) >= kStreamChunkFrames)
             {
-                // A new AudioStream starts with two empty sub-buffers.  The first two
+                // A new stream starts with two empty sub-buffers.  The first two
                 // processed notifications merely let us prime them; every later one means a
                 // complete stereo chunk was actually heard.
                 auto &lDev = m_impl->deviceProgress[kLeftId];
@@ -714,7 +653,7 @@ void PS2AudioBackend::serviceStreams()
                     inter[i * 2u]     = static_cast<int16_t>(L.ring[i] * musicVol);
                     inter[i * 2u + 1u] = static_cast<int16_t>(R.ring[i] * musicVol);
                 }
-                UpdateAudioStream(s, inter.data(), static_cast<int>(kStreamChunkFrames));
+                ps2x_audio::updateStream(s, inter.data(), static_cast<uint32_t>(kStreamChunkFrames));
                 L.ring.erase(L.ring.begin(), L.ring.begin() + static_cast<long>(kStreamChunkFrames));
                 R.ring.erase(R.ring.begin(), R.ring.begin() + static_cast<long>(kStreamChunkFrames));
                 L.fed += kStreamChunkFrames;
@@ -778,19 +717,17 @@ void PS2AudioBackend::serviceStreams()
 
         if (!st.opened)
         {
-            // raylib refills an AudioStream in fixed-size sub-buffers. Feeding fewer frames
-            // than a whole sub-buffer leaves the remainder unfilled, which is heard as rapid
-            // dropouts (~10/sec) that sound like pause/unpause stutter. Pin the sub-buffer
-            // size and always hand over exactly that many frames.
-            SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
-            AudioStream s = LoadAudioStream(st.sampleRate, 16, s_channels);
-            m_impl->streams[id] = s;
+            // The host refills a stream in fixed-size sub-buffers. Feeding fewer frames than
+            // a whole sub-buffer leaves the remainder unfilled, which is heard as rapid
+            // dropouts (~10/sec) that sound like pause/unpause stutter. The sub-buffer size
+            // is pinned at open and we always hand over exactly that many frames.
+            m_impl->streams[id] = ps2x_audio::openStream(st.sampleRate, s_channels, kStreamChunkFrames);
             st.opened = true;
             m_impl->deviceProgress[id] = {};
             std::fprintf(stderr, "[sndplay] opened stream=%u rate=%u channels=%u\n",
                          id, st.sampleRate, s_channels);
         }
-        AudioStream &s = m_impl->streams[id];
+        const ps2x_audio::Stream s = m_impl->streams[id];
 
         // Wait for a little cushion before starting so the first buffers do not underrun.
         // ---- ONE-SHOT SOUNDS (punches, explosions, menu blips) --------------------------
@@ -853,15 +790,15 @@ void PS2AudioBackend::serviceStreams()
                                                             : s_cushion * s_channels;
             if (st.ring.size() < need)
                 continue;
-            PlayAudioStream(s);
+            ps2x_audio::playStream(s);
             st.started = true;
             if (st.forceStart)
                 std::fprintf(stderr, "[sndplay] stream=%u force-start with %zu samples cushion\n",
                              id, st.ring.size());
         }
 
-        // raylib refills in fixed-size chunks; feed while it has room and we have data.
-        while (IsAudioStreamProcessed(s) && !st.ring.empty())
+        // The host refills in fixed-size chunks; feed while it has room and we have data.
+        while (ps2x_audio::streamProcessed(s) && !st.ring.empty())
         {
             // Only ever hand over a COMPLETE sub-buffer; a short feed is what causes the
             // stutter. If we do not have a full one yet, leave it for the next frame.
@@ -888,13 +825,13 @@ void PS2AudioBackend::serviceStreams()
             {
                 std::vector<int16_t> scaled(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
                 for (auto &v : scaled) v = static_cast<int16_t>(v * sfxVol);
-                // UpdateAudioStream counts FRAMES, not samples.
-                UpdateAudioStream(s, scaled.data(), static_cast<int>(kStreamChunkFrames));
+                // updateStream counts FRAMES, not samples.
+                ps2x_audio::updateStream(s, scaled.data(), static_cast<uint32_t>(kStreamChunkFrames));
             }
             else
             {
-                // UpdateAudioStream counts FRAMES, not samples.
-                UpdateAudioStream(s, st.ring.data(), static_cast<int>(kStreamChunkFrames));
+                // updateStream counts FRAMES, not samples.
+                ps2x_audio::updateStream(s, st.ring.data(), static_cast<uint32_t>(kStreamChunkFrames));
             }
             st.ring.erase(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
             st.fed += chunk;
@@ -931,9 +868,9 @@ void PS2AudioBackend::pruneFinishedSounds()
     auto it = sounds.begin();
     while (it != sounds.end())
     {
-        if (!IsSoundPlaying(it->snd))
+        if (!ps2x_audio::soundPlaying(it->snd))
         {
-            UnloadSound(it->snd);
+            ps2x_audio::stopSound(it->snd);
             it = sounds.erase(it);
         }
         else
@@ -962,7 +899,7 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
 
     for (const auto &t : m_impl->activeSounds)
     {
-        if (t.sampleKey == sampleKey && IsSoundPlaying(t.snd))
+        if (t.sampleKey == sampleKey && ps2x_audio::soundPlaying(t.snd))
             return;
     }
 
@@ -971,10 +908,9 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     {
         for (auto it = sounds.begin(); it != sounds.end();)
         {
-            if (IsSoundPlaying(it->snd))
+            if (ps2x_audio::soundPlaying(it->snd))
             {
-                StopSound(it->snd);
-                UnloadSound(it->snd);
+                ps2x_audio::stopSound(it->snd);
                 it = sounds.erase(it);
             }
             else
@@ -985,21 +921,15 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     constexpr int kMaxConcurrentSounds = 4;
     while (static_cast<int>(sounds.size()) >= kMaxConcurrentSounds)
     {
-        StopSound(sounds.front().snd);
-        UnloadSound(sounds.front().snd);
+        ps2x_audio::stopSound(sounds.front().snd);
         sounds.erase(sounds.begin());
     }
 
-    std::vector<uint8_t> wav = buildWavFromPcm(sample.pcm.data(), sample.pcm.size(), sample.sampleRate);
-    Wave wave = LoadWaveFromMemory(".wav", wav.data(), static_cast<int>(wav.size()));
-    if (wave.frameCount <= 0)
+    const ps2x_audio::Sound snd = ps2x_audio::playSound(sample.pcm.data(), sample.pcm.size(), sample.sampleRate,
+                                                        pitch, volume * s_masterVolume * s_sfxVolume);
+    if (!snd)
         return;
-    Sound snd = LoadSoundFromWave(wave);
-    UnloadWave(wave);
-    SetSoundPitch(snd, pitch);
-    SetSoundVolume(snd, volume * s_masterVolume * s_sfxVolume);
     m_impl->activeSounds.push_back({snd, sampleKey});
-    PlaySound(snd);
 #endif
 }
 
@@ -1015,10 +945,7 @@ void PS2AudioBackend::stopAll()
     return;
 #else
     for (auto &t : m_impl->activeSounds)
-    {
-        StopSound(t.snd);
-        UnloadSound(t.snd);
-    }
+        ps2x_audio::stopSound(t.snd);
     m_impl->activeSounds.clear();
 #endif
 }

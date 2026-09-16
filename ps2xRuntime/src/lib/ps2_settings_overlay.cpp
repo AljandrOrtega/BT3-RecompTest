@@ -7,6 +7,7 @@
 #include "runtime/ps2_render_scale.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/pad_config.h"
+#include "runtime/ps2_host_pad.h"
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
 #endif
@@ -335,10 +336,6 @@ void PS2SettingsOverlay::setConfigDirectory(const std::string &dir)
         std::filesystem::create_directories(s_configDir, ec);
     }
 }
-
-// Declared here rather than including GLFW/glfw3.h, which clashes with raylib.h.
-extern "C" int glfwJoystickIsGamepad(int jid);
-extern "C" const char *glfwGetJoystickName(int jid);
 
 void PS2SettingsOverlay::initialize()
 {
@@ -837,16 +834,14 @@ void PS2SettingsOverlay::buildDeviceList()
     // 1: Keyboard
     m_deviceList.push_back({"Keyboard", -1, false, ps2_stubs::PadDeviceKind::Keyboard});
 
-    // 2+: GLFW gamepads
-    for (int g = 0; g < 16; ++g)
+    // 2+: host gamepad slots
+    for (int g = 0; g < ps2x_pad::kMaxSlots; ++g)
     {
-        if (!IsGamepadAvailable(g))
+        if (!ps2x_pad::available(g))
             continue;
 
-        const char *name = GetGamepadName(g);
-        if (!name || !name[0])
-            name = glfwGetJoystickName(g);
-        std::string devName = name ? name : ("Gamepad slot " + std::to_string(g));
+        const char *name = ps2x_pad::name(g);
+        std::string devName = (name && name[0]) ? name : ("Gamepad slot " + std::to_string(g));
 
 #if defined(__linux__)
         bool evdevMatch = false;
@@ -895,17 +890,17 @@ void PS2SettingsOverlay::readGamepadStateForDevice(
 
     if (dev.kind == ps2_stubs::PadDeviceKind::None)
     {
-        // Auto: merge all GLFW gamepads + evdev
-        for (int g = 0; g < 16; ++g)
+        // Auto: merge all host gamepads + evdev
+        for (int g = 0; g < ps2x_pad::kMaxSlots; ++g)
         {
-            if (!IsGamepadAvailable(g))
+            if (!ps2x_pad::available(g))
                 continue;
             for (int b = 0; b < 32; ++b)
-                if (IsGamepadButtonDown(g, b))
+                if (ps2x_pad::buttonDown(g, b))
                     btnDown[b] = 1;
             for (int a = 0; a < 6; ++a)
             {
-                float v = GetGamepadAxisMovement(g, a);
+                float v = ps2x_pad::axis(g, a);
                 if (std::fabs(v) > std::fabs(axis[a]))
                     axis[a] = v;
             }
@@ -928,14 +923,14 @@ void PS2SettingsOverlay::readGamepadStateForDevice(
     }
     else if (dev.kind == ps2_stubs::PadDeviceKind::Gamepad)
     {
-        // Read from specific GLFW slot
-        if (dev.glfwSlot >= 0 && IsGamepadAvailable(dev.glfwSlot))
+        // Read from the specific host slot
+        if (dev.glfwSlot >= 0 && ps2x_pad::available(dev.glfwSlot))
         {
             for (int b = 0; b < 32; ++b)
-                if (IsGamepadButtonDown(dev.glfwSlot, b))
+                if (ps2x_pad::buttonDown(dev.glfwSlot, b))
                     btnDown[b] = 1;
             for (int a = 0; a < 6; ++a)
-                axis[a] = GetGamepadAxisMovement(dev.glfwSlot, a);
+                axis[a] = ps2x_pad::axis(dev.glfwSlot, a);
         }
         // Also read from evdev if it matches
         if (dev.isEvdev)
@@ -1706,8 +1701,8 @@ void PS2SettingsOverlay::drawControllersTab()
     ImGui::TextDisabled("Overlay Shortcuts");
     ImGui::Text("Keyboard:  Shift + Tab");
     bool anyPad = false;
-    for (int g = 0; g < 16 && !anyPad; ++g)
-        anyPad = IsGamepadAvailable(g);
+    for (int g = 0; g < ps2x_pad::kMaxSlots && !anyPad; ++g)
+        anyPad = ps2x_pad::available(g);
     if (anyPad)
         ImGui::Text("Gamepad:   Select + Start");
     else

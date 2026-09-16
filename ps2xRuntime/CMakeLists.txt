@@ -174,6 +174,40 @@ else()
     )
     target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
     target_link_libraries(rlImGui PUBLIC raylib imgui)
+
+    # [hostio] SDL2 for gamepads and audio output (the window and keyboard stay raylib's). Built
+    # static from source so every platform gets the same version; PS2X_HOSTPAD=raylib /
+    # PS2X_HOSTAUDIO=raylib switch back at runtime, -DPS2X_HOST_SDL2=OFF leaves it out entirely.
+    option(PS2X_HOST_SDL2 "Use SDL2 for gamepad input and audio output" ON)
+    if(PS2X_HOST_SDL2)
+        set(SDL_TEST OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_RENDER OFF CACHE BOOL "" FORCE)   # not used; no GL/renderer surface goes through SDL
+        FetchContent_Declare(
+            SDL2
+            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+            GIT_TAG        release-2.32.10
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(SDL2)
+        if(TARGET SDL2::SDL2-static)
+            set(PS2X_SDL2_TARGET SDL2::SDL2-static)
+        elseif(TARGET SDL2-static)
+            set(PS2X_SDL2_TARGET SDL2-static)
+        else()
+            set(PS2X_SDL2_TARGET SDL2::SDL2)
+        endif()
+        # ps2xStudio (same tree) links SDL2::SDL2 and expects the shared build; give it the
+        # static one when this declaration won the FetchContent name.
+        if(NOT TARGET SDL2::SDL2 AND TARGET SDL2-static)
+            add_library(SDL2::SDL2 ALIAS SDL2-static)
+        endif()
+        message(STATUS "[hostio] SDL2 gamepad/audio backend: ON (${PS2X_SDL2_TARGET})")
+    else()
+        message(STATUS "[hostio] SDL2 gamepad/audio backend: OFF (raylib only)")
+    endif()
 endif()
 
 add_library(ps2_host_backend INTERFACE)
@@ -411,6 +445,8 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
+    src/lib/ps2_host_audio.cpp   # [hostio] audio device: SDL2 mixer or raylib/miniaudio
+    src/lib/ps2_host_pad.cpp     # [hostio] gamepads: SDL2 gamecontroller or raylib/GLFW
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_gpu_renderer.cpp
     src/lib/ps2_win_timer.cpp
@@ -437,6 +473,13 @@ add_library(ps2_runtime STATIC
 # Native Linux evdev reader for unmapped gamepads (xone driver).
 if(UNIX AND NOT APPLE)
     target_sources(ps2_runtime PRIVATE src/lib/pad_evdev_linux.cpp)
+endif()
+
+# [hostio] SDL2 is only included by the two host files; PRIVATE keeps <SDL.h> (and its `main`
+# macro) out of every other translation unit, while the static lib still reaches the runner.
+if(NOT PS2X_IS_VITA AND PS2X_HOST_SDL2)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_SDL2=1)
+    target_link_libraries(ps2_runtime PRIVATE ${PS2X_SDL2_TARGET})
 endif()
 
 # The emulator runtime is small (~25 files) and holds every hot loop (rasterizer,
