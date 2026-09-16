@@ -4,6 +4,8 @@
 #endif
 #include "ps2_compat.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_native.h"   // [vunative]
+extern std::atomic<uint64_t> g_vu1PairCount;   // defined below; the [vunative] hook binds it before that point
 #include "runtime/ps2_guestprof.h"
 #include <mutex>
 #include "runtime/ps2_gs_gpu.h"
@@ -96,6 +98,59 @@ void gifCmpFold(const uint8_t *data, uint32_t n)
     uint64_t h = t_gifAcc.roll;
     for (uint32_t i = 0; i < n; ++i) h = (h ^ data[i]) * 1099511628211ull;
     t_gifAcc.roll = h; ++t_gifAcc.packets; t_gifAcc.bytes += n;
+}
+
+// [vu1cap] Kick capture for the Route A offline oracle. PS2X_VU1CAP=<file> records sampled runs
+// of ONE program: the VU1 state at entry, the whole data memory at entry, every GIF packet the run
+// emitted (byte-exact, from the same hook [gifcmp] hashes), and the state at exit. A GLSL port can
+// then be iterated against real kicks with no game running. Reader: work/rig/vu1cap.py.
+//   PS2X_VU1CAP_PROG=<low 32 bits of the program hash, hex>   default dc59311d (= 3b5dfe97)
+//   PS2X_VU1CAP_N=<kicks>      default 2000        PS2X_VU1CAP_STRIDE=<k>   keep every k-th, default 1
+//   PS2X_VU1CAP_FROM=<frame>   start at that game frame, default 0
+// File: "VU1CAP01" | u64 hash | u32 extent, codeSize, dataSize, sizeof(VU1State), count, reserved |
+//       code image | records. Record: u32 entryPc, clipWait, pendingClip, nPackets | VU1State entry |
+//       data memory | packets (u32 len + bytes)... | u32 exitPc | VU1State exit.
+thread_local std::vector<uint8_t> *t_vu1CapBuf = nullptr;
+void vu1CapPacket(const uint8_t *data, uint32_t n)
+{
+    if (!t_vu1CapBuf) return;
+    const uint32_t len = n;
+    t_vu1CapBuf->insert(t_vu1CapBuf->end(), reinterpret_cast<const uint8_t *>(&len), reinterpret_cast<const uint8_t *>(&len) + 4);
+    t_vu1CapBuf->insert(t_vu1CapBuf->end(), data, data + n);
+}
+struct Vu1Cap
+{
+    std::FILE *f = nullptr; uint32_t want = 0, have = 0, stride = 1, seen = 0; uint64_t from = 0; uint32_t progLo = 0;
+    bool headerDone = false; bool done = false;
+    ~Vu1Cap() { finish(); }
+    void finish()
+    {
+        if (!f) return;
+        std::fseek(f, 8 + 8 + 4 * 4, SEEK_SET);
+        std::fwrite(&have, 4, 1, f);
+        std::fclose(f); f = nullptr; done = true;
+        std::fprintf(stderr, "[vu1cap] wrote %u kicks\n", have);
+    }
+};
+Vu1Cap g_vu1Cap;
+bool vu1CapInit()
+{
+    static const bool s_on = []()
+    {
+        const char *p = std::getenv("PS2X_VU1CAP");
+        if (!p || !p[0]) return false;
+        g_vu1Cap.f = std::fopen(p, "wb");
+        if (!g_vu1Cap.f) { std::fprintf(stderr, "[vu1cap] cannot open %s\n", p); return false; }
+        const char *v = std::getenv("PS2X_VU1CAP_PROG");
+        g_vu1Cap.progLo = (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 16) : 0xdc59311du;
+        v = std::getenv("PS2X_VU1CAP_N");      g_vu1Cap.want = (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 10) : 2000u;
+        v = std::getenv("PS2X_VU1CAP_STRIDE"); g_vu1Cap.stride = (v && v[0]) ? std::max(1u, (uint32_t)std::strtoul(v, nullptr, 10)) : 1u;
+        v = std::getenv("PS2X_VU1CAP_FROM");   g_vu1Cap.from = (v && v[0]) ? std::strtoull(v, nullptr, 10) : 0ull;
+        std::fprintf(stderr, "[vu1cap] capturing %u kicks of prog %08x (stride %u, from frame %llu) to %s\n",
+                     g_vu1Cap.want, g_vu1Cap.progLo, g_vu1Cap.stride, (unsigned long long)g_vu1Cap.from, p);
+        return true;
+    }();
+    return s_on && !g_vu1Cap.done;
 }
 }
 
@@ -1086,11 +1141,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         static thread_local uint32_t s_jitGen = 0xFFFFFFFFu;
         static thread_local const vujit::Prog *s_jitProg = nullptr;
+        static thread_local vu1native::Fn s_runFn = nullptr;   // [vunative] the kernel when there is one, else the recompiled fn
         static thread_local unsigned long s_jitRuns = 0, s_jitMiss = 0, s_jitBad = 0;
         const uint32_t gen = g_vu1CodeGen.load(std::memory_order_relaxed);
         if (gen != s_jitGen)
         {
-            s_jitGen = gen; s_jitProg = nullptr;
+            s_jitGen = gen; s_jitProg = nullptr; s_runFn = nullptr;
             for (int p = 0; p < vujit::kProgramCount; ++p)
             {
                 const vujit::Prog &pr = vujit::kPrograms[p];
@@ -1098,6 +1154,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 uint64_t h = 1469598103934665603ull;
                 for (uint32_t i = 0; i < pr.extent; ++i) h = (h ^ vuCode[i]) * 1099511628211ull;
                 if (h == pr.hash) { s_jitProg = &pr; break; }
+            }
+            if (s_jitProg)
+            {
+                s_runFn = s_jitProg->fn;
+                if (vu1native::enabled())
+                    if (vu1native::Fn k = vu1native::lookup(s_jitProg->hash))
+                    {
+                        static bool s_bound = false;
+                        if (!s_bound) { s_bound = true; vu1native::Ctx c; c.clipWait = &g_clipWait; c.pendingClip = &g_pendingClip; c.pairCount = &g_vu1PairCount; vu1native::bind(c); }
+                        vu1native::setGeneric(s_jitProg->hash, s_jitProg->fn);
+                        s_runFn = k;
+                        std::fprintf(stderr, "[vunative] program %016llx runs the native kernel\n", (unsigned long long)s_jitProg->hash);
+                    }
             }
         }
         if (s_jitProg)
@@ -1141,7 +1210,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (gifOn) gifRef = t_gifAcc;
                 const uint32_t cwR = g_clipWait, cpR = g_pendingClip; g_clipWait = cw; g_pendingClip = cp;
                 if (gifOn) t_gifAcc = GifCmpAcc{};
-                s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
+                s_runFn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
                 if (gifOn)
                 {
                     gifCand = t_gifAcc; t_gifCapture = false;
@@ -1165,9 +1234,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 else if (std::memcmp(&a.q, &b.q, 4)) what = "q";
                 else if (std::memcmp(&a.i, &b.i, 4)) what = "i";
                 else if (a.pc != b.pc) what = "pc";
-                else if (a.mac != b.mac) what = "mac";
+                // [macelide] a program that never reads MAC/STATUS (no FMAND/FSAND...) leaves them dead
+                // state: the recompiled code does not maintain them outside verify mode, and a native
+                // kernel does not either. Compare them only where the program can observe them.
+                else if (s_jitProg->needsMac && a.mac != b.mac) what = "mac";
                 else if (a.clip != b.clip) what = "clip";
-                else if (a.status != b.status) what = "status";
+                else if (s_jitProg->needsMac && a.status != b.status) what = "status";
                 else if (a.ebit != b.ebit) what = "ebit";
                 else if (g_clipWait != cwR || g_pendingClip != cpR) what = "clippipe";
                 else if (std::memcmp(vuData, dataCopy.data(), dataSize)) { what = "datamem"; for (uint32_t o = 0; o < dataSize && idx < 0; o += 16) if (std::memcmp(vuData + o, dataCopy.data() + o, 16)) idx = (int)o; }
@@ -1180,18 +1252,52 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 return;
             }
             vujit::g_jitMacNeeded = s_jitProg->needsMac;   // [macelide]
+            if (vu1CapInit() && (uint32_t)(s_jitProg->hash & 0xFFFFFFFFull) == g_vu1Cap.progLo &&
+                g_bt3FrameCount.load(std::memory_order_relaxed) >= g_vu1Cap.from &&
+                (g_vu1Cap.seen++ % g_vu1Cap.stride) == 0u)
+            {   // [vu1cap] run this kick with the packet capture armed and write the record
+                Vu1Cap &c = g_vu1Cap;
+                if (!c.headerDone)
+                {
+                    c.headerDone = true;
+                    const uint32_t stSize = (uint32_t)sizeof(VU1State), zero = 0;
+                    std::fwrite("VU1CAP01", 1, 8, c.f);
+                    std::fwrite(&s_jitProg->hash, 8, 1, c.f);
+                    std::fwrite(&s_jitProg->extent, 4, 1, c.f); std::fwrite(&codeSize, 4, 1, c.f);
+                    std::fwrite(&dataSize, 4, 1, c.f); std::fwrite(&stSize, 4, 1, c.f);
+                    std::fwrite(&zero, 4, 1, c.f); std::fwrite(&zero, 4, 1, c.f);
+                    std::fwrite(vuCode, 1, codeSize, c.f);
+                }
+                const VU1State entry = m_state;
+                const uint32_t cw = g_clipWait, cp = g_pendingClip;
+                std::vector<uint8_t> dataAtEntry(vuData, vuData + dataSize);
+                std::vector<uint8_t> packets;
+                t_vu1CapBuf = &packets;
+                s_runFn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
+                t_vu1CapBuf = nullptr;
+                uint32_t nPk = 0;
+                for (size_t o = 0; o + 4 <= packets.size();) { uint32_t l; std::memcpy(&l, packets.data() + o, 4); o += 4 + l; ++nPk; }
+                std::fwrite(&entryPc, 4, 1, c.f); std::fwrite(&cw, 4, 1, c.f); std::fwrite(&cp, 4, 1, c.f); std::fwrite(&nPk, 4, 1, c.f);
+                std::fwrite(&entry, sizeof entry, 1, c.f);
+                std::fwrite(dataAtEntry.data(), 1, dataAtEntry.size(), c.f);
+                if (!packets.empty()) std::fwrite(packets.data(), 1, packets.size(), c.f);
+                std::fwrite(&m_state.pc, 4, 1, c.f);
+                std::fwrite(&m_state, sizeof m_state, 1, c.f);
+                if (++c.have >= c.want) c.finish();
+            }
+            else
             {   // [vu1cost] sampled per-program timing
                 static const unsigned s_costN = [](){ const char *v = std::getenv("PS2X_VU1COST");
                     const unsigned n = (v && v[0]) ? (unsigned)std::strtoul(v, nullptr, 10) : 0u; return n; }();
-                if (!s_costN) { s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles); }
+                if (!s_costN) { s_runFn(*this, m_state, vuData, dataSize, gs, memory, maxCycles); }
                 else
                 {
                     VuCost &c = g_vuCost[(s_jitProg - &vujit::kPrograms[0]) & 7];
-                    if ((++c.runs % s_costN) != 0u) { s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles); }
+                    if ((++c.runs % s_costN) != 0u) { s_runFn(*this, m_state, vuData, dataSize, gs, memory, maxCycles); }
                     else
                     {
                         const auto t0 = std::chrono::steady_clock::now();
-                        s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
+                        s_runFn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
                         c.ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - t0).count();
                         ++c.sampled;
@@ -4169,6 +4275,7 @@ void VU1Interpreter::xgkickImpl(uint32_t viS, uint8_t *vuData, uint32_t dataSize
     if (addr + totalBytes <= dataSize)
     {
         gifCmpFold(vuData + addr, totalBytes);   // [gifcmp]
+        vu1CapPacket(vuData + addr, totalBytes);  // [vu1cap]
         {   // [kickbatch] does this kick share its constant block with the previous one?
             const uint64_t t0k = read64Wrap(addr);
             kickBatchNote(vuData, dataSize, g_curStartPc, (uint32_t)(t0k & 0x7FFFu));
@@ -4190,6 +4297,7 @@ void VU1Interpreter::xgkickImpl(uint32_t viS, uint8_t *vuData, uint32_t dataSize
         }
 
         gifCmpFold(wrappedPacket.data(), totalBytes);   // [gifcmp]
+        vu1CapPacket(wrappedPacket.data(), totalBytes);  // [vu1cap]
         if (!m_dryKick)
         {
             if (memory)
