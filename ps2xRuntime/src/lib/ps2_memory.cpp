@@ -3202,7 +3202,10 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         // flushed at PS2X_S2FLUSH packets (default 32; =1 restores per-packet), and always at the job end and
         // the other drain sites, so stream order and the drain's "both stages idle" are unchanged; only the
         // granularity stage 2 sees changes (bounded latency: 32 packets is a fraction of one kick job).
-        static const uint32_t s_flushN = [](){ const char *v = std::getenv("PS2X_S2FLUSH"); const long n = (v && v[0]) ? std::strtol(v, nullptr, 10) : 32L; return n >= 1 ? (uint32_t)n : 1u; }();
+        static const uint32_t s_flushN = [](){ const char *v = std::getenv("PS2X_S2FLUSH"); const long n = (v && v[0]) ? std::strtol(v, nullptr, 10) : 32L;
+                                               const uint32_t r = n >= 1 ? (uint32_t)n : 1u;
+                                               std::fprintf(stderr, "[gifarena] arena packets + per-producer lanes; stage-2 hand-off every %u packets (PS2X_S2FLUSH)\n", r);   // banner: proves the build in a user log
+                                               return r; }();
         if (vu1PipeEnabled() && t_onKickWorker && s_flushN > 1u)
         {
             if (m_gifArbiter->pending() >= s_flushN) stage2FlushArbiter();
