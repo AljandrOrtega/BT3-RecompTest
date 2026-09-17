@@ -6,6 +6,7 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_native.h"   // [vunative]
 extern std::atomic<uint64_t> g_vu1PairCount;   // defined below; the [vunative] hook binds it before that point
+thread_local uint32_t g_vu1CensusProg = 0;    // [gifcensus] low 32 bits of the hash of the program this thread last selected (read by the arbiter for PATH1)
 #include "runtime/ps2_guestprof.h"
 #include <mutex>
 #include "runtime/ps2_gs_gpu.h"
@@ -1155,6 +1156,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 for (uint32_t i = 0; i < pr.extent; ++i) h = (h ^ vuCode[i]) * 1099511628211ull;
                 if (h == pr.hash) { s_jitProg = &pr; break; }
             }
+            g_vu1CensusProg = s_jitProg ? (uint32_t)s_jitProg->hash : 0u;   // [gifcensus]
             if (s_jitProg)
             {
                 s_runFn = s_jitProg->fn;
