@@ -27,7 +27,7 @@ jobs:
         uses: llvm/actions/install-ninja@main
 
       - name: Configurar Qt6
-        uses: jurplel/install-qt@v3
+        uses: install-qt/install-qt@v3
         with:
           version: '6.6.3'
           arch: 'win64_msvc2019_64'
