@@ -26,17 +26,20 @@ jobs:
       - name: Instalar Ninja y LLVM (Clang)
         uses: llvm/actions/install-ninja@main
 
-      - name: Configurar Qt6
-        uses: install-qt/install-qt@v3
-        with:
-          version: '6.6.3'
-          arch: 'win64_msvc2019_64'
-
-      - name: Instalar dependencias del sistema
+      - name: Instalar dependencias y Qt6 nativamente
         shell: powershell
         run: |
           python -m pip install --upgrade pip
           python -m pip install aqtinstall
+          
+          # Instalar Qt 6.6.3 en C:\Qt
+          aqt install-qt windows desktop 6.6.3 win64_msvc2019_64 -o C:\Qt
+          
+          # Exportar la ruta de Qt a las variables de entorno del runner
+          echo "C:\Qt\6.6.3\msvc2019_64\bin" >> $env:GITHUB_PATH
+          echo "QT_ROOT=C:\Qt\6.6.3\msvc2019_64" >> $env:GITHUB_ENV
+          echo "Qt6_DIR=C:\Qt\6.6.3\msvc2019_64\lib\cmake\Qt6" >> $env:GITHUB_ENV
+          
           .\install-deps-windows.ps1 -Install
 
       - name: Restaurar / Guardar ISO en Caché
