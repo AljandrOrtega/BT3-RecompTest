@@ -20,6 +20,24 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Instalar sccache
+        uses: mozilla-actions/sccache-action@v0.0.8
+
+      - name: Restaurar / Guardar Caché de sccache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Mozilla\sccache\cache
+          key: sccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            sccache-${{ runner.os }}-
+
+      - name: Configurar Variables de Entorno para sccache
+        shell: powershell
+        run: |
+          echo "CC=sccache clang-cl" >> $env:GITHUB_ENV
+          echo "CXX=sccache clang-cl" >> $env:GITHUB_ENV
+          echo "SCCACHE_CACHE_SIZE=2G" >> $env:GITHUB_ENV
+
       - name: Instalar dependencias del sistema
         shell: powershell
         run: |
@@ -27,15 +45,26 @@ jobs:
           python -m pip install aqtinstall
           .\install-deps-windows.ps1 -Install
 
-      - name: Descargar ISO del juego
+      - name: Restaurar / Guardar ISO en Caché
+        id: cache-iso
+        uses: actions/cache@v4
+        with:
+          path: bt3-usa.iso
+          key: iso-bt3-slus21678
+
+      - name: Descargar ISO con aria2 (Multi-hilo)
+        if: steps.cache-iso.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://archive.org/download/dbz-3-slus-21678/DBZ3_SLUS_21678.ISO" -OutFile "bt3-usa.iso"
+          winget install aria2 --accept-source-agreements --accept-package-agreements
+          aria2c -x 16 -s 16 "https://archive.org/download/dbz-3-slus-21678/DBZ3_SLUS_21678.ISO" -o "bt3-usa.iso"
 
       - name: Compilar proyecto
         shell: powershell
         run: |
+          sccache --start-server
           .\build-windows.ps1 -Iso "bt3-usa.iso"
+          sccache --show-stats
 
       - name: Empaquetar Release
         shell: powershell
