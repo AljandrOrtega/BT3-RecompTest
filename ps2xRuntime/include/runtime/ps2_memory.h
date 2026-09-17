@@ -332,7 +332,7 @@ public:
     // it owns the GS state, VRAM and the draw list exactly as the worker did. Drains cover both stages.
     struct Stage2Item { uint8_t kind = 0; uint8_t chan = 0; GifArbiterBatch batch; std::function<void()> fn; };   // kind 0 packets, 1 swap, 2 apply, 3 job end
     static bool vu1PipeEnabled();
-    // [s1fence] PS2X_S1FENCE=1: sceGsSyncPath fences STAGE 1 ONLY (guest RAM is consumed once the worker ran the
+    // [s1fence] DEFAULT ON (PS2X_S1FENCE=0 disables): sceGsSyncPath fences STAGE 1 ONLY (guest RAM is consumed once the worker ran the
     // job; the GS-side work keeps flowing on stage 2), the channel-busy bit is released at stage-1 job end, every
     // guest-thread GIF submission and privileged display-register store travels the kick queue in stream order,
     // and the paraLLEl-GS presenter scans out from the stream-ordered display block. Needs [vu1pipe] + paraLLEl-GS.

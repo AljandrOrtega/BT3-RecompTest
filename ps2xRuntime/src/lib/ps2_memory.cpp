@@ -2482,10 +2482,14 @@ bool PS2Memory::stage1FenceEnabled()
     // this mode, and the presenter reads the display block in stream order. VRAM READS keep the full drain.
     // The earlier [syncrelax]/[gsqueue] attempts relaxed the same fence WITHOUT routing those writers, so the
     // game thread's in-place writes overtook queued draws (VRAM slot corruption, alternating flips).
-    static const bool s_on = [](){ const char *v = std::getenv("PS2X_S1FENCE"); const bool want = v && v[0] && v[0] != '0';
+    // DEFAULT ON since 2026-09-17: i5-12400 60 fps mode splitscreen 55.1 -> 59.0 fps (58-61 nearly every second),
+    // kick_drain 208 -> 1.5 ms/s, display registers identical, user saw nothing broken (fence1.txt). PS2X_S1FENCE=0 restores
+    // the full drain.
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_S1FENCE"); const bool want = !(v && v[0] == '0');
                                    const bool on = want && vu1PipeEnabled() && ps2x_pgs::enabled();
-                                   if (want) std::fprintf(stderr, on ? "[s1fence] stage-1 SyncPath fence ON: guest GIF + display regs in stream order, presenter on the stream block\n"
-                                                                     : "[s1fence] PS2X_S1FENCE requested but needs [vu1pipe] + paraLLEl-GS -- OFF\n");
+                                   std::fprintf(stderr, on   ? "[s1fence] stage-1 SyncPath fence ON: guest GIF + display regs in stream order, presenter on the stream block (PS2X_S1FENCE=0 restores the full drain)\n"
+                                                        : want ? "[s1fence] OFF: needs [vu1pipe] + paraLLEl-GS (full drain)\n"
+                                                               : "[s1fence] OFF (PS2X_S1FENCE=0): full two-stage drain at sceGsSyncPath\n");
                                    return on; }();
     return s_on;
 }
