@@ -23,6 +23,7 @@ void ps2HalfStepNoteLogic(uint64_t frame);
 void ps2AddrWatchEnable(const char *hex);
 void ps2StoreTraceEnable(const char *spec);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
+extern std::atomic<uint64_t> g_cdLoadReads, g_cdLoadBytes;   // [cdload] CD.cpp (file scope: a block-scope extern inside the namespace mangles into it)
 extern std::atomic<uint32_t> g_bt3StateLive;    // [fightgate] BT3's top-level state, as seen by the status probe (ps2_runtime.cpp)
 extern std::atomic<uint64_t> g_vu1PairCount;    // [fightgate] VU1 instruction pairs run by the fight's programs (ps2_vu1.cpp)
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
@@ -3174,6 +3175,11 @@ namespace
         if (ps2xSchedTraceOn()) std::fprintf(stderr, "[schedtrace] CDTICK tid=%d pc=0x%x\n", ps2xSchedTid(), ctx ? ctx->pc : 0u);
         g_lastCdTickNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);   // [dispatchpump]
         g_lastCdTickFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);   // [detsound]
+        // [cdload] PS2X_CDLOAD=1: what a load is made of, per second -- CD file-server ticks (count + guest time inside
+        // them), sceCdRead requests (count + MB, counted in CD.cpp) and the current bt3state. The datum for "would
+        // dropping the CD model speed loads up": the tick is the game's own state machine, run inline per poll.
+        static const bool s_cdload = [](){ const char *v = std::getenv("PS2X_CDLOAD"); return v && v[0] && v[0] != '0'; }();
+        const auto _t0 = s_cdload ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         R5900Context tctx = *ctx;             // inherit gp/sp
         tctx.r[31] = _mm_setzero_si128();     // ra = 0 => run until return
         tctx.pc = 0x0028a3b0u;                // CD file-server tick
@@ -3183,6 +3189,24 @@ namespace
             PS2Runtime::RecompiledFunction step = runtime->lookupFunction(tctx.pc);
             if (!step) break;
             step(rdram, &tctx, runtime);
+        }
+        if (s_cdload)
+        {
+            static std::atomic<uint64_t> s_ticks{0}, s_tickNs{0};
+            static std::atomic<int64_t> s_last{0};
+            const auto now = std::chrono::steady_clock::now();
+            s_ticks.fetch_add(1u, std::memory_order_relaxed);
+            s_tickNs.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - _t0).count(), std::memory_order_relaxed);
+            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+            int64_t last = s_last.load(std::memory_order_relaxed);
+            if (last == 0) s_last.store(nowNs, std::memory_order_relaxed);
+            else if (nowNs - last >= 1000000000LL && s_last.compare_exchange_strong(last, nowNs, std::memory_order_relaxed))
+            {
+                const double dt = (nowNs - last) / 1e9;
+                const uint64_t t = s_ticks.exchange(0), tn = s_tickNs.exchange(0), rd = g_cdLoadReads.exchange(0), by = g_cdLoadBytes.exchange(0);
+                std::fprintf(stderr, "[cdload] state=0x%x: ticks %.0f/s (%.1f ms/s inside), reads %.0f/s (%.2f MB/s), %.1f ticks/read\n",
+                             g_bt3StateLive.load(std::memory_order_relaxed), t / dt, tn / 1e6 / dt, rd / dt, by / 1048576.0 / dt, rd ? (double)t / rd : 0.0);
+            }
         }
     }
     // [spinpump] Called by the dispatch loop when a guest thread has re-dispatched at the same pc for
