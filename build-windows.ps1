@@ -246,11 +246,11 @@ $cmakeLauncherArgs = @(
 )
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-& cmake @cmakeLauncherArgs *> $null
+& cmake @cmakeLauncherArgs
 $ErrorActionPreference = $prevEAP
 if ($LASTEXITCODE -ne 0) { Fail "Launcher cmake configure failed" }
 $ErrorActionPreference = "Continue"
-& cmake --build $LAUNCHER_BUILD -j $Jobs *> $null
+& cmake --build $LAUNCHER_BUILD -j $Jobs
 $ErrorActionPreference = $prevEAP
 if ($LASTEXITCODE -ne 0) { Fail "Launcher build failed" }
 $launcherExe = Join-Path $LAUNCHER_BUILD "Launcher.exe"
