@@ -20,6 +20,9 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Configurar entorno C++ de MSVC Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Instalar dependencias del sistema
         shell: powershell
         run: |
@@ -46,11 +49,6 @@ jobs:
         run: |
           $env:CFLAGS = "-w"
           $env:CXXFLAGS = "-w"
-          
-          # Cargar entorno de Visual Studio 2022 para resolver dependencias de Qt y MSVC
-          Import-Module "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-          Enter-VsDevShell -VsInstallPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" -SkipAutomaticLocation -Architecture amd64
-
           .\build-windows.ps1 -Iso "bt3-usa.iso"
 
       - name: Empaquetar Release
