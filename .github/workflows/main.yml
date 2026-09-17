@@ -23,6 +23,15 @@ jobs:
       - name: Configurar entorno C++ de MSVC Visual Studio
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Instalar Ninja y LLVM (Clang)
+        uses: llvm/actions/install-ninja@main
+
+      - name: Configurar Qt6
+        uses: jurplel/install-qt@v3
+        with:
+          version: '6.6.3'
+          arch: 'win64_msvc2019_64'
+
       - name: Instalar dependencias del sistema
         shell: powershell
         run: |
