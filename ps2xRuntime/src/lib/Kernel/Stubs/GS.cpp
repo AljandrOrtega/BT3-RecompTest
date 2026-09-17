@@ -1533,7 +1533,7 @@ namespace ps2_stubs
             // [syncrelax] ...unless the frame gate is engaged: then the gate paces, the busy bit reads idle
             // (see readIORegister) and the guest may run ahead of the worker -- see ps2xAsyncPaceRelaxed.
             if (!ps2xAsyncPaceRelaxedForStubs())
-                fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH);
+                fenceAsyncKickForGsAccess(runtime, WP_FENCE_SYNCPATH, /*stage1Only=*/true);   // [s1fence] a no-op flag unless that mode is on
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;

@@ -321,6 +321,7 @@ struct State
     SlowCall slowCalls[3] = {};
     uint32_t slowOver1ms = 0;
     uint64_t streamDispfb1 = 0; bool haveStreamFlip = false;   // the game's DISPFB1 flip, carried in stream order ([displatch] job)
+    uint64_t streamLo[0x10] = {}; uint32_t streamHave = 0;    // [s1fence] the stream-ordered display block (slot = regOff >> 4), bit set once written
     uint64_t streamFlips = 0, flipMismatch = 0, lastFb1 = 0, lastLive1 = 0, lastLive2 = 0;   // [pgsflip] diagnostics
     uint32_t privHist[0x20] = {};   // privileged stores per 16-byte slot since the last stats line (bus + pseudo regs)
     uint64_t pseudoSeen = 0;        // in-stream pseudo A+D registers applied (exclusive mode)
@@ -331,6 +332,10 @@ struct State
 State &st() { static State *s = new State; return *s; }   // leaked on purpose: never destroy the device behind a running thread
 
 bool envOn(const char *name) { const char *v = std::getenv(name); return v && v[0] && v[0] != '0'; }
+}
+extern "C" bool ps2xStage1FenceC();   // [s1fence] ps2_memory.cpp (C linkage, declared inside ps2x_pgs on purpose)
+namespace
+{
 
 void registerThread()
 {   // Granite keys per-thread command pools by a registered index; unregistered threads log an error per call.
@@ -394,6 +399,24 @@ void copyPrivLocked(State &s)
         put(&p.pmode, r->pmode);     put(&p.smode1, r->smode1 ? r->smode1 : 0x0000000740814504ULL);   put(&p.smode2, r->smode2);   // NTSC default when the CRTC was never programmed
         put(&p.srfsh, r->srfsh);     put(&p.synch1, r->synch1);   put(&p.synch2, r->synch2);
         static const bool s_useStream = !envOn("PS2X_PGS_LIVEFLIP");   // PS2X_PGS_LIVEFLIP=1: scan out whatever the bus says right now
+        if (ps2xStage1FenceC())
+        {   // [s1fence] the display block in STREAM order: whichever of the three writers (bus store, display-env
+            // stub, parse pseudo-register) came last IN THE STREAM wins, not whichever thread ran last. Registers
+            // never written on the stream fall back to the live block (boot, before the first frame).
+            auto pick = [&](uint32_t slot, uint64_t live) { return (s.streamHave & (1u << slot)) ? s.streamLo[slot] : live; };
+            const uint64_t pm = pick(0, r->pmode), sm2 = pick(2, r->smode2), fb1 = pick(7, r->dispfb1), d1 = pick(8, r->display1);
+            const uint64_t fb2 = pick(9, r->dispfb2), d2 = pick(10, r->display2), bg = pick(14, r->bgcolor);
+            put(&p.pmode, pm); put(&p.smode2, sm2);
+            if (fb1 != r->dispfb1) s.flipMismatch++;
+            s.lastFb1 = fb1; s.lastLive1 = r->dispfb1; s.lastLive2 = r->dispfb2;
+            put(&p.syncv, r->syncv);     put(&p.dispfb1, fb1);        put(&p.display1, d1);
+            put(&p.dispfb2, fb2);        put(&p.display2, d2);        put(&p.extbuf, r->extbuf);
+            put(&p.extdata, r->extdata); put(&p.extwrite, r->extwrite); put(&p.bgcolor, bg);
+            put(&p.csr, r->csr.load(std::memory_order_relaxed)); put(&p.imr, r->imr); put(&p.busdir, r->busdir);
+            put(&p.siglblid, r->siglblid);
+            s.privLo[0] = pm; s.privLo[2] = sm2; s.privLo[7] = fb1; s.privLo[8] = d1; s.privLo[9] = fb2; s.privLo[10] = d2;   // for the stats line
+            return;
+        }
         const uint64_t fb1 = (s_useStream && s.haveStreamFlip) ? s.streamDispfb1 : r->dispfb1;
         const uint64_t fb2 = (s_useStream && s.haveStreamFlip && r->dispfb2 == r->dispfb1) ? s.streamDispfb1 : r->dispfb2;
         if (fb1 != r->dispfb1) s.flipMismatch++;
@@ -1529,20 +1552,21 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
                             // (0x7f23, the value actually presented) lands after it once the kick
                             // queue is drained -- reorder anything on this path and the garbage
                             // reaches the scanout as black and squished frames. Drop it at source.
-                            if (v <= 0xFFFFull) { r->pmode = v; }
+                            if (v <= 0xFFFFull) { r->pmode = v; s.streamLo[0] = v; s.streamHave |= 1u << 0; }
                             s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
                         case 0x42:
                             // [smode2guard] Same defect on SMODE2, which has four meaningful bits
                             // (INT, FFMD, DPMS). This path writes 0x44 -- bit 6 is undefined -- and
                             // it reaches the scanout as "640x224", i.e. half height. Same reason it
                             // normally stays invisible: the drain lets the real writer land last.
-                            if (v <= 0xFull) { r->smode2 = v; }
+                            if (v <= 0xFull) { r->smode2 = v; s.streamLo[2] = v; s.streamHave |= 1u << 2; }
                             s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
-                        case 0x59: r->dispfb1 = v; s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5a: r->display1 = v; s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5b: r->dispfb2 = v; s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5c: r->display2 = v; s.privHist[0xA0 >> 4]++; s.pseudoSeen++; break;
-                        case 0x5f: r->bgcolor = v; s.privHist[0xE0 >> 4]++; s.pseudoSeen++; break;
+                        // [s1fence] the parse runs on stage 2, so its writes are stream-ordered by construction: stamp the block too
+                        case 0x59: r->dispfb1 = v;  s.streamLo[7] = v;  s.streamHave |= 1u << 7;  s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5a: r->display1 = v; s.streamLo[8] = v;  s.streamHave |= 1u << 8;  s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5b: r->dispfb2 = v;  s.streamLo[9] = v;  s.streamHave |= 1u << 9;  s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5c: r->display2 = v; s.streamLo[10] = v; s.streamHave |= 1u << 10; s.privHist[0xA0 >> 4]++; s.pseudoSeen++; break;
+                        case 0x5f: r->bgcolor = v;  s.streamLo[14] = v; s.streamHave |= 1u << 14; s.privHist[0xE0 >> 4]++; s.pseudoSeen++; break;
                         default: break;
                         }
                     }
@@ -1705,6 +1729,16 @@ void streamFlip(uint64_t dispfb1)
     std::lock_guard<std::mutex> lk(s.mtx);
     s.streamDispfb1 = dispfb1; s.haveStreamFlip = true;
     s.streamFlips++;
+}
+
+void streamPriv(uint32_t regOff, uint64_t value)
+{   // [s1fence] GsApply job on stage 2: a display register in stream order (see the header)
+    State &s = st();
+    std::lock_guard<std::mutex> lk(s.mtx);
+    const uint32_t slot = regOff >> 4;
+    if (slot >= 0x10u) return;
+    s.streamLo[slot] = value; s.streamHave |= 1u << slot;
+    if (slot == 7u) { s.streamDispfb1 = value; s.haveStreamFlip = true; }
 }
 
 void setInkColor(uint32_t rgb)

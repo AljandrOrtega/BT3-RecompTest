@@ -1059,6 +1059,18 @@ static void ps2xDispFlipInStream(PS2Memory *mem, uint64_t dispfb)
     }
     else ps2xGsDisplayFlipHook((unsigned long long)dispfb);
 }
+// [s1fence] Every privileged DISPLAY register the game stores from the bus (PMODE, SMODE2, DISPFB1/2, DISPLAY1/2,
+// BGCOLOR) also travels the kick queue: stage 2 stamps it into the presenter's stream-ordered block, so the
+// scanout sees the game's writes, the display-env stub's and the parse's own in ONE order -- the live block
+// keeps being written inline for the guest's read-backs. The flip hook above stays as it was.
+static void ps2xPrivInStream(PS2Memory *mem, uint32_t regOff, uint64_t value)
+{
+    if (!PS2Memory::stage1FenceEnabled()) return;
+    if (regOff != 0x00u && regOff != 0x20u && regOff != 0x70u && regOff != 0x80u && regOff != 0x90u && regOff != 0xA0u && regOff != 0xE0u) return;
+    PS2Memory::KickJob j; j.kind = PS2Memory::KickJob::GsApply;
+    j.fn = [regOff, value]() { ps2x_pgs::streamPriv(regOff, value); };
+    mem->enqueueKickJob(std::move(j));
+}
 
 void PS2Memory::write32(uint32_t address, uint32_t value)
 {
@@ -1085,6 +1097,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             *reg = newVal;
             ps2x_pgs::privWrite(regOff, newVal, &gs_regs);   // [pgs]
             if (regOff == 0x70u) ps2xDispFlipInStream(this, newVal);   // [displatch] DISPFB1
+            ps2xPrivInStream(this, regOff, newVal);   // [s1fence]
             // DISPFB1 (offset 0x0070) changed => the game swapped display buffers,
             // i.e. the just-rendered frame is complete. Snapshot it now.
             if (regOff == 0x0070u && changed && m_displaySwapCallback)
@@ -1147,6 +1160,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             *reg = value;
             ps2x_pgs::privWrite(regOff, value, &gs_regs);   // [pgs]
             if (regOff == 0x70u) ps2xDispFlipInStream(this, value);   // [displatch] DISPFB1
+            ps2xPrivInStream(this, regOff, value);   // [s1fence]
         }
         return;
     }
@@ -2441,13 +2455,41 @@ void PS2Memory::enqueueGpuSwapMarker()
     enqueueKickJob(std::move(j));
 }
 
-void PS2Memory::drainKickQueue()
+void PS2Memory::drainKickQueue(bool stage1Only)
 {
     std::unique_lock<std::mutex> lk(m_kickMtx);
     if (!m_kickThreadStarted)
         return;
+    if (stage1Only && stage1FenceEnabled())
+    {   // [s1fence] the worker has run every job: guest RAM is consumed, the packets are queued on stage 2 in order
+        Ps2xWaitScope w(WP_KICK_DRAIN); m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy) || m_kickStop; });
+        return;
+    }
     { Ps2xWaitScope w(WP_KICK_DRAIN); m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy && m_s2Pending.load(std::memory_order_acquire) == 0u) || m_kickStop; }); }   // [vu1pipe] both stages
 }
+
+bool PS2Memory::stage1FenceEnabled()
+{
+    // [s1fence] Why the frame-end drain existed: sceGsSyncPath(0) = "the path is idle", and on hardware that
+    // means the GS has consumed everything. Our pipeline split that into stage 1 (VIF+VU1 on the kick worker)
+    // and stage 2 (GIF parse on the GS thread); draining both serialised the game thread on the GS thread's
+    // tail every frame (~3.5-4 ms of a 60 fps frame on the i5-12400, [waitprof] kick_drain = fence_syncpath).
+    // What the guest actually needs after the fence: its RAM buffers free (true after stage 1: every job
+    // copies or consumes its data there), the channel idle (released at stage-1 job end), and every GS-side
+    // effect it causes AFTER the fence to land after the ones it caused before -- which holds as long as ALL
+    // of its GS-side writes travel the same queue: guest-thread GIF packets (processGIFPacket), the
+    // display-env stub and the privileged display-register bus stores are routed through the kick queue in
+    // this mode, and the presenter reads the display block in stream order. VRAM READS keep the full drain.
+    // The earlier [syncrelax]/[gsqueue] attempts relaxed the same fence WITHOUT routing those writers, so the
+    // game thread's in-place writes overtook queued draws (VRAM slot corruption, alternating flips).
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_S1FENCE"); const bool want = v && v[0] && v[0] != '0';
+                                   const bool on = want && vu1PipeEnabled() && ps2x_pgs::enabled();
+                                   if (want) std::fprintf(stderr, on ? "[s1fence] stage-1 SyncPath fence ON: guest GIF + display regs in stream order, presenter on the stream block\n"
+                                                                     : "[s1fence] PS2X_S1FENCE requested but needs [vu1pipe] + paraLLEl-GS -- OFF\n");
+                                   return on; }();
+    return s_on;
+}
+extern "C" bool ps2xStage1FenceC() { return PS2Memory::stage1FenceEnabled(); }   // [s1fence] for the GS stubs and the presenter
 
 // [framegate] The kick worker's BUSY time for the last completed frame, in ns. The frame gate in
 // game_overrides.cpp uses it to decide whether to enforce two vsync ticks: sync mode's brake was
@@ -2683,6 +2725,12 @@ void PS2Memory::kickWorkerLoop()
         if (vu1PipeEnabled())
         {   // [vu1pipe] the channel-busy release and the frame count belong to the stage that finishes the job's work
             Stage2Item it; it.kind = 3u; it.chan = (job.kind == KickJob::Vif1) ? 1u : (job.kind == KickJob::GifPath3) ? 2u : 0u;
+            if (stage1FenceEnabled())
+            {   // [s1fence] the guest's side of the transfer (its RAM, VU memory) is finished here; the GS side keeps flowing
+                if (it.chan == 1u)      m_asyncChanBusy[1].fetch_sub(1, std::memory_order_release);
+                else if (it.chan == 2u) m_asyncChanBusy[2].fetch_sub(1, std::memory_order_release);
+                it.chan = 0u;
+            }
             stage2Push(std::move(it));
             std::unique_lock<std::mutex> lk(m_kickMtx);
             m_kickBusy = false;
@@ -3221,6 +3269,19 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
         return;
     const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
     uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+    if (m_gifArbiter && asyncKickEnabled() && stage1FenceEnabled() && srcPhysAddr < PS2_RAM_SIZE)
+    {   // [s1fence] a guest-thread packet takes the kick queue like a DMA would: after what the guest kicked before it
+        uint32_t left = sizeBytes, src = srcPhysAddr;
+        while (left >= 16u)
+        {
+            const uint32_t chunk = (src + left > PS2_RAM_SIZE) ? (PS2_RAM_SIZE - src) : left;
+            if (chunk < 16u) break;
+            KickJob j; j.kind = KickJob::GifPath3; j.data.assign(m_rdram + src, m_rdram + src + chunk);
+            enqueueKickJob(std::move(j));
+            left -= chunk; src = 0u;
+        }
+        return;
+    }
     uint32_t bytesLeft = sizeBytes;
     while (bytesLeft >= 16)
     {
@@ -3321,7 +3382,12 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 
 void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (m_gifArbiter)
+    if (m_gifArbiter && asyncKickEnabled() && stage1FenceEnabled() && data && sizeBytes >= 16u)
+    {   // [s1fence] stream order, see above
+        KickJob j; j.kind = KickJob::GifPath3; j.data.assign(data, data + sizeBytes);
+        enqueueKickJob(std::move(j));
+    }
+    else if (m_gifArbiter)
         submitGifPacket(GifPathId::Path3, data, sizeBytes);
     else if (m_gifPacketCallback && data && sizeBytes >= 16)
         m_gifPacketCallback(data, sizeBytes);
