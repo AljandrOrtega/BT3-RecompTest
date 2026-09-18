@@ -1,0 +1,43 @@
+name: Cache Dependencies
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare-cache:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    # 1. Cache de paquetes PIP
+    - name: Cache Pip Packages
+      uses: actions/cache@v4
+      id: cache-pip
+      with:
+        path: ~\AppData\Local\pip\Cache
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/install-deps-windows.ps1') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    # 2. Cache de Qt y Mesa (Carpeta build)
+    - name: Cache Qt and Mesa
+      uses: actions/cache@v4
+      id: cache-deps
+      with:
+        path: build
+        key: ${{ runner.os }}-qt-mesa-6.5.3-26.2.0
+        restore-keys: |
+          ${{ runner.os }}-qt-mesa-
+
+    # 3. Descarga de dependencias (solo si la caché no existía)
+    - name: Download & Install Dependencies
+      shell: pwsh
+      run: |
+        .\install-deps-windows.ps1 -Install
