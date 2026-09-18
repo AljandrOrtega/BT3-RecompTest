@@ -11,12 +11,13 @@ jobs:
         id: cache-iso
         uses: actions/cache@v4
         with:
-          path: bt3-usa.iso
+          path: iso/
           key: iso-bt3-slus21678
 
       - name: Descargar ISO con aria2
         if: steps.cache-iso.outputs.cache-hit != 'true'
         shell: powershell
         run: |
+          New-Item -ItemType Directory -Force -Path iso
           choco install aria2 --no-progress -y
-          aria2c -x 16 -s 16 --check-certificate=false "https://archive.org/download/dbz-3-slus-21678/DBZ3_SLUS_21678.ISO" -o "bt3-usa.iso"
+          aria2c -x 16 -s 16 --check-certificate=false "https://archive.org/download/dbz-3-slus-21678/DBZ3_SLUS_21678.ISO" -o "iso/bt3-usa.iso"
