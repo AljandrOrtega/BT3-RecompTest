@@ -54,4 +54,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: runner-stage
-          path: build/stage/
+          path: |
+            build/stage/
+            games/bt3/work/
