@@ -21,7 +21,6 @@ env:
 
 jobs:
   build-launcher-package:
-    # Evita ejecutarse si el workflow 2 fallo cuando se dispara automáticamente
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: windows-latest
 
@@ -45,24 +44,20 @@ jobs:
         run: |
           .\install-deps-windows.ps1 -Install
 
-      - name: Descargar Artifact del Runner
+      - name: Descargar Artifact del Runner y Work
         uses: actions/download-artifact@v4
         with:
           name: runner-stage
-          path: build/stage
+          path: .
           run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Obtener ISO desde Caché
-        uses: actions/cache@v4
-        with:
-          path: bt3-usa.iso
-          key: iso-bt3-slus21678
-
-      - name: Compilar Launcher Qt y Empaquetar
+      - name: Compilar ÚNICAMENTE Launcher Qt y Empaquetar
         shell: powershell
         run: |
-          .\build-windows.ps1 -Iso "bt3-usa.iso" -OutDir "build/release-windows/out"
+          $env:CXXFLAGS = "-w"
+          $env:CFLAGS = "-w"
+          .\build-windows.ps1 -SkipSetup -OutDir "build/release-windows/out"
 
       - name: Subir Release Final
         uses: actions/upload-artifact@v4
