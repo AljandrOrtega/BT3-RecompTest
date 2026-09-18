@@ -36,9 +36,9 @@ foreach ($isoDir in @([Environment]::GetFolderPath("Desktop"), (Join-Path $env:U
         if ($isoHit) { $ISO_DEFAULT = $isoHit.FullName; break }
     }
 }
-$QT_VERSION = "6.5.3"
+$QT_VERSION = "6.6.3"
 $QT_HOST = "windows"
-# Qt 6.5.x ships only the msvc2019_64 kit; it is ABI-compatible with MSVC 2022.
+# Qt 6.6.x mantiene compatibilidad con MSVC/Clang-CL
 $QT_TARGET = "win64_msvc2019_64"   # aqtinstall arch name for the download
 $QT_INSTALL_DIR = "msvc2019_64"    # directory aqt creates under <outputdir>/<version>
 $QT_BASE = Join-Path $BUILD "qt"
