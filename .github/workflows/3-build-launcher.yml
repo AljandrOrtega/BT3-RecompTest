@@ -1,0 +1,51 @@
+name: "3. Compilar Launcher y Release"
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["2. Compilar Runner"]
+    types:
+      - completed
+
+jobs:
+  build-launcher-package:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Configurar entorno C++ de MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Instalar Ninja y LLVM
+        uses: llvm/actions/install-ninja@main
+
+      - name: Instalar dependencias de Qt y Sistema
+        shell: powershell
+        run: |
+          .\install-deps-windows.ps1 -Install
+
+      - name: Descargar Artifact del Runner
+        uses: actions/upload-artifact/download-artifact@v4
+        with:
+          name: runner-stage
+          path: build/release-windows/out/stage
+
+      - name: Compilar Launcher Qt y Empaquetar
+        shell: powershell
+        run: |
+          # Se usa -SkipSetup para no volver a procesar la ISO
+          .\build-windows.ps1 -SkipSetup -OutDir "build/release-windows/out"
+
+      - name: Subir Release Final
+        uses: actions/upload-artifact@v4
+        with:
+          name: BT3-Recomp-Windows-x86_64
+          path: |
+            build/release-windows/out/BT3-Recomp-x86_64.zip
+            build/release-windows/out/*.sha256
