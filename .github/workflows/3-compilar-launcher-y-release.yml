@@ -63,7 +63,7 @@ jobs:
         .\install-deps-windows.ps1 -Install
 
         # 2. Compila el Launcher, despliega DLLs (windeployqt), corre el PE gate y crea el ZIP final
-        .\build-windows.ps1 -LauncherOnly -SkipDeps
+        .\build-action.ps1 -LauncherOnly -SkipDeps
 
     # 9. Subir el ZIP resultante generado por el script en build/release-windows/out/
     - name: Subir Release Artefacto
