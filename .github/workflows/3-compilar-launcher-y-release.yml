@@ -14,7 +14,7 @@ jobs:
       with:
         submodules: false
 
-    # 2. Habilitar Long Paths antes de cualquier operación de Git
+    # 2. Habilitar Long Paths en Windows y Git
     - name: Habilitar Long Paths en Windows y Git
       shell: pwsh
       run: |
@@ -27,28 +27,28 @@ jobs:
       run: |
         git submodule update --init --recursive --depth 1
 
-    # 4. Instalar Qt6 requerido por el CMakeLists del Launcher
-    - name: Instalar Qt6
-      uses: jurplel/install-qt-action@v3
+    # 4. Configurar Python (requerido para pefile, aqtinstall y scripts auxiliares)
+    - name: Configurar Python
+      uses: actions/setup-python@v5
       with:
-        version: '6.5.3'
-        arch: 'win64_msvc2019_64'
+        python-version: '3.11'
 
-    # 4b. Configurar entorno de MSVC en el Runner
+    # 5. Configurar entorno MSVC en el Runner
     - name: Configurar entorno MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
-    # 5. Restaurar el binario del Runner compilado en el Flujo 2 (560 MB)
+    # 6. Restaurar el binario del Runner compilado en el Flujo 2
     - name: Restaurar Caché del Runner
       uses: actions/cache@v4
       with:
         path: |
           build/
+          games/bt3/work/
         key: runner-bin-${{ github.sha }}
         restore-keys: |
           runner-bin-
 
-    # 6. Validar que la carpeta de compilación previa exista
+    # 7. Validar que los artefactos del Runner existan
     - name: Validar Binarios del Runner
       shell: pwsh
       run: |
@@ -56,41 +56,19 @@ jobs:
           throw "No se encontró la carpeta 'build' en la caché. Debes ejecutar primero el flujo '2. Compilar Runner'."
         }
 
-    # 7. Configurar y compilar el Launcher (Qt6)
-    - name: Compilar Launcher (Qt6)
+    # 8. Instalar dependencias (Mesa Lavapipe, Qt, pefile) y ejecutar compilación/empaquetado
+    - name: Instalar Dependencias, Compilar Launcher y Generar Package
       shell: pwsh
       run: |
-        cmake -S ps2xRuntime/src/launcher -B build/launcher -G Ninja `
-          -DCMAKE_C_COMPILER=cl `
-          -DCMAKE_CXX_COMPILER=cl `
-          -DCMAKE_BUILD_TYPE=Release
+        # 1. Garantiza la descarga de Mesa Lavapipe y paquetes de Python
+        .\install-deps-windows.ps1 -Install
 
-        cmake --build build/launcher --config Release -j $env:NUMBER_OF_PROCESSORS
+        # 2. Compila el Launcher, despliega DLLs (windeployqt), corre el PE gate y crea el ZIP final
+        .\build-windows.ps1 -LauncherOnly -SkipDeps
 
-    # 8. Unificar ejecutable, desplegar DLLs de Qt6 y empaquetar en staging
-    - name: Desplegar Artefactos y DLLs de Qt
-      shell: pwsh
-      run: |
-        $stageDir = "build/release-windows/out/stage"
-        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
-
-        # Copiar ejecutable Launcher al staging
-        Copy-Item "build/launcher/Launcher.exe" -Destination "$stageDir/BT3-Launcher.exe" -Force
-
-        # Correr windeployqt para copiar las librerías dinámicas de Qt necesarias
-        windeployqt --release --no-compiler-runtime "$stageDir/BT3-Launcher.exe"
-
-    # 9. Crear archivo comprimido .zip listo para distribución
-    - name: Empaquetar Release ZIP
-      shell: pwsh
-      run: |
-        $stageDir = "build/release-windows/out/stage"
-        $zipPath = "BT3-Recomp-Windows-x64.zip"
-        Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -Force
-
-    # 10. Subir el ZIP como artefacto de la ejecución en GitHub Actions
+    # 9. Subir el ZIP resultante generado por el script en build/release-windows/out/
     - name: Subir Release Artefacto
       uses: actions/upload-artifact@v4
       with:
         name: BT3-Recomp-Windows-x64
-        path: BT3-Recomp-Windows-x64.zip
+        path: build/release-windows/out/BT3-Recomp-x86_64.zip
