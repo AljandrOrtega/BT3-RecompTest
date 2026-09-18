@@ -1,0 +1,30 @@
+name: Generate Sources Only
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-sources:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Restore ISO Cache
+      uses: actions/cache@v4
+      with:
+        path: iso/
+        key: ${{ runner.os }}-bt3-iso
+
+    - name: Run setup.py (--gen-only)
+      shell: pwsh
+      run: |
+        $isoPath = Get-ChildItem -Path "iso" -Filter "*.iso" | Select-Object -ExpandProperty FullName -First 1
+        if (-not $isoPath) { throw "ISO not found in iso/" }
+        python games/bt3/setup.py "$isoPath" --gen-only
