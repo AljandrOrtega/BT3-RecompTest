@@ -35,10 +35,10 @@ jobs:
           # Instalar Qt 6.6.3 en C:\Qt
           aqt install-qt windows desktop 6.6.3 win64_msvc2019_64 -o C:\Qt
           
-          # Exportar la ruta de Qt a las variables de entorno del runner
-          echo "C:\Qt\6.6.3\msvc2019_64\bin" >> $env:GITHUB_PATH
-          echo "QT_ROOT=C:\Qt\6.6.3\msvc2019_64" >> $env:GITHUB_ENV
-          echo "Qt6_DIR=C:\Qt\6.6.3\msvc2019_64\lib\cmake\Qt6" >> $env:GITHUB_ENV
+          # Configurar variables de entorno correctamente en GitHub Actions con PowerShell
+          "C:\Qt\6.6.3\msvc2019_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "QT_ROOT=C:\Qt\6.6.3\msvc2019_64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "Qt6_DIR=C:\Qt\6.6.3\msvc2019_64\lib\cmake\Qt6" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           
           .\install-deps-windows.ps1 -Install
 
@@ -61,6 +61,12 @@ jobs:
         run: |
           $env:CFLAGS = "-w"
           $env:CXXFLAGS = "-w"
+          
+          # Forzar a la sesión actual a reconocer Qt antes de ejecutar el script
+          $env:QT_ROOT = "C:\Qt\6.6.3\msvc2019_64"
+          $env:Qt6_DIR = "C:\Qt\6.6.3\msvc2019_64\lib\cmake\Qt6"
+          $env:PATH = "C:\Qt\6.6.3\msvc2019_64\bin;$env:PATH"
+
           .\build-windows.ps1 -Iso "bt3-usa.iso"
 
       - name: Empaquetar Release
