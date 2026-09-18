@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(bt3_launcher LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
@@ -113,16 +113,7 @@ target_link_libraries(Launcher PRIVATE
 # lld-link cannot resolve against a .lib. Keep the same macro on the launcher side.
 target_compile_definitions(Launcher PRIVATE LIBARCHIVE_STATIC)
 
-if(MSVC)
-    # Deshabilita el modo estricto en MSVC para que Qt 6.5.3 pueda usar 'stdext'
-    target_compile_options(Launcher PRIVATE /EHsc /permissive /W3)
-    # Remueve /permissive- de las flags target de CMake
-    get_target_property(LAUNCHER_FLAGS Launcher COMPILE_OPTIONS)
-    if(LAUNCHER_FLAGS)
-        string(REPLACE "/permissive-" "/permissive" LAUNCHER_FLAGS "${LAUNCHER_FLAGS}")
-        set_target_properties(Launcher PROPERTIES COMPILE_OPTIONS "${LAUNCHER_FLAGS}")
-    endif()
-else()
+if(NOT MSVC)
     target_compile_options(Launcher PRIVATE -Wall -Wextra)
 endif()
 
