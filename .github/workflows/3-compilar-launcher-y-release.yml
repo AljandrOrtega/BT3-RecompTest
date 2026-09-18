@@ -66,7 +66,7 @@ jobs:
           -DCMAKE_CXX_FLAGS="-w" `
           -DCMAKE_BUILD_TYPE=Release
 
-        cmake --build $launcherBuild --config Release -j$env:NUMBER_OF_PROCESSORS
+        cmake --build $launcherBuild --config Release -j $env:NUMBER_OF_PROCESSORS
 
     # 8. Unificar ejecutable, desplegar DLLs de Qt6 y empaquetar en staging
     - name: Desplegar Artefactos y DLLs de Qt
