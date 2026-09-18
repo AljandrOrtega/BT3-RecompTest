@@ -56,25 +56,24 @@ jobs:
           throw "No se encontró la carpeta 'build' en la caché. Debes ejecutar primero el flujo '2. Compilar Runner'."
         }
 
-    # 7. Configurar y compilar el Launcher removiendo /permissive- de CMake
+    # 7. Configurar y compilar el Launcher (Qt6)
     - name: Compilar Launcher (Qt6)
       shell: pwsh
       run: |
-        $launcherSrc = "ps2xRuntime/src/launcher"
-        $launcherBuild = "build/launcher"
-        
-        cmake -S $launcherSrc -B$launcherBuild -G Ninja `
+        cmake -S ps2xRuntime/src/launcher -B build/launcher -G Ninja `
           -DCMAKE_C_COMPILER=cl `
           -DCMAKE_CXX_COMPILER=cl `
           -DCMAKE_CXX_FLAGS="/EHsc /permissive -w" `
           -DCMAKE_C_FLAGS="-w" `
           -DCMAKE_BUILD_TYPE=Release `
-          -DCMAKE_CXX_FLAGS_RELEASE="/EHsc /permissive -w"
+          -DCMAKE_POLICY_DEFAULT_CMP0092=NEW
 
-        # Remover forzosamente la bandera /permissive- generada por CMake C++20
-        (Get-Content "$launcherBuild/build.ninja") -replace '/permissive-', '/permissive' | Set-Content "$launcherBuild/build.ninja"
+        # Deshabilitar /permissive- en el build.ninja si CMake lo agregó
+        if (Test-Path "build/launcher/build.ninja") {
+            (Get-Content "build/launcher/build.ninja") -replace '/permissive-', '/permissive' | Set-Content "build/launcher/build.ninja"
+        }
 
-        cmake --build $launcherBuild --config Release -j $env:NUMBER_OF_PROCESSORS
+        cmake --build build/launcher --config Release -j $env:NUMBER_OF_PROCESSORS
 
     # 8. Unificar ejecutable, desplegar DLLs de Qt6 y empaquetar en staging
     - name: Desplegar Artefactos y DLLs de Qt
