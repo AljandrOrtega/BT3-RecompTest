@@ -1,0 +1,97 @@
+name: "3. Compilar Launcher y Release"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-launcher-release:
+    runs-on: windows-latest
+
+    steps:
+    # 1. Checkout básico sin submódulos pesados
+    - name: Checkout repositorio
+      uses: actions/checkout@v4
+      with:
+        submodules: false
+
+    # 2. Habilitar Long Paths antes de cualquier operación de Git
+    - name: Habilitar Long Paths en Windows y Git
+      shell: pwsh
+      run: |
+        git config --global core.longpaths true
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    # 3. Descargar submódulos necesarios con profundidad 1
+    - name: Descargar Submódulos
+      shell: pwsh
+      run: |
+        git submodule update --init --recursive --depth 1
+
+    # 4. Instalar Qt6 requerido por el CMakeLists del Launcher
+    - name: Instalar Qt6
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.5.3'
+        arch: 'win64_msvc2019_64'
+
+    # 5. Restaurar el binario del Runner compilado en el Flujo 2 (560 MB)
+    - name: Restaurar Caché del Runner
+      uses: actions/cache@v4
+      with:
+        path: |
+          build/
+        key: runner-bin-${{ github.sha }}
+        restore-keys: |
+          runner-bin-
+
+    # 6. Validar que la carpeta de compilación previa exista
+    - name: Validar Binarios del Runner
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "build")) {
+          throw "No se encontró la carpeta 'build' en la caché. Debes ejecutar primero el flujo '2. Compilar Runner'."
+        }
+
+    # 7. Configurar y compilar el target del Launcher usando Ninja y silenciando warnings
+    - name: Compilar Launcher (Qt6)
+      shell: pwsh
+      run: |
+        $launcherSrc = "ps2xRuntime/src/launcher"
+        $launcherBuild = "build/launcher"
+        
+        cmake -S $launcherSrc -B $launcherBuild -G Ninja `
+          -DCMAKE_C_COMPILER=clang-cl `
+          -DCMAKE_CXX_COMPILER=clang-cl `
+          -DCMAKE_C_FLAGS="-w" `
+          -DCMAKE_CXX_FLAGS="-w" `
+          -DCMAKE_BUILD_TYPE=Release
+
+        cmake --build $launcherBuild --config Release -j$env:NUMBER_OF_PROCESSORS
+
+    # 8. Unificar ejecutable, desplegar DLLs de Qt6 y empaquetar en staging
+    - name: Desplegar Artefactos y DLLs de Qt
+      shell: pwsh
+      run: |
+        $stageDir = "build/release-windows/out/stage"
+        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+        # Copiar ejecutable Launcher al staging
+        Copy-Item "build/launcher/Launcher.exe" -Destination "$stageDir/BT3-Launcher.exe" -Force
+
+        # Correr windeployqt para copiar las librerías dinámicas de Qt necesarias
+        windeployqt --release --no-compiler-runtime "$stageDir/BT3-Launcher.exe"
+
+    # 9. Crear archivo comprimido .zip listo para distribución
+    - name: Empaquetar Release ZIP
+      shell: pwsh
+      run: |
+        $stageDir = "build/release-windows/out/stage"
+        $zipPath = "BT3-Recomp-Windows-x64.zip"
+        Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -Force
+
+    # 10. Subir el ZIP como artefacto de la ejecución en GitHub Actions
+    - name: Subir Release Artefacto
+      uses: actions/upload-artifact@v4
+      with:
+        name: BT3-Recomp-Windows-x64
+        path: BT3-Recomp-Windows-x64.zip
