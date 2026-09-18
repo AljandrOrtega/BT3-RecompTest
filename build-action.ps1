@@ -241,7 +241,7 @@ $cmakeLauncherArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",
     "-DCMAKE_CXX_COMPILER=clang-cl",
     "-DCMAKE_C_COMPILER=clang-cl",
-    "-DCMAKE_CXX_FLAGS=/FIiterator",
+    "-DCMAKE_CXX_FLAGS=/FIiterator /EHsc",
     "-DCMAKE_PREFIX_PATH=$QT_ROOT",
     "-DPS2X_CMAKE_EXTRA_ROOTS=$QT_ROOT"
 )
