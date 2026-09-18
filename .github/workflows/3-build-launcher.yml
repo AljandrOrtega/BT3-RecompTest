@@ -2,14 +2,26 @@ name: "3. Compilar Launcher y Release"
 
 on:
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID de ejecucion de "2-build-runner" (opcional si ejecutas manualmente)'
+        required: false
+        type: string
   workflow_run:
-    workflows: ["2. Compilar Runner"]
+    workflows: ["2-build-runner"]
     types:
       - completed
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   build-launcher-package:
+    # Evita ejecutarse si el workflow 2 fallo cuando se dispara automáticamente
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: windows-latest
+
     steps:
       - name: Checkout del código
         uses: actions/checkout@v4
@@ -31,15 +43,16 @@ jobs:
           .\install-deps-windows.ps1 -Install
 
       - name: Descargar Artifact del Runner
-        uses: actions/upload-artifact/download-artifact@v4
+        uses: actions/download-artifact@v4
         with:
           name: runner-stage
           path: build/release-windows/out/stage
+          run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compilar Launcher Qt y Empaquetar
         shell: powershell
         run: |
-          # Se usa -SkipSetup para no volver a procesar la ISO
           .\build-windows.ps1 -SkipSetup -OutDir "build/release-windows/out"
 
       - name: Subir Release Final
