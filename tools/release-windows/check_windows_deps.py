@@ -79,6 +79,7 @@ OS_COMPONENTS = {
     "cfgmgr32.dll",
     "d2d1.dll",
     "d3d11.dll",
+    "d3d12.dll",     # <--- Añadido para Qt6Gui / Direct3D 12
     "d3d9.dll",
     "dxgi.dll",
     "opengl32.dll",
@@ -86,13 +87,14 @@ OS_COMPONENTS = {
     "winspool.drv",
     "d3dcompiler_47.dll",
     "wldap32.dll",
-    "wtsapi32.dll",
     "dbghelp.dll",
     # Video capture (AVICAP32), authorization (AUTHZ), DNS, DirectWrite
     "avicap32.dll",
     "authz.dll",
     "dnsapi.dll",
     "dwrite.dll",
+    # Criptografía y TLS de Windows (utilizado por qschannelbackend.dll)
+    "ncrypt.dll",    # <--- Añadido para el backend TLS de Qt (Schannel)
     # ODBC driver manager (ships with Windows; Qt SQL plugin imports it)
     "odbc32.dll",
     "odbcint.dll",
