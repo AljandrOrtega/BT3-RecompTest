@@ -34,6 +34,10 @@ jobs:
         version: '6.5.3'
         arch: 'win64_msvc2019_64'
 
+    # 4b. Configurar entorno de MSVC en el Runner
+    - name: Configurar entorno MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+
     # 5. Restaurar el binario del Runner compilado en el Flujo 2 (560 MB)
     - name: Restaurar Caché del Runner
       uses: actions/cache@v4
@@ -52,7 +56,7 @@ jobs:
           throw "No se encontró la carpeta 'build' en la caché. Debes ejecutar primero el flujo '2. Compilar Runner'."
         }
 
-    # 7. Configurar y compilar el target del Launcher usando Ninja y silenciando warnings
+    # 7. Configurar y compilar el Launcher con MSVC (cl.exe)
     - name: Compilar Launcher (Qt6)
       shell: pwsh
       run: |
@@ -60,6 +64,8 @@ jobs:
         $launcherBuild = "build/launcher"
         
         cmake -S $launcherSrc -B $launcherBuild -G Ninja `
+          -DCMAKE_C_COMPILER=cl `
+          -DCMAKE_CXX_COMPILER=cl `
           -DCMAKE_C_FLAGS="-w" `
           -DCMAKE_CXX_FLAGS="-w" `
           -DCMAKE_BUILD_TYPE=Release
