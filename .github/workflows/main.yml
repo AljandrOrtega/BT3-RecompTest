@@ -60,9 +60,10 @@ jobs:
         shell: powershell
         run: |
           $env:CFLAGS = "-w"
-          $env:CXXFLAGS = "-w"
+          # Añadir flag para deshabilitar las extensiones antiguas de iteradores en clang-cl y MSVC
+          $env:CXXFLAGS = "-w -D_SILENCE_STDEXT_ARR_IT_DEPRECATION_WARNING -D_ALLOW_ITERATOR_DEBUG_LEVEL_MISMATCH"
           
-          # Forzar a la sesión actual a reconocer Qt antes de ejecutar el script
+          # Mantener variables de Qt
           $env:QT_ROOT = "C:\Qt\6.6.3\msvc2019_64"
           $env:Qt6_DIR = "C:\Qt\6.6.3\msvc2019_64\lib\cmake\Qt6"
           $env:PATH = "C:\Qt\6.6.3\msvc2019_64\bin;$env:PATH"
