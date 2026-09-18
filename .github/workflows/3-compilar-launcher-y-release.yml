@@ -63,15 +63,7 @@ jobs:
         cmake -S ps2xRuntime/src/launcher -B build/launcher -G Ninja `
           -DCMAKE_C_COMPILER=cl `
           -DCMAKE_CXX_COMPILER=cl `
-          -DCMAKE_CXX_FLAGS="/EHsc /permissive -w" `
-          -DCMAKE_C_FLAGS="-w" `
-          -DCMAKE_BUILD_TYPE=Release `
-          -DCMAKE_POLICY_DEFAULT_CMP0092=NEW
-
-        # Deshabilitar /permissive- en el build.ninja si CMake lo agregó
-        if (Test-Path "build/launcher/build.ninja") {
-            (Get-Content "build/launcher/build.ninja") -replace '/permissive-', '/permissive' | Set-Content "build/launcher/build.ninja"
-        }
+          -DCMAKE_BUILD_TYPE=Release
 
         cmake --build build/launcher --config Release -j $env:NUMBER_OF_PROCESSORS
 
