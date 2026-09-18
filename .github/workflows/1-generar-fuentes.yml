@@ -11,6 +11,13 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # Habilitar soporte para rutas largas en Git y Windows
+    - name: Habilitar Long Paths
+      shell: pwsh
+      run: |
+        git config --global core.longpaths true
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -22,9 +29,24 @@ jobs:
         path: iso/
         key: iso-bt3-slus21678
 
+    # 1. Primero generas las fuentes C++
     - name: Run setup.py (--gen-only)
       shell: pwsh
       run: |
         $isoPath = Get-ChildItem -Path "iso" -Filter "*.iso" | Select-Object -ExpandProperty FullName -First 1
-        if (-not $isoPath) { throw "ISO not found in iso/" }
+        if (-not $isoPath) { throw "ISO no encontrada en la carpeta iso/" }
         python games/bt3/setup.py "$isoPath" --gen-only
+
+    # 2. Luego guardas el resultado en la caché
+    - name: Guardar Fuentes C++ Generadas en Caché
+      uses: actions/cache@v4
+      with:
+        path: |
+          games/bt3/work
+          ps2xRuntime/src/runner
+          ps2xRuntime/src/runner_overlay
+          ps2xRuntime/include
+          ps2xRuntime/src/lib/vu1_jit_gen.inc
+        key: sources-bt3-${{ github.sha }}
+        restore-keys: |
+          sources-bt3-
