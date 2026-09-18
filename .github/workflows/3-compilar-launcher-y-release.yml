@@ -37,9 +37,9 @@ jobs:
     - name: Configurar entorno MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
-    # 6. Restaurar el binario del Runner compilado en el Flujo 2
+    # 6. Restaurar la Caché del Runner
     - name: Restaurar Caché del Runner
-      uses: actions/cache@v4
+      uses: actions/cache/restore@v4
       with:
         path: |
           build/
