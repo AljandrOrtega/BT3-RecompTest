@@ -31,8 +31,12 @@ function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
 function Fail($msg) { Write-Error $msg; exit 1 }
 
 function Test-FileCmd($name) {
-    if ($PSVersionTable.PSEdition -eq "Core") { $exe = $name + (if ($IsWindows) { ".exe" } else { "" }) }
-    else { $exe = $name + ".exe" }
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        $ext = if ($IsWindows) { ".exe" } else { "" }
+        $exe = $name + $ext
+    } else {
+        $exe = $name + ".exe"
+    }
     return [bool](Get-Command $exe -ErrorAction SilentlyContinue)
 }
 
