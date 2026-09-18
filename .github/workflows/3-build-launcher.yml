@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       runner_sha:
-        description: 'SHA del commit que generó la caché del Runner (dejar vacío para usar HEAD)'
+        description: 'SHA del commit que generó la caché del Runner'
         required: false
         type: string
   workflow_run:
@@ -15,9 +15,6 @@ on:
 permissions:
   contents: read
   actions: read
-
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
 
 jobs:
   build-launcher-package:
@@ -39,10 +36,9 @@ jobs:
       - name: Instalar Ninja y LLVM
         uses: llvm/actions/install-ninja@main
 
-      # CACHÉ 1: Dependencias del sistema / Qt / Mesa (Evita descargarlas nuevamente)
-      - name: Caché Dependencias de Qt y Sistema
-        id: cache-system-deps
-        uses: actions/cache@v4
+      # Solo restaura Qt y Mesa de la caché global previa (no ejecuta script de instalación)
+      - name: Restaurar Caché Dependencias de Sistema (Qt/Mesa)
+        uses: actions/cache/restore@v4
         with:
           path: |
             C:\Qt
@@ -50,13 +46,7 @@ jobs:
             ~\AppData\Local\pip\Cache
           key: deps-qt-mesa-v1
 
-      - name: Instalar dependencias de Qt y Sistema (si no están en caché)
-        if: steps.cache-system-deps.outputs.cache-hit != 'true'
-        shell: powershell
-        run: |
-          .\install-deps-windows.ps1 -Install
-
-      # CACHÉ 2: Restaurar Archivos de Runner y Work generados en el Workflow 2
+      # Restaurar Archivos del Runner y Work
       - name: Restaurar Caché de Runner y Work
         uses: actions/cache/restore@v4
         with:
@@ -67,7 +57,7 @@ jobs:
           restore-keys: |
             runner-work-
 
-      # Compilar aisladamente solo el Launcher en su propia etapa limpia
+      # PASO AISLADO: Compilación pura del Launcher
       - name: Compilar ÚNICAMENTE Launcher Qt y Empaquetar
         shell: powershell
         run: |
