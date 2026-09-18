@@ -1,0 +1,86 @@
+name: "2. Compilar Runner"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-runner:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # Habilitar soporte para rutas largas en Git y Windows
+    - name: Habilitar Long Paths
+      shell: pwsh
+      run: |
+        git config --global core.longpaths true
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    # Restaurar las fuentes C++ generadas en el Flujo 1
+    - name: Restaurar Fuentes C++
+      uses: actions/cache@v4
+      with:
+        path: |
+          games/bt3/work
+          ps2xRuntime/src/runner
+          ps2xRuntime/src/runner_overlay
+          ps2xRuntime/include
+          ps2xRuntime/src/lib/vu1_jit_gen.inc
+        key: sources-bt3-${{ github.sha }}
+
+    # Validar que las fuentes existan antes de compilar
+    - name: Validar Fuentes C++
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "games/bt3/work/SLUS_216.78")) {
+          throw "No se encontraron las fuentes en la caché. Debes ejecutar primero el flujo '1. Generar Fuentes'."
+        }
+
+    # Pre-configurar CMake apagando proyectos pesados (Studio, Recomp, Analyzer, Test)
+    - name: Pre-configurar CMake (Target único)
+      shell: pwsh
+      run: |
+        cmake -S . -B build -G Ninja `
+          -DCMAKE_C_COMPILER=clang-cl `
+          -DCMAKE_CXX_COMPILER=clang-cl `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DPS2X_BUILD_RECOMP=OFF `
+          -DPS2X_BUILD_ANALYZER=OFF `
+          -DPS2X_BUILD_TEST=OFF `
+          -DPS2X_BUILD_STUDIO=OFF `
+          -DPS2X_SHOW_WINDOWS_CONSOLE=OFF
+
+    # Generar fuentes faltantes de VU1 y compilar el Runner
+    - name: Compilar Runner (--skip-setup)
+      shell: pwsh
+      run: |
+        python games/bt3/setup.py --skip-setup --deploy "build/release-windows/out/stage"
+
+    # Renombrar ps2EntryRunner.exe a bt3-runner.exe en el staging
+    - name: Preparar ejecutable del Runner
+      shell: pwsh
+      run: |
+        $runnerPath = "build/release-windows/out/stage/ps2EntryRunner.exe"
+        if (Test-Path $runnerPath) {
+          Move-Item $runnerPath "build/release-windows/out/stage/bt3-runner.exe" -Force
+          Write-Host "Ejecutable renombrado a bt3-runner.exe"
+        }
+
+    # Guardar la carpeta build/ compilada en caché para el Flujo 3
+    - name: Guardar Runner Binario en Caché
+      uses: actions/cache@v4
+      with:
+        path: |
+          build/
+        key: runner-bin-${{ github.sha }}
+        restore-keys: |
+          runner-bin-
