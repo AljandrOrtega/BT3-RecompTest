@@ -1,0 +1,32 @@
+name: "0. Preparar Dependencias del Sistema"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cache-system-deps:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Restaurar / Crear Caché de Qt y Mesa
+        id: cache-qt
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Qt
+            C:\tools
+            ~\AppData\Local\pip\Cache
+          key: deps-qt-mesa-v1
+
+      - name: Instalar dependencias pesadas (Solo si no hay Caché)
+        if: steps.cache-qt.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          .\install-deps-windows.ps1 -Install
