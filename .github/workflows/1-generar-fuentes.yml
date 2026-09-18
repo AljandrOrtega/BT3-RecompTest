@@ -1,4 +1,4 @@
-name: Generate Sources Only
+name: "1. Generar Fuentes"
 
 on:
   workflow_dispatch:
