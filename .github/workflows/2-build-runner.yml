@@ -1,0 +1,57 @@
+name: "2. Compilar Runner"
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["1. Preparar ISO"]
+    types:
+      - completed
+
+jobs:
+  build-runner:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Configurar entorno C++ de MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Instalar Ninja y LLVM
+        uses: llvm/actions/install-ninja@main
+
+      - name: Instalar dependencias base
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pefile
+
+      - name: Obtener ISO desde Caché
+        uses: actions/cache@v4
+        with:
+          path: bt3-usa.iso
+          key: iso-bt3-slus21678
+
+      - name: Pre-configurar y Compilar Runner
+        shell: powershell
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release -DPS2X_BUILD_STUDIO=OFF -DPS2X_SHOW_WINDOWS_CONSOLE=OFF
+          python games/bt3/setup.py bt3-usa.iso --deploy build/stage --jobs 4
+
+      - name: Renombrar Runner
+        shell: powershell
+        run: |
+          if (Test-Path "build/stage/ps2EntryRunner.exe") {
+            Move-Item "build/stage/ps2EntryRunner.exe" "build/stage/bt3-runner.exe" -Force
+          }
+
+      - name: Subir Artifact del Runner
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-stage
+          path: build/stage/
