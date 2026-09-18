@@ -43,6 +43,8 @@ jobs:
           ps2xRuntime/include
           ps2xRuntime/src/lib/vu1_jit_gen.inc
         key: sources-bt3-${{ github.sha }}
+        restore-keys: |
+          sources-bt3-
 
     # Validar que las fuentes existan antes de compilar
     - name: Validar Fuentes C++
