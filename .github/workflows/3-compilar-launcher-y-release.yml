@@ -56,19 +56,23 @@ jobs:
           throw "No se encontró la carpeta 'build' en la caché. Debes ejecutar primero el flujo '2. Compilar Runner'."
         }
 
-    # 7. Configurar y compilar el Launcher habilitando extensiones MSVC para Qt6
+    # 7. Configurar y compilar el Launcher removiendo /permissive- de CMake
     - name: Compilar Launcher (Qt6)
       shell: pwsh
       run: |
         $launcherSrc = "ps2xRuntime/src/launcher"
         $launcherBuild = "build/launcher"
         
-        cmake -S $launcherSrc -B $launcherBuild -G Ninja `
+        cmake -S $launcherSrc -B$launcherBuild -G Ninja `
           -DCMAKE_C_COMPILER=cl `
           -DCMAKE_CXX_COMPILER=cl `
           -DCMAKE_CXX_FLAGS="/EHsc /permissive -w" `
           -DCMAKE_C_FLAGS="-w" `
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_CXX_FLAGS_RELEASE="/EHsc /permissive -w"
+
+        # Remover forzosamente la bandera /permissive- generada por CMake C++20
+        (Get-Content "$launcherBuild/build.ninja") -replace '/permissive-', '/permissive' \vert{} Set-Content "$launcherBuild/build.ninja"
 
         cmake --build $launcherBuild --config Release -j $env:NUMBER_OF_PROCESSORS
 
