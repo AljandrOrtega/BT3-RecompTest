@@ -16,6 +16,9 @@ permissions:
   contents: read
   actions: read
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+
 jobs:
   build-launcher-package:
     # Evita ejecutarse si el workflow 2 fallo cuando se dispara automáticamente
@@ -46,14 +49,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: runner-stage
-          path: build/release-windows/out/stage
+          path: build/stage
           run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Obtener ISO desde Caché
+        uses: actions/cache@v4
+        with:
+          path: bt3-usa.iso
+          key: iso-bt3-slus21678
 
       - name: Compilar Launcher Qt y Empaquetar
         shell: powershell
         run: |
-          .\build-windows.ps1 -SkipSetup -OutDir "build/release-windows/out"
+          .\build-windows.ps1 -Iso "bt3-usa.iso" -OutDir "build/release-windows/out"
 
       - name: Subir Release Final
         uses: actions/upload-artifact@v4
