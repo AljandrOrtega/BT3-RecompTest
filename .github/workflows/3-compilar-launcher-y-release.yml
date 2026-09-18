@@ -39,14 +39,12 @@ jobs:
 
     # 6. Restaurar la Caché del Runner
     - name: Restaurar Caché del Runner
-      uses: actions/cache/restore@v4
+      uses: actions/cache@v4
       with:
         path: |
           build/
           games/bt3/work/
-        key: runner-bin-${{ github.sha }}
-        restore-keys: |
-          runner-bin-
+        key: runner-bin-54a075a1f08e50971d376b4de40b07c21b942a19
 
     # 7. Validar que los artefactos del Runner existan
     - name: Validar Binarios del Runner
