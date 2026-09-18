@@ -43,11 +43,10 @@ jobs:
       with:
         path: |
           build/
-          games/bt3/work/
         key: runner-bin-${{ github.sha }}
         restore-keys: |
           runner-bin-
-
+          
     # 7. Validar que los artefactos del Runner existan
     - name: Validar Binarios del Runner
       shell: pwsh
