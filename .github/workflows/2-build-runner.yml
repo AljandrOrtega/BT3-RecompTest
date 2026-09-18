@@ -31,12 +31,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pefile
 
-      - name: Obtener ISO desde Caché
+      # Restaurar o guardar ISO
+      - name: Cache ISO
         uses: actions/cache@v4
         with:
           path: bt3-usa.iso
           key: iso-bt3-slus21678
 
+      # Pre-configurar y generar Runner + Fuentes recompiladas
       - name: Pre-configurar y Compilar Runner
         shell: powershell
         run: |
@@ -50,6 +52,16 @@ jobs:
             Move-Item "build/stage/ps2EntryRunner.exe" "build/stage/bt3-runner.exe" -Force
           }
 
+      # Guardar build/stage y games/bt3/work en Caché global para workflows posteriores
+      - name: Guardar Runner y Work en Caché
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/stage
+            games/bt3/work
+          key: runner-work-${{ github.sha }}
+
+      # Mantenemos upload-artifact como respaldo de seguridad rápido
       - name: Subir Artifact del Runner
         uses: actions/upload-artifact@v4
         with:
