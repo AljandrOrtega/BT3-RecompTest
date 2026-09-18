@@ -18,11 +18,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $BUILD = Join-Path $PSScriptRoot "build"
-$QT_VERSION = "6.5.3"
+# Actualizamos a una versión de Qt compatible con Clang-CL y C++ moderno
+$QT_VERSION = "6.6.3" 
 $QT_HOST = "windows"
-# Qt 6.5.x ships only the msvc2019_64 kit; it is ABI-compatible with MSVC 2022.
-$QT_TARGET = "win64_msvc2019_64"   # aqtinstall arch name for the download
-$QT_INSTALL_DIR = "msvc2019_64"    # directory aqt creates under <outputdir>/<version>
+$QT_TARGET = "win64_msvc2019_64"   
+$QT_INSTALL_DIR = "msvc2019_64"    
 $QT_BASE = Join-Path $BUILD "qt"
 $QT_ROOT = Join-Path $QT_BASE "$QT_VERSION\$QT_INSTALL_DIR"
 
@@ -103,32 +103,6 @@ if ($pipPresent) {
         if (-not (Test-Path $QT_ROOT)) { Fail "Qt not found at $QT_ROOT after install" }
         Log "Qt installed: $QT_ROOT"
     }
-}
-
-# Mesa lavapipe (software Vulkan ICD) -- bundled on Windows so the launcher can
-# run paraLLEl-GS when the vendor Vulkan driver is broken (the AMD proprietary
-# driver access-violates inside amdvlk64.dll during shader compilation on
-# Polaris/GCN parts). Fetched here so the Windows build is reproducible.
-$MESA_VERSION = "26.2.0"
-$MESA_DIR = Join-Path $BUILD "mesa"
-$MESA_DLL = Join-Path $MESA_DIR "x64\vulkan_lvp.dll"
-if (Test-Path $MESA_DLL) {
-    Log "Mesa lavapipe found at $MESA_DIR"
-} elseif ($Install) {
-    Step "Downloading Mesa lavapipe $MESA_VERSION"
-    New-Item -ItemType Directory -Force -Path $MESA_DIR | Out-Null
-    $sevenZr = Join-Path $MESA_DIR "7zr.exe"
-    if (-not (Test-Path $sevenZr)) {
-        Invoke-WebRequest "https://www.7-zip.org/a/7zr.exe" -OutFile $sevenZr -UseBasicParsing
-    }
-    $mesaArchive = Join-Path $MESA_DIR "mesa.7z"
-    Invoke-WebRequest "https://github.com/pal1000/mesa-dist-win/releases/download/$MESA_VERSION/mesa3d-$MESA_VERSION-release-msvc.7z" -OutFile $mesaArchive -UseBasicParsing
-    & $sevenZr x $mesaArchive "-o$MESA_DIR" -y | Out-Null
-    Remove-Item $mesaArchive -Force -ErrorAction SilentlyContinue
-    if (-not (Test-Path $MESA_DLL)) { Fail "lavapipe not found after extraction ($MESA_DLL)" }
-    Log "Mesa lavapipe installed: $MESA_DIR"
-} else {
-    Log "Mesa lavapipe missing (run with -Install to fetch it)"
 }
 
 if (-not $Install) {
