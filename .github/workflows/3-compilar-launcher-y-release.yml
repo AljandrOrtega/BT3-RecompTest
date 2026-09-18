@@ -56,7 +56,7 @@ jobs:
           throw "No se encontró la carpeta 'build' en la caché. Debes ejecutar primero el flujo '2. Compilar Runner'."
         }
 
-    # 7. Configurar y compilar el Launcher con MSVC (cl.exe)
+    # 7. Configurar y compilar el Launcher habilitando extensiones MSVC para Qt6
     - name: Compilar Launcher (Qt6)
       shell: pwsh
       run: |
@@ -66,8 +66,8 @@ jobs:
         cmake -S $launcherSrc -B $launcherBuild -G Ninja `
           -DCMAKE_C_COMPILER=cl `
           -DCMAKE_CXX_COMPILER=cl `
+          -DCMAKE_CXX_FLAGS="/EHsc /permissive -w" `
           -DCMAKE_C_FLAGS="-w" `
-          -DCMAKE_CXX_FLAGS="-w" `
           -DCMAKE_BUILD_TYPE=Release
 
         cmake --build $launcherBuild --config Release -j $env:NUMBER_OF_PROCESSORS
