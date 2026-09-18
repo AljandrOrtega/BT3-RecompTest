@@ -36,7 +36,7 @@ ELF_SHA256 = "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99"
 IS_WINDOWS = os.name == "nt"
 IS_MACOS = sys.platform == "darwin"
 # Generated TUs are huge; high job counts can exhaust RAM (16 GB: keep <= 3).
-DEFAULT_JOBS = "3"
+DEFAULT_JOBS = "4"
 
 
 def die(msg: str) -> None:
