@@ -3,12 +3,12 @@ name: "3. Compilar Launcher y Release"
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: 'ID de ejecucion de "2-build-runner" (opcional si ejecutas manualmente)'
+      runner_sha:
+        description: 'SHA del commit que generó la caché del Runner (dejar vacío para usar HEAD)'
         required: false
         type: string
   workflow_run:
-    workflows: ["2-build-runner"]
+    workflows: ["2. Compilar Runner"]
     types:
       - completed
 
@@ -39,19 +39,35 @@ jobs:
       - name: Instalar Ninja y LLVM
         uses: llvm/actions/install-ninja@main
 
-      - name: Instalar dependencias de Qt y Sistema
+      # CACHÉ 1: Dependencias del sistema / Qt / Mesa (Evita descargarlas nuevamente)
+      - name: Caché Dependencias de Qt y Sistema
+        id: cache-system-deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Qt
+            C:\tools
+            ~\AppData\Local\pip\Cache
+          key: deps-qt-mesa-v1
+
+      - name: Instalar dependencias de Qt y Sistema (si no están en caché)
+        if: steps.cache-system-deps.outputs.cache-hit != 'true'
         shell: powershell
         run: |
           .\install-deps-windows.ps1 -Install
 
-      - name: Descargar Artifact del Runner y Work
-        uses: actions/download-artifact@v4
+      # CACHÉ 2: Restaurar Archivos de Runner y Work generados en el Workflow 2
+      - name: Restaurar Caché de Runner y Work
+        uses: actions/cache/restore@v4
         with:
-          name: runner-stage
-          path: .
-          run-id: ${{ github.event.workflow_run.id || inputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: |
+            build/stage
+            games/bt3/work
+          key: runner-work-${{ inputs.runner_sha || github.sha }}
+          restore-keys: |
+            runner-work-
 
+      # Compilar aisladamente solo el Launcher en su propia etapa limpia
       - name: Compilar ÚNICAMENTE Launcher Qt y Empaquetar
         shell: powershell
         run: |
