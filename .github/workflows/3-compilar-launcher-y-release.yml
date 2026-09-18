@@ -72,7 +72,7 @@ jobs:
           -DCMAKE_CXX_FLAGS_RELEASE="/EHsc /permissive -w"
 
         # Remover forzosamente la bandera /permissive- generada por CMake C++20
-        (Get-Content "$launcherBuild/build.ninja") -replace '/permissive-', '/permissive' \vert{} Set-Content "$launcherBuild/build.ninja"
+        (Get-Content "$launcherBuild/build.ninja") -replace '/permissive-', '/permissive' | Set-Content "$launcherBuild/build.ninja"
 
         cmake --build $launcherBuild --config Release -j $env:NUMBER_OF_PROCESSORS
 
