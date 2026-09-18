@@ -54,13 +54,15 @@ jobs:
           throw "No se encontraron las fuentes en la caché. Debes ejecutar primero el flujo '1. Generar Fuentes'."
         }
 
-    # Pre-configurar CMake apagando proyectos pesados
-    - name: Pre-configurar CMake (Target único)
+    # Pre-configurar CMake apagando proyectos pesados y silenciando warnings
+    - name: Pre-configurar CMake (Target único sin warnings)
       shell: pwsh
       run: |
         cmake -S . -B build -G Ninja `
           -DCMAKE_C_COMPILER=clang-cl `
           -DCMAKE_CXX_COMPILER=clang-cl `
+          -DCMAKE_C_FLAGS="-w" `
+          -DCMAKE_CXX_FLAGS="-w" `
           -DCMAKE_BUILD_TYPE=Release `
           -DPS2X_BUILD_RECOMP=OFF `
           -DPS2X_BUILD_ANALYZER=OFF `
