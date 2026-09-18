@@ -136,39 +136,44 @@ if (-not $Install) {
 
 # ─── Install phase ─────────────────────────────────────────────────────────────
 if ($missing.Count -gt 0) {
-    Step "Installing missing prerequisites via winget"
+    # Si estamos en GitHub Actions, no usar winget para herramientas base (ya están preinstaladas en el runner)
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        Log "Running in GitHub Actions: Skipping winget installation for core tools ($($missing -join ', '))."
+    } else {
+        Step "Installing missing prerequisites via winget"
 
-    if (-not $hasVS) {
-        Step "Installing VS Build Tools 2022 (this takes several minutes)"
-        $override = "--quiet --wait --norestart " +
-            "--add Microsoft.VisualStudio.Workload.VCTools " +
-            "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang " +
-            "--add Microsoft.VisualStudio.Component.VC.Tools.LLVM " +
-            "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 " +
-            "--add Microsoft.VisualStudio.Component.Windows11SDK.22621 " +
-            "--includeRecommended"
-        winget install -e --id Microsoft.VisualStudio.2022.BuildTools `
-            --accept-source-agreements --accept-package-agreements --override $override
-        if ($LASTEXITCODE -ne 0) { Fail "winget install VS Build Tools failed (exit $LASTEXITCODE)" }
-        Log "VS Build Tools installed"
-    }
+        if (-not $hasVS) {
+            Step "Installing VS Build Tools 2022 (this takes several minutes)"
+            $override = "--quiet --wait --norestart " +
+                "--add Microsoft.VisualStudio.Workload.VCTools " +
+                "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang " +
+                "--add Microsoft.VisualStudio.Component.VC.Tools.LLVM " +
+                "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 " +
+                "--add Microsoft.VisualStudio.Component.Windows11SDK.22621 " +
+                "--includeRecommended"
+            winget install -e --id Microsoft.VisualStudio.2022.BuildTools `
+                --accept-source-agreements --accept-package-agreements --override $override
+            if ($LASTEXITCODE -ne 0) { Fail "winget install VS Build Tools failed (exit $LASTEXITCODE)" }
+            Log "VS Build Tools installed"
+        }
 
-    if (-not (Test-FileCmd "cmake")) {
-        winget install -e --id Kitware.CMake --accept-source-agreements --accept-package-agreements
-        $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links" + [System.IO.Path]::PathSeparator + $env:PATH
-        if (-not (Test-FileCmd "cmake")) { Fail "cmake installed but not on PATH" }
-    }
+        if (-not (Test-FileCmd "cmake")) {
+            winget install -e --id Kitware.CMake --accept-source-agreements --accept-package-agreements
+            $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links" + [System.IO.Path]::PathSeparator + $env:PATH
+            if (-not (Test-FileCmd "cmake")) { Fail "cmake installed but not on PATH" }
+        }
 
-    if (-not (Test-FileCmd "ninja")) {
-        winget install -e --id Ninja-build.Ninja --accept-source-agreements --accept-package-agreements
-        $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links" + [System.IO.Path]::PathSeparator + $env:PATH
-        if (-not (Test-FileCmd "ninja")) { Fail "ninja installed but not on PATH" }
-    }
+        if (-not (Test-FileCmd "ninja")) {
+            winget install -e --id Ninja-build.Ninja --accept-source-agreements --accept-package-agreements
+            $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links" + [System.IO.Path]::PathSeparator + $env:PATH
+            if (-not (Test-FileCmd "ninja")) { Fail "ninja installed but not on PATH" }
+        }
 
-    if (-not (Test-FileCmd "python")) {
-        winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
-        $env:PATH = "$env:LOCALAPPDATA\Programs\Python\Python312\Scripts" + [System.IO.Path]::PathSeparator + $env:PATH
-        if (-not (Test-FileCmd "python")) { Fail "python installed but not on PATH; open a new terminal" }
+        if (-not (Test-FileCmd "python")) {
+            winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+            $env:PATH = "$env:LOCALAPPDATA\Programs\Python\Python312\Scripts" + [System.IO.Path]::PathSeparator + $env:PATH
+            if (-not (Test-FileCmd "python")) { Fail "python installed but not on PATH; open a new terminal" }
+        }
     }
 }
 
