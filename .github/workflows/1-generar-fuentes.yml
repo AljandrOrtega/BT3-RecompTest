@@ -50,3 +50,14 @@ jobs:
         key: sources-bt3-${{ github.sha }}
         restore-keys: |
           sources-bt3-
+
+    - name: Subir Fuentes Artefacto
+      uses: actions/upload-artifact@v4
+      with:
+        name: BT3-Recomp-Windows-x64
+        path: |
+          games/bt3/work
+          ps2xRuntime/src/runner
+          ps2xRuntime/src/runner_overlay
+          ps2xRuntime/include
+          ps2xRuntime/src/lib/vu1_jit_gen.inc
